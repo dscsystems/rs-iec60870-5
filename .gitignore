@@ -1,0 +1,9 @@
+/target
+target/
+
+# Interoperability harness: the reference Go implementation and its binaries
+/tests/interop/go-iecp5/
+/tests/interop/go/bin/
+
+# Release archives built by .github/workflows/release.yml
+/dist

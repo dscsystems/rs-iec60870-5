@@ -1,0 +1,263 @@
+# Build the shippable binaries for every practical Rust host platform and
+# publish them as a GitHub release when a version tag is pushed.
+#
+#   git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+#
+# `workflow_dispatch` runs the same matrix without publishing, which is how to
+# check a matrix change before committing to a tag.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create the release
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Nothing is published unless the library is green on the host platform.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Test the explorer
+        run: cargo test -p cs104-explorer
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check the documentation
+        run: cargo doc -p rs-iec60870-5 --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # -- tier 1 --------------------------------------------------------
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13 # the last Intel runner
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+
+          # -- statically linked Linux, for containers and appliances --------
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+
+          # -- 32-bit ARM, the usual substation gateway and RTU hardware -----
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            cross: true
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            cross: true
+
+          # -- other 64-bit hosts --------------------------------------------
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+          - target: i686-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            optional: true
+          - target: x86_64-unknown-freebsd
+            os: ubuntu-latest
+            cross: true
+            optional: true # build only; no runner exists to test it
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Select the build command
+        shell: bash
+        run: echo "CARGO=${{ matrix.cross && 'cross' || 'cargo' }}" >> "$GITHUB_ENV"
+
+      # The library's runnable examples. `serial` and `tls` are built in so the
+      # 101 and 103 examples can drive a real port out of the box.
+      - name: Build the examples
+        shell: bash
+        run: $CARGO build --release --locked --target ${{ matrix.target }} -p rs-iec60870-5 --examples --features serial,tls
+
+      # A separate package, so a separate invocation; both land in the same
+      # target directory because they share the workspace.
+      - name: Build the explorer
+        shell: bash
+        run: $CARGO build --release --locked --target ${{ matrix.target }} -p cs104-explorer
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="$(git rev-parse --short HEAD)"
+          name="rs-iec60870-5-${version}-${{ matrix.target }}"
+
+          mkdir -p "dist/$name"
+          case "${{ matrix.target }}" in
+            *windows*) ext=".exe" ;;
+            *)         ext="" ;;
+          esac
+
+          for bin in cs104_server cs104_client cs104_server_special \
+                     cs101_client cs101_server cs103_client; do
+            cp "target/${{ matrix.target }}/release/examples/${bin}${ext}" "dist/$name/"
+          done
+          cp "target/${{ matrix.target }}/release/cs104-explorer${ext}" "dist/$name/"
+
+          cp README.md LICENSE SKILL.md "dist/$name/"
+          mkdir -p "dist/$name/docs" && cp docs/*.md "dist/$name/docs/"
+
+          cd dist
+          case "${{ matrix.target }}" in
+            *windows*)
+              7z a -tzip "${name}.zip" "$name" > /dev/null
+              archive="${name}.zip"
+              ;;
+            *)
+              tar --create --gzip --file "${name}.tar.gz" "$name"
+              archive="${name}.tar.gz"
+              ;;
+          esac
+
+          # A per-archive checksum, collated into one file by the release job.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "$archive" > "${archive}.sha256"
+          else
+            shasum -a 256 "$archive" > "${archive}.sha256"
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collate the checksums
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          rm -f ./*.sha256
+          echo "Release contents:"
+          cat SHA256SUMS
+
+      - name: Write the release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "## rs-iec60870-5 ${version}"
+            echo
+            echo "Pure Rust IEC 60870-5-101/-103/-104 telecontrol protocol library."
+            echo
+            echo "### Binaries"
+            echo
+            echo "Each archive contains the runnable examples — \`cs104_server\`,"
+            echo "\`cs104_client\`, \`cs104_server_special\`, \`cs101_client\`,"
+            echo "\`cs101_server\`, \`cs103_client\` — and \`cs104-explorer\`, the"
+            echo "interactive IEC 104 master. Built with the \`serial\` and \`tls\`"
+            echo "features enabled."
+            echo
+            echo "Verify a download against \`SHA256SUMS\`:"
+            echo
+            echo '```sh'
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo '```'
+            echo
+            echo "### Using the library"
+            echo
+            echo '```toml'
+            echo "[dependencies]"
+            echo "rs-iec60870-5 = \"${version}\""
+            echo '```'
+            echo
+            echo "See [the user guide](docs/guide.md) and [SKILL.md](SKILL.md)."
+          } > RELEASE_NOTES.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease=""
+          case "$GITHUB_REF_NAME" in
+            *-alpha*|*-beta*|*-rc*|*-pre*) prerelease="--prerelease" ;;
+          esac
+
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag \
+            $prerelease \
+            artifacts/*

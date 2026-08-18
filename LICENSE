@@ -1,0 +1,72 @@
+DSC Systems Source-Available License, Version 1.0
+
+Copyright (c) 2026 Ricardo Olsen / DSC Systems. All rights reserved.
+
+"Software" means this source code, the object code and documentation
+distributed with it, and any derivative work of it.
+"Licensor" means Ricardo Olsen / DSC Systems.
+"You" means the individual or legal entity exercising the rights granted here.
+"Production Use" means any use of the Software, in whole or in part, in the
+operation of a live process, plant, substation, control centre, product or
+service, whether or not the Software is distributed to a third party, and
+whether or not a fee is charged.
+
+1. GRANT
+
+   Subject to the terms below, the Licensor grants You a worldwide,
+   royalty-free, non-exclusive, non-transferable, revocable license to:
+
+   a) obtain, read, inspect and audit the source code of the Software;
+   b) compile, run and modify the Software for the purposes of evaluation,
+      development, testing, teaching, academic research and internal
+      interoperability verification;
+   c) create derivative works of the Software for those same purposes;
+   d) redistribute the Software, or a derivative work of it, in source form,
+      provided that this LICENSE file and all copyright notices are retained
+      unmodified and that the recipient is bound by these same terms.
+
+2. CONDITIONS AND LIMITATIONS
+
+   a) Production Use requires a separate commercial license granted in writing
+      by the Licensor. No such right is granted by this license.
+   b) You may not redistribute the Software, or any derivative work of it, in
+      binary form, nor incorporate it into a product or service made available
+      to third parties, without a commercial license from the Licensor.
+   c) You may not remove or alter any copyright, trademark or attribution
+      notice contained in the Software.
+   d) You may not use the name "DSC Systems" or "Ricardo Olsen" to endorse or
+      promote products derived from the Software without prior written
+      permission.
+   e) This license grants no rights under any patent held by the Licensor
+      other than those strictly necessary to exercise the rights in section 1.
+   f) Any breach of this section terminates this license automatically and
+      immediately.
+
+3. THIRD-PARTY MATERIAL
+
+   The Software is an independent Rust implementation whose protocol behaviour
+   was verified for interoperability against, among others, the Go project
+   github.com/riclolsen/go-iecp5. Third-party components consumed as
+   dependencies remain governed by their own licenses.
+
+4. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NONINFRINGEMENT.
+
+5. LIMITATION OF LIABILITY
+
+   IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+   THE SOFTWARE IMPLEMENTS PROTOCOLS USED IN ELECTRICAL POWER SYSTEM CONTROL.
+   IT IS THE SOLE RESPONSIBILITY OF THE USER TO VALIDATE ITS SUITABILITY AND
+   SAFETY FOR ANY SUCH APPLICATION.
+
+6. COMMERCIAL LICENSING
+
+   For production, commercial or OEM licensing, contact
+   Ricardo Olsen <https://www.linkedin.com/in/ricardo-olsen/> / DSC Systems <https://dscsys.com>.

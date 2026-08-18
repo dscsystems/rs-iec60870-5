@@ -1,0 +1,98 @@
+[workspace]
+# The terminal explorer is a member so it shares this lock file and target
+# directory, but it is a separate package: its UI dependencies are never
+# dependencies of `rs-iec60870-5`. `default-members` keeps it out of a bare
+# `cargo build`/`cargo test` at the root — use `-p cs104-explorer` for it.
+members = ["examples/cs104_explorer"]
+default-members = ["."]
+
+[package]
+name = "rs-iec60870-5"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Ricardo Olsen"]
+description = "Pure Rust IEC 60870-5-101/-103/-104 telecontrol protocol library (client and server)"
+documentation = "https://docs.rs/rs-iec60870-5"
+readme = "README.md"
+repository = "https://github.com/dscsystems/rs-iec60870-5"
+license-file = "LICENSE"
+keywords = ["iec60870", "iec104", "scada", "telecontrol", "protocol"]
+categories = ["network-programming", "encoding"]
+exclude = ["/tests/interop/**", "/examples/cs104_explorer/**", "/.github/**"]
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+] }
+tracing = "0.1"
+
+# optional
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+# `ring` rather than the default aws-lc-rs backend: aws-lc-sys builds C and
+# assembly through cmake and bindgen, which does not survive cross-compilation
+# to the musl, 32-bit ARM and riscv targets this project ships binaries for.
+# The library never constructs a rustls config itself — callers pass in their
+# own — so this only fixes which provider is linked and what
+# `ClientConfig::builder()` defaults to.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "logging",
+    "tls12",
+    "ring",
+], optional = true }
+tokio-serial = { version = "5", optional = true }
+
+[features]
+default = ["cs101", "cs103", "cs104"]
+
+# Application layer only (`asdu`) is always built.
+cs104 = []
+# Serial / FT1.2 based companion standards. `serial` pulls in a real serial
+# port backend; without it cs101/cs103 still work over their TCP transports.
+cs101 = []
+cs103 = ["cs101"]
+serial = ["dep:tokio-serial", "cs101"]
+
+tls = ["dep:tokio-rustls"]
+serde = ["dep:serde", "dep:serde_json", "chrono/serde"]
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "cs104_server"
+required-features = ["cs104"]
+
+[[example]]
+name = "cs104_client"
+required-features = ["cs104"]
+
+[[example]]
+name = "cs104_server_special"
+required-features = ["cs104"]
+
+[[example]]
+name = "cs101_client"
+required-features = ["cs101"]
+
+[[example]]
+name = "cs101_server"
+required-features = ["cs101"]
+
+[[example]]
+name = "cs103_client"
+required-features = ["cs103"]
+
+[package.metadata.docs.rs]
+all-features = true
