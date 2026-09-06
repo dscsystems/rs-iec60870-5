@@ -59,6 +59,8 @@ pub mod net;
 
 #[cfg(feature = "cs101")]
 pub mod cs101;
+#[cfg(feature = "filetransfer")]
+pub mod filetransfer;
 #[cfg(feature = "cs103")]
 pub mod cs103;
 #[cfg(feature = "cs104")]

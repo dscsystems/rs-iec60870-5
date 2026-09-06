@@ -20,6 +20,7 @@ rs-iec60870-5 = "0.1"
 | [`cs104`] | IEC 60870-5-104 master and controlled station over TCP/IP, optionally TLS |
 | [`cs101`] | IEC 60870-5-101 primary and secondary station over serial FT1.2, unbalanced (multi-drop) and balanced |
 | [`cs103`] | IEC 60870-5-103 master for protection equipment |
+| [`filetransfer`] | The file transfer procedures (types 120–126) on any endpoint: fetching disturbance records and the like |
 
 Vocabulary: *master* = controlling station = client; *outstation* = RTU = slave
 = controlled station = server. *Monitor direction* is data flowing to the master
@@ -199,6 +200,7 @@ cargo run -p cs104-explorer -- 127.0.0.1:2404
 | [`cs104` reference](docs/cs104.md) | IEC 104 client, server and reverse-connection station; k/w windows and t₀–t₃ |
 | [`cs101` reference](docs/cs101.md) | IEC 101 primary and secondary; FT1.2, class buffering, balanced mode |
 | [`cs103` reference](docs/cs103.md) | IEC 103 relay master: FUN/INF addressing, measurands, CP32 |
+| [`filetransfer` reference](docs/filetransfer.md) | file transfer: the `F_*` ASDUs, the sender and receiver procedures, stores |
 | [SKILL.md](SKILL.md) | condensed build guide for AI coding agents |
 | [docs.rs](https://docs.rs/rs-iec60870-5) | generated API documentation |
 
@@ -209,9 +211,11 @@ cargo run -p cs104-explorer -- 127.0.0.1:2404
 | `cs104` | yes | IEC 60870-5-104 over TCP/IP |
 | `cs101` | yes | IEC 60870-5-101 over FT1.2 |
 | `cs103` | yes | IEC 60870-5-103 master (implies `cs101`) |
+| `filetransfer` | yes | the file transfer procedures (types 120–126) on any endpoint |
 | `serial` | no | real serial ports via `tokio-serial`; without it, 101 and 103 still work over their TCP transports |
 | `tls` | no | TLS via `tokio-rustls` (the `ring` provider), for the `tls://` endpoints and TLS listeners |
 | `serde` | no | `Serialize`/`Deserialize` on the ASDU types |
+| `tz` | no | named IANA time zones (`TimeZone::Named`) via `chrono-tz`, for a device whose profile fixes a zone the host does not share |
 
 The `asdu` application layer is always built, so a codec-only dependency can
 turn every transport off.
@@ -247,9 +251,9 @@ general commands with RII-matched acknowledgements, multi-drop.
 
 ## Not implemented
 
-* File transfer ASDUs (`F_FR_NA_1` … `F_DR_TA_1`) — the type identifications are
-  defined, but there is no file transfer service.
 * IEC 62351-5 security ASDUs (`S_*`) — enumerated only.
+* `F_SC_NB_1` (127, query log) — enumerated only; the rest of the file transfer
+  set (120–126) is implemented, see [`filetransfer`].
 * Select-before-execute supervision is left to the application: command ASDUs
   reach the handler, which decides how to confirm and execute them. The S/E bit
   is available as `QualifierOfCommand::in_select`.

@@ -42,7 +42,8 @@ pub fn cp56time2a(t: Option<DateTime<Utc>>, zone: TimeZone) -> [u8; CP56TIME2A_S
         msec as u8,
         (msec >> 8) as u8,
         min as u8,
-        hour as u8,
+        // D7 of the hour octet is SU: the reading is expressed in summer time.
+        hour as u8 | if zone.is_dst(t) { 0x80 } else { 0 },
         ((dow as u8) << 5) | (day as u8),
         month as u8,
         (year - 2000).rem_euclid(100) as u8,
@@ -65,7 +66,14 @@ pub fn parse_cp56time2a(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     let day = (b[4] & 0x1f) as u32;
     let month = (b[5] & 0x0f) as u32;
     let year = 2000 + (b[6] & 0x7f) as i32;
-    zone.instant_from(year, month, day, hour, min, sec, msec)
+    // The year field is 7 bits, so it reaches 2127; the standard defines it as
+    // 0..99 within the century. A value beyond that is a fault in the sender,
+    // not a time.
+    if year > 2099 {
+        return None;
+    }
+    let t = zone.instant_from(year, month, day, hour, min, sec, msec)?;
+    Some(zone.resolve_summer_time(t, b[3] & 0x80 != 0))
 }
 
 /// Encode an instant as a 3-octet CP24Time2a tag (minutes and milliseconds only).
@@ -118,7 +126,7 @@ pub fn parse_cp16time2a(b: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
+    use chrono::{FixedOffset, TimeZone as _};
 
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32, ms: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s)
@@ -187,6 +195,130 @@ mod tests {
         let got = parse_cp24time2a(&b, TimeZone::Utc).expect("valid tag");
         assert_eq!(got.minute(), now.minute());
         assert_eq!(got.second(), now.second());
+    }
+
+    // Bit 7 of the hour octet of CP56Time2a is SU: the reading is expressed in
+    // summer time. IEC 60870-5-4 lays the octet out as
+    //
+    //     | SU(D7) | RES2(D6-D5) | Hours(D4-D0) |
+    //
+    // Omitting it makes every summer timestamp look like standard time to a
+    // peer that honours the flag — an hour of skew, twice a year, in the
+    // direction that makes an event look like it happened before its cause.
+
+    #[test]
+    fn cp56_leaves_su_clear_for_utc_and_fixed_zones() {
+        // Neither UTC nor a fixed offset observes summer time.
+        let midsummer = utc(2026, 7, 1, 12, 0, 0, 0);
+        for zone in [
+            TimeZone::Utc,
+            TimeZone::Fixed(FixedOffset::east_opt(2 * 3600).unwrap()),
+        ] {
+            assert_eq!(cp56time2a(Some(midsummer), zone)[3] & 0x80, 0, "{zone:?}");
+        }
+    }
+
+    /// A named zone, so these do not depend on how the host is configured.
+    /// Berlin is +01:00 standard / +02:00 summer, Sydney +10:00 / +11:00 with
+    /// the seasons reversed, and Kolkata +05:30 all year.
+    #[cfg(feature = "tz")]
+    fn named(tz: chrono_tz::Tz) -> TimeZone {
+        TimeZone::Named(tz)
+    }
+
+
+    #[cfg(feature = "tz")]
+    #[test]
+    fn cp56_sets_su_exactly_when_the_zone_is_on_summer_time() {
+        use chrono_tz::{Asia::Kolkata, Australia::Sydney, Europe::Berlin};
+        // (zone, instant, expected SU). The seasons are reversed in Sydney,
+        // and Kolkata never observes summer time.
+        for (tz, t, want) in [
+            (Berlin, utc(2026, 1, 15, 12, 0, 0, 0), false),
+            (Berlin, utc(2026, 7, 15, 12, 0, 0, 0), true),
+            (Sydney, utc(2026, 1, 15, 12, 0, 0, 0), true),
+            (Sydney, utc(2026, 7, 15, 12, 0, 0, 0), false),
+            (Kolkata, utc(2026, 1, 15, 12, 0, 0, 0), false),
+            (Kolkata, utc(2026, 7, 15, 12, 0, 0, 0), false),
+        ] {
+            let zone = named(tz);
+            assert_eq!(zone.is_dst(t), want, "{tz} at {t}");
+            let su = cp56time2a(Some(t), zone)[3] & 0x80 != 0;
+            assert_eq!(su, want, "SU octet for {tz} at {t}");
+            // The hour octet must still carry the local hour in D4..D0.
+            let (.., hour, _, _, _) = zone.parts(t);
+            assert_eq!((cp56time2a(Some(t), zone)[3] & 0x1f) as u32, hour);
+        }
+    }
+
+    #[cfg(feature = "tz")]
+    #[test]
+    fn cp56_round_trips_through_a_summer_time_transition() {
+        use chrono_tz::{Australia::Sydney, Europe::Berlin};
+        // Berlin's clocks go back at 01:00 UTC on 2026-10-25, so 02:30 local
+        // occurs twice: once at 00:30 UTC in summer time and once at 01:30 UTC
+        // in standard time. SU is the only thing that tells the two apart, and
+        // without it the second reading decodes as the first — an hour of skew
+        // in the direction that makes an event look like it happened before
+        // its cause.
+        let ambiguous = [utc(2026, 10, 25, 0, 30, 0, 0), utc(2026, 10, 25, 1, 30, 0, 0)];
+        let tags: Vec<_> = ambiguous
+            .iter()
+            .map(|t| cp56time2a(Some(*t), named(Berlin)))
+            .collect();
+        assert_eq!(
+            tags[0][3] & 0x1f,
+            tags[1][3] & 0x1f,
+            "the two readings share a wall clock hour"
+        );
+        assert_ne!(tags[0][3] & 0x80, tags[1][3] & 0x80, "and differ only in SU");
+
+        for (t, tag) in ambiguous.iter().zip(&tags) {
+            assert_eq!(parse_cp56time2a(tag, named(Berlin)), Some(*t), "at {t}");
+        }
+
+        // And ordinary instants either side of both transitions, in both
+        // hemispheres.
+        for tz in [Berlin, Sydney] {
+            for t in [
+                utc(2026, 1, 15, 12, 0, 0, 0),
+                utc(2026, 3, 29, 3, 0, 0, 0),
+                utc(2026, 7, 15, 12, 0, 0, 0),
+                utc(2026, 10, 25, 12, 0, 0, 0),
+            ] {
+                let b = cp56time2a(Some(t), named(tz));
+                assert_eq!(parse_cp56time2a(&b, named(tz)), Some(t), "{tz} at {t}");
+            }
+        }
+    }
+
+    #[cfg(feature = "tz")]
+    #[test]
+    fn a_tag_from_a_peer_with_different_rules_keeps_its_wall_clock() {
+        use chrono_tz::Europe::Berlin;
+        // A sender that never sets SU still has to be understood: with no
+        // instant matching the flag, the wall clock is the only thing the two
+        // ends agree on, so the reading is kept as-is rather than shifted.
+        let t = utc(2026, 7, 15, 12, 0, 0, 0);
+        let mut b = cp56time2a(Some(t), named(Berlin));
+        assert_eq!(b[3] & 0x80, 0x80, "Berlin is on summer time in July");
+        b[3] &= 0x7f; // the peer omits SU
+        let got = parse_cp56time2a(&b, named(Berlin)).expect("still a valid tag");
+        assert_eq!(
+            named(Berlin).parts(got),
+            named(Berlin).parts(t),
+            "the wall clock reading is preserved"
+        );
+    }
+
+    #[test]
+    fn cp56_rejects_a_year_beyond_the_century() {
+        // The year field is 7 bits and reaches 2127; the standard defines 0..99.
+        let mut b = cp56time2a(Some(utc(2026, 1, 2, 3, 4, 5, 6)), TimeZone::Utc);
+        b[6] = 100;
+        assert_eq!(parse_cp56time2a(&b, TimeZone::Utc), None);
+        b[6] = 99;
+        assert!(parse_cp56time2a(&b, TimeZone::Utc).is_some());
     }
 
     #[test]

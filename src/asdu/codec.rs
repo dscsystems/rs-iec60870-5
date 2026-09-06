@@ -230,28 +230,63 @@ impl Asdu {
         Ok(asdu)
     }
 
-    /// Trim the information object payload to the size implied by the type
-    /// identification and the variable structure qualifier.
+    /// Check the information object payload against the size implied by the
+    /// type identification and the variable structure qualifier.
+    ///
+    /// A short payload is [`Error::UnexpectedEof`]. A long one is
+    /// [`Error::TrailingOctets`], unless
+    /// [`Params::allow_trailing_octets`](crate::asdu::Params::allow_trailing_octets)
+    /// is set, in which case the surplus is discarded.
     pub fn fix_info_obj_size(&mut self) -> Result<()> {
-        let obj_size = self.identifier.type_id.info_obj_size()?;
-        let n = self.identifier.variable.number as usize;
-        let addr_size = self.params.info_obj_addr_size as usize;
-
-        let size = if self.identifier.variable.is_sequence {
-            addr_size + n * obj_size
-        } else {
-            n * (addr_size + obj_size)
+        // A variable-length object carries its own length, so "expected" is
+        // only meaningful once that octet is present.
+        let size = match self.variable_info_obj_size() {
+            Some(0) => return Err(Error::UnexpectedEof),
+            Some(size) => size,
+            None => {
+                let obj_size = self.identifier.type_id.info_obj_size()?;
+                let n = self.identifier.variable.number as usize;
+                let addr_size = self.params.info_obj_addr_size as usize;
+                let size = if self.identifier.variable.is_sequence {
+                    addr_size + n * obj_size
+                } else {
+                    n * (addr_size + obj_size)
+                };
+                if size == 0 {
+                    return Err(Error::InfoObjIndexFit);
+                }
+                size
+            }
         };
 
-        if size == 0 {
-            return Err(Error::InfoObjIndexFit);
-        }
         if size > self.info_obj.len() {
             return Err(Error::UnexpectedEof);
         }
-        // A longer payload is not explicitly prohibited by the standard; trim it.
-        self.info_obj.truncate(size);
+        if size < self.info_obj.len() {
+            if !self.params.allow_trailing_octets {
+                return Err(Error::TrailingOctets);
+            }
+            self.info_obj.truncate(size);
+        }
         Ok(())
+    }
+
+    /// The size of an information object whose length is not fixed by the type
+    /// identification, or `None` when this type is not such a case.
+    ///
+    /// The compatible range defines one: `F_SG_NA_1` (segment), whose length is
+    /// carried in its own LOS (length of segment) octet. `Some(0)` means the
+    /// type was recognised but the payload is too short to hold that octet.
+    fn variable_info_obj_size(&self) -> Option<usize> {
+        if self.identifier.type_id != TypeId::F_SG_NA_1 {
+            return None;
+        }
+        // IOA + NOF(2) + NOS(1) + LOS(1) + segment data(LOS)
+        let head = self.params.info_obj_addr_size as usize + 4;
+        if self.info_obj.len() < head {
+            return Some(0);
+        }
+        Some(head + self.info_obj[self.params.info_obj_addr_size as usize + 3] as usize)
     }
 
     /// An appender that writes information elements into this ASDU.
@@ -331,6 +366,16 @@ impl Encoder<'_> {
             _ => return Err(Error::Param),
         }
         Ok(self)
+    }
+
+    /// Append a 3-octet length of file (LOF).
+    ///
+    /// The element is 3 octets, so only the low 24 bits are written; callers
+    /// bound the value against
+    /// [`LENGTH_OF_FILE_MAX`](crate::asdu::LENGTH_OF_FILE_MAX) first.
+    pub fn length_of_file(&mut self, n: u32) -> &mut Self {
+        self.buf.extend_from_slice(&n.to_le_bytes()[..3]);
+        self
     }
 
     /// Append a normalized value (NVA).
@@ -457,6 +502,17 @@ impl<'a> InfoObjReader<'a> {
             }
             _ => Err(Error::Param),
         }
+    }
+
+    /// Read a 3-octet length of file (LOF).
+    pub fn length_of_file(&mut self) -> Result<u32> {
+        let b = self.take(3)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], 0]))
+    }
+
+    /// Read `n` raw octets, as the payload of a variable-length element.
+    pub fn take_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
+        self.take(n)
     }
 
     /// Read a normalized value (NVA).
@@ -665,15 +721,69 @@ mod tests {
     }
 
     #[test]
-    fn unmarshal_trims_trailing_octets_and_rejects_short_payloads() {
+    fn unmarshal_rejects_trailing_octets_and_short_payloads() {
         // One M_SP_NA_1 object: 3 address octets + 1 value octet.
-        let raw = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01, 0xde, 0xad];
-        let a = Asdu::unmarshal_binary(PARAMS_WIDE, &raw).unwrap();
-        assert_eq!(a.info_obj.len(), 4);
+        let exact = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01];
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &exact).unwrap().info_obj.len(),
+            4
+        );
+
+        // A conforming sender cannot produce a surplus octet, so two extra
+        // ones mean the frame is not what its qualifier claims.
+        let padded = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01, 0xde, 0xad];
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &padded),
+            Err(Error::TrailingOctets)
+        );
 
         let short = [1u8, 1, 3, 0, 1, 0, 1, 0];
         assert_eq!(
             Asdu::unmarshal_binary(PARAMS_WIDE, &short),
+            Err(Error::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn trailing_octets_are_discarded_only_when_the_parameter_allows_it() {
+        let lenient = Params {
+            allow_trailing_octets: true,
+            ..PARAMS_WIDE
+        };
+        let padded = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01, 0xde, 0xad];
+        let a = Asdu::unmarshal_binary(lenient, &padded).unwrap();
+        assert_eq!(a.info_obj, vec![1, 0, 0, 0x01], "the surplus is discarded");
+    }
+
+    #[test]
+    fn a_file_segment_is_sized_by_its_own_length_octet() {
+        // F_SG_NA_1: IOA(3) + NOF(2) + NOS(1) + LOS(1) + 3 segment octets.
+        let raw = [
+            125u8, 1, 13, 0, 1, 0, // identifier: F_SG_NA_1, 1 object, FileTransfer, CA 1
+            0x64, 0, 0, // IOA 100
+            0x02, 0, // NOF
+            0x01, // NOS
+            0x03, // LOS = 3
+            0xaa, 0xbb, 0xcc,
+        ];
+        let a = Asdu::unmarshal_binary(PARAMS_WIDE, &raw).unwrap();
+        assert_eq!(a.info_obj.len(), 10);
+
+        // One octet short of what LOS promises.
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &raw[..raw.len() - 1]),
+            Err(Error::UnexpectedEof)
+        );
+        // One octet more than LOS accounts for.
+        let mut padded = raw.to_vec();
+        padded.push(0xdd);
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &padded),
+            Err(Error::TrailingOctets)
+        );
+        // Truncated before the LOS octet itself.
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &raw[..9]),
             Err(Error::UnexpectedEof)
         );
     }

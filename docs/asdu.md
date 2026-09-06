@@ -24,6 +24,16 @@ use identical parameters** or every ASDU will be mis-parsed.
 | `common_addr_size` | common (station) address octets | 1, 2 |
 | `info_obj_addr_size` | information object address octets | 1, 2, 3 |
 | `info_obj_time_zone` | zone used to encode and decode CP24/CP56 tags | [`TimeZone`] |
+| `allow_trailing_octets` | accept an ASDU longer than its qualifier accounts for, discarding the surplus | `false` by default |
+
+`allow_trailing_octets` is off by default, and should stay off. An ASDU's
+length is fixed by the frame that carries it, its object count by the variable
+structure qualifier and its object size by the type identification, so a
+conforming sender cannot produce a surplus octet; one that arrives means the
+frame is not what it claims, and accepting it means acting on a command nobody
+can account for. Decoding such an ASDU yields [`Error::TrailingOctets`]. Turn
+it on only for a device known to pad, knowing that a truncated interrogation
+reply then looks the same as a complete one.
 
 Predefined:
 
@@ -34,7 +44,16 @@ Predefined:
 | `PARAMS_NARROW` | 1 | 1 | 1 | smallest legal configuration |
 
 `TimeZone` is `Utc` (the default, and what the standard recommends), `Local`,
-or `Fixed(FixedOffset)`.
+`Fixed(FixedOffset)`, or `Named(chrono_tz::Tz)` with the `tz` feature — an IANA
+zone that does not depend on how the host is configured, for a device whose
+profile fixes one the host does not share.
+
+The zone decides the **SU (summer time) bit** of a CP56Time2a and CP32Time2a
+tag as well as the wall clock reading. `Local` and `Named` set it while the
+zone is on summer time, and honour it on decode; `Utc` and `Fixed` never do,
+because neither observes summer time. That bit is what resolves the hour that
+occurs twice when the clocks go back — without it the second reading decodes as
+the first, which puts an event an hour before its cause.
 
 ## Identifier
 
@@ -135,8 +154,10 @@ Control direction (master to device):
 identifications (`128..=255`) round-trip unchanged. `TypeId::name()` gives the
 mnemonic or `None`; `TypeId::info_obj_size()` gives the element size.
 
-File transfer types (120–127) and the IEC 62351-5 security types are
-enumerated but not implemented.
+The file transfer types (120–126) are implemented — see the `filetransfer`
+module for the procedures that drive them, and `docs/filetransfer.md` for the
+ASDUs themselves. `F_SC_NB_1` (127, query log) and the IEC 62351-5 security
+types are enumerated but not implemented.
 
 ## Building ASDUs
 
@@ -458,6 +479,7 @@ failing. With the `serde` feature the ASDU types also derive `Serialize` and
 [`Identifier`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Identifier.html
 [`Params`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Params.html
 [`TimeZone`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/enum.TimeZone.html
+[`Error::TrailingOctets`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 [`Normalize`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Normalize.html
 [`StepPosition`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.StepPosition.html
 [`BinaryCounterReading`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.BinaryCounterReading.html

@@ -312,6 +312,79 @@ impl fmt::Display for Asdu {
             TypeId::C_CS_NA_1 => self
                 .get_clock_synchronization_cmd()
                 .map(|(ioa, t)| write!(f, " IOA={ioa}{}", ts(t))),
+            TypeId::F_FR_NA_1 => self.get_file_ready().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} LOF={} FRQ=0x{:02x}",
+                    i.ioa,
+                    i.nof,
+                    i.length_of_file,
+                    i.frq.value()
+                )
+            }),
+            TypeId::F_SR_NA_1 => self.get_section_ready().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} LOS={} SRQ=0x{:02x}",
+                    i.ioa,
+                    i.nof,
+                    i.nos,
+                    i.length_of_section,
+                    i.srq.value()
+                )
+            }),
+            TypeId::F_SC_NA_1 => self.get_call_or_select_file().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} SCQ=0x{:02x}",
+                    i.ioa,
+                    i.nof,
+                    i.nos,
+                    i.scq.value()
+                )
+            }),
+            TypeId::F_LS_NA_1 => self.get_last_section_or_segment().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} LSQ={} CHS=0x{:02x}",
+                    i.ioa, i.nof, i.nos, i.lsq.0, i.chs
+                )
+            }),
+            TypeId::F_AF_NA_1 => self.get_ack_file_or_section().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} AFQ=0x{:02x}",
+                    i.ioa,
+                    i.nof,
+                    i.nos,
+                    i.afq.value()
+                )
+            }),
+            // The segment payload itself is not dumped: a file transfer fills
+            // the log with it, and its length is what a reader needs.
+            TypeId::F_SG_NA_1 => self.get_file_segment().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} segment={}B",
+                    i.ioa,
+                    i.nof,
+                    i.nos,
+                    i.segment.len()
+                )
+            }),
+            TypeId::F_DR_TA_1 => self.get_file_directory().map(|infos| {
+                list(f, &infos, |f, i| {
+                    write!(
+                        f,
+                        "{}=NOF({}) {}B SOF=0x{:02x}{}",
+                        i.ioa,
+                        i.nof,
+                        i.length_of_file,
+                        i.sof.value(),
+                        ts(i.time)
+                    )
+                })
+            }),
             _ => {
                 let n = self.variable().number.max(1);
                 return write!(f, " items={n} payload={}B", self.info_obj.len());

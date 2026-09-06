@@ -101,8 +101,10 @@ pub enum Apci {
     },
     /// Unnumbered control format.
     U {
-        /// The control function, or `None` for an undefined bit combination.
-        function: Option<UFunction>,
+        /// The control function. Undefined bit combinations are rejected
+        /// when the frame is parsed, so this is always one of the six the
+        /// standard defines.
+        function: UFunction,
     },
 }
 
@@ -111,8 +113,7 @@ impl fmt::Display for Apci {
         match self {
             Apci::I { send_sn, recv_sn } => write!(f, "I[sendNO: {send_sn}, recvNO: {recv_sn}]"),
             Apci::S { recv_sn } => write!(f, "S[recvNO: {recv_sn}]"),
-            Apci::U { function: Some(x) } => write!(f, "U[function: {x}]"),
-            Apci::U { function: None } => f.write_str("U[function: Unknown]"),
+            Apci::U { function } => write!(f, "U[function: {function}]"),
         }
     }
 }
@@ -154,24 +155,73 @@ pub(crate) fn new_u_frame(which: UFunction) -> [u8; 6] {
 ///
 /// `apdu` must be a complete frame of at least six octets, as produced by
 /// [`read_apdu`].
-pub(crate) fn parse(apdu: &[u8]) -> (Apci, &[u8]) {
-    debug_assert!(apdu.len() >= 6);
+///
+/// The checks matter because the S and U formats carry no payload to be
+/// validated later: whatever the control field says is acted on directly, so
+/// this is the only place a malformed one can be caught. IEC 60870-5-104
+/// subclause 5.1 fixes both formats at an APDU length of 4 and requires every
+/// unused control bit to be zero, and a frame that violates either was not
+/// produced by a conforming peer. A peer must not be able to change the state
+/// of the link with a frame it had no right to send.
+pub(crate) fn parse(apdu: &[u8]) -> Result<(Apci, &[u8])> {
+    if apdu.len() < 6 {
+        return Err(Error::Apci("fewer than the minimum six octets"));
+    }
+    let field_len = apdu[1] as usize;
+    // The length octet counts the control field and the ASDU, so it must
+    // describe exactly what was read.
+    if field_len != apdu.len() - 2 {
+        return Err(Error::Apci("length field does not match the octets read"));
+    }
     let (c1, c2, c3, c4) = (apdu[2], apdu[3], apdu[4], apdu[5]);
-    let apci = if c1 & 0x01 == 0 {
-        Apci::I {
-            send_sn: (c1 as u16) >> 1 | (c2 as u16) << 7,
-            recv_sn: (c3 as u16) >> 1 | (c4 as u16) << 7,
+
+    if c1 & 0x01 == 0 {
+        // I format. An I frame carries an ASDU; one without a payload has
+        // nothing to say. The low bit of the third octet is the format bit of
+        // the receive sequence number and is always zero.
+        if field_len <= APCI_CTL_FIELD_SIZE {
+            return Err(Error::Apci("I format with no ASDU"));
         }
+        if c3 & 0x01 != 0 {
+            return Err(Error::Apci("I format with bit 0 of control octet 3 set"));
+        }
+        Ok((
+            Apci::I {
+                send_sn: (c1 as u16) >> 1 | (c2 as u16) << 7,
+                recv_sn: (c3 as u16) >> 1 | (c4 as u16) << 7,
+            },
+            &apdu[6..],
+        ))
     } else if c1 & 0x03 == 0x01 {
-        Apci::S {
-            recv_sn: (c3 as u16) >> 1 | (c4 as u16) << 7,
+        // S format.
+        if field_len != APCI_CTL_FIELD_SIZE {
+            return Err(Error::Apci("S format with a length other than 4"));
         }
+        if c1 != 0x01 || c2 != 0 || c3 & 0x01 != 0 {
+            return Err(Error::Apci("S format with unused control bits set"));
+        }
+        Ok((
+            Apci::S {
+                recv_sn: (c3 as u16) >> 1 | (c4 as u16) << 7,
+            },
+            &apdu[6..],
+        ))
     } else {
-        Apci::U {
-            function: UFunction::from_bits(c1 & 0xfc),
+        // U format, c1 & 0x03 == 0x03.
+        if field_len != APCI_CTL_FIELD_SIZE {
+            return Err(Error::Apci("U format with a length other than 4"));
         }
-    };
-    (apci, &apdu[6..])
+        if c2 != 0 || c3 != 0 || c4 != 0 {
+            return Err(Error::Apci("U format with non-zero reserved octets"));
+        }
+        // The function occupies the upper six bits as three act/con pairs, and
+        // exactly one bit is set in a legal frame — a frame with two of them
+        // set is not "both", it is malformed.
+        let Some(function) = UFunction::from_bits(c1 & 0xfc) else {
+            return Err(Error::Apci("U format function is not one of the six defined"));
+        };
+        Ok((Apci::U { function }, &apdu[6..]))
+    }
 }
 
 /// Read one complete APDU into `buf`, returning its total length.
@@ -225,13 +275,13 @@ mod tests {
     fn i_frame_encodes_both_sequence_numbers() {
         let f = new_i_frame(0, 0, &[1, 2, 3]).unwrap();
         assert_eq!(f, vec![0x68, 7, 0, 0, 0, 0, 1, 2, 3]);
-        assert_eq!(parse(&f), (Apci::I { send_sn: 0, recv_sn: 0 }, &[1u8, 2, 3][..]));
+        assert_eq!(parse(&f).unwrap(), (Apci::I { send_sn: 0, recv_sn: 0 }, &[1u8, 2, 3][..]));
 
         // 15 bit numbers straddle the two octets: value << 1.
-        let f = new_i_frame(0x7fff, 0x1234, &[]).unwrap();
+        let f = new_i_frame(0x7fff, 0x1234, &[0x64]).unwrap();
         assert_eq!(&f[2..6], &[0xfe, 0xff, 0x68, 0x24]);
         assert_eq!(
-            parse(&f).0,
+            parse(&f).unwrap().0,
             Apci::I {
                 send_sn: 0x7fff,
                 recv_sn: 0x1234
@@ -251,7 +301,7 @@ mod tests {
     #[test]
     fn s_and_u_frames_round_trip() {
         let f = new_s_frame(300);
-        assert_eq!(parse(&f), (Apci::S { recv_sn: 300 }, &[][..]));
+        assert_eq!(parse(&f).unwrap(), (Apci::S { recv_sn: 300 }, &[][..]));
 
         for func in [
             UFunction::StartDtActive,
@@ -263,10 +313,8 @@ mod tests {
         ] {
             let f = new_u_frame(func);
             assert_eq!(
-                parse(&f).0,
-                Apci::U {
-                    function: Some(func)
-                }
+                parse(&f).unwrap().0,
+                Apci::U { function: func }
             );
         }
     }
@@ -284,9 +332,63 @@ mod tests {
     }
 
     #[test]
-    fn undefined_u_functions_decode_to_none() {
+    fn undefined_u_functions_are_rejected() {
+        // Two act/con bits set at once is not "both", it is malformed.
         let frame = [0x68, 4, 0x0c | 0x03, 0, 0, 0];
-        assert_eq!(parse(&frame).0, Apci::U { function: None });
+        assert_eq!(
+            parse(&frame),
+            Err(Error::Apci("U format function is not one of the six defined"))
+        );
+    }
+
+    #[test]
+    fn a_malformed_control_field_is_rejected() {
+        // Each case is a frame a conforming peer cannot produce.
+        for (frame, want) in [
+            (
+                vec![0x68, 3, 0x07, 0, 0, 0],
+                "length field does not match the octets read",
+            ),
+            (vec![0x68, 4, 0x00, 0, 0, 0], "I format with no ASDU"),
+            (
+                vec![0x68, 5, 0x00, 0, 0x01, 0, 0x64],
+                "I format with bit 0 of control octet 3 set",
+            ),
+            (
+                vec![0x68, 5, 0x01, 0, 0, 0, 0x64],
+                "S format with a length other than 4",
+            ),
+            (
+                vec![0x68, 4, 0x05, 0, 0, 0],
+                "S format with unused control bits set",
+            ),
+            (
+                vec![0x68, 4, 0x01, 0x02, 0, 0],
+                "S format with unused control bits set",
+            ),
+            (
+                vec![0x68, 4, 0x01, 0, 0x01, 0],
+                "S format with unused control bits set",
+            ),
+            (
+                vec![0x68, 5, 0x07, 0, 0, 0, 0x64],
+                "U format with a length other than 4",
+            ),
+            (
+                vec![0x68, 4, 0x07, 0, 0, 0x01],
+                "U format with non-zero reserved octets",
+            ),
+        ] {
+            assert_eq!(parse(&frame), Err(Error::Apci(want)), "frame {frame:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_short_apdu_is_rejected_without_panicking() {
+        assert_eq!(
+            parse(&[0x68, 4, 0x07]),
+            Err(Error::Apci("fewer than the minimum six octets"))
+        );
     }
 
     #[test]
@@ -309,15 +411,15 @@ mod tests {
         let n = read_apdu(&mut stream, &mut buf).await.unwrap();
         assert_eq!(n, 6);
         assert_eq!(
-            parse(&buf[..n]).0,
+            parse(&buf[..n]).unwrap().0,
             Apci::U {
-                function: Some(UFunction::StartDtActive)
+                function: UFunction::StartDtActive
             }
         );
 
         let n = read_apdu(&mut stream, &mut buf).await.unwrap();
         assert_eq!(n, 7);
-        let (apci, asdu) = parse(&buf[..n]);
+        let (apci, asdu) = parse(&buf[..n]).unwrap();
         assert_eq!(apci, Apci::I { send_sn: 0, recv_sn: 0 });
         assert_eq!(asdu, &[0x64]);
     }
@@ -332,7 +434,7 @@ mod tests {
         // The bad header is dropped and the following valid frame is returned.
         let n = read_apdu(&mut stream, &mut buf).await.unwrap();
         assert_eq!(n, 6);
-        assert!(matches!(parse(&buf[..n]).0, Apci::U { .. }));
+        assert!(matches!(parse(&buf[..n]).unwrap().0, Apci::U { .. }));
     }
 
     #[tokio::test]

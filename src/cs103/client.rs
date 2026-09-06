@@ -107,6 +107,21 @@ impl ClientOption {
         ClientOption::default()
     }
 
+    /// Set the time zone the device's CP32/CP56 time tags are expressed in.
+    ///
+    /// Applied to every ASDU this client decodes and to the time
+    /// synchronization it sends. UTC is the standard's recommendation and the
+    /// default.
+    pub fn with_time_zone(mut self, zone: crate::asdu::TimeZone) -> Self {
+        self.config.time_zone = zone;
+        self
+    }
+
+    /// The time zone time tags are interpreted in.
+    pub fn time_zone(&self) -> crate::asdu::TimeZone {
+        self.config.time_zone
+    }
+
     /// Set the configuration. Rejected if invalid.
     pub fn with_config(mut self, mut config: Config) -> Result<Self> {
         config.valid()?;
@@ -449,7 +464,9 @@ impl<H: ClientHandler> Client<H> {
                             // The standard 103 start-up: set the clock, then
                             // read the whole process image.
                             tracing::debug!(device = addr, "auto-init: time sync + interrogation");
-                            let _ = self.shared.enqueue(Asdu::time_sync(addr, Utc::now()), addr);
+                            let _ = self
+                                .shared
+                                .enqueue(Asdu::time_sync(addr, Utc::now(), cfg.time_zone), addr);
                             let _ = self
                                 .shared
                                 .enqueue(Asdu::general_interrogation(addr, 0), addr);
@@ -458,7 +475,7 @@ impl<H: ClientHandler> Client<H> {
                     }
 
                     if let Some(raw) = frame.asdu() {
-                        match Asdu::unmarshal_binary(raw) {
+                        match Asdu::unmarshal_binary(raw).map(|a| a.with_time_zone(cfg.time_zone)) {
                             Ok(pack) => dispatch(&*self.handler, self.as_link(), &pack).await,
                             Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
                         }
@@ -560,6 +577,10 @@ impl<H: ClientHandler> Link for Client<H> {
 
     fn is_link_active(&self) -> bool {
         self.is_connected() && self.shared.link_active.load(Ordering::Acquire)
+    }
+
+    fn time_zone(&self) -> crate::asdu::TimeZone {
+        self.option.time_zone()
     }
 }
 

@@ -364,7 +364,17 @@ pub(crate) async fn run<S, D>(
                 };
                 // Any I, S or U frame restarts the t3 idle timer.
                 idle_since = Instant::now();
-                let (apci, raw_asdu) = parse(&frame);
+                // A malformed control field is not acted on. Ignoring it
+                // rather than closing the link keeps a peer from being able to
+                // drop the connection with a single bad frame; the log line is
+                // what makes the sender's fault visible.
+                let (apci, raw_asdu) = match parse(&frame) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(error = %e, apdu = ?frame, "frame ignored");
+                        continue;
+                    }
+                };
 
                 match apci {
                     Apci::S { recv_sn } => {
@@ -420,7 +430,7 @@ pub(crate) async fn run<S, D>(
                     Apci::U { function } => {
                         tracing::debug!(%apci, "RX U-frame");
                         match (function, opts.role) {
-                            (Some(UFunction::StartDtActive), Role::Controlled) => {
+                            (UFunction::StartDtActive, Role::Controlled) => {
                                 if tx_raw
                                     .send(new_u_frame(UFunction::StartDtConfirm).to_vec())
                                     .await
@@ -433,7 +443,7 @@ pub(crate) async fn run<S, D>(
                                     cb(Arc::clone(&conn));
                                 }
                             }
-                            (Some(UFunction::StopDtActive), Role::Controlled) => {
+                            (UFunction::StopDtActive, Role::Controlled) => {
                                 if tx_raw
                                     .send(new_u_frame(UFunction::StopDtConfirm).to_vec())
                                     .await
@@ -446,21 +456,21 @@ pub(crate) async fn run<S, D>(
                                     cb(Arc::clone(&conn));
                                 }
                             }
-                            (Some(UFunction::StartDtConfirm), Role::Master) => {
+                            (UFunction::StartDtConfirm, Role::Master) => {
                                 conn.set_active(true);
                                 start_dt_since = None;
                                 if let Some(cb) = opts.callbacks.on_activated.as_ref() {
                                     cb(Arc::clone(&conn));
                                 }
                             }
-                            (Some(UFunction::StopDtConfirm), Role::Master) => {
+                            (UFunction::StopDtConfirm, Role::Master) => {
                                 conn.set_active(false);
                                 stop_dt_since = None;
                                 if let Some(cb) = opts.callbacks.on_deactivated.as_ref() {
                                     cb(Arc::clone(&conn));
                                 }
                             }
-                            (Some(UFunction::TestFrActive), _) => {
+                            (UFunction::TestFrActive, _) => {
                                 if tx_raw
                                     .send(new_u_frame(UFunction::TestFrConfirm).to_vec())
                                     .await
@@ -469,11 +479,10 @@ pub(crate) async fn run<S, D>(
                                     break;
                                 }
                             }
-                            (Some(UFunction::TestFrConfirm), _) => test_fr_since = None,
-                            (Some(f), role) => {
+                            (UFunction::TestFrConfirm, _) => test_fr_since = None,
+                            (f, role) => {
                                 tracing::warn!(%f, ?role, "U-frame function not valid for this role");
                             }
-                            (None, _) => tracing::error!("illegal U-frame function ignored"),
                         }
                     }
                 }

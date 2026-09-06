@@ -50,9 +50,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
 ], optional = true }
 tokio-serial = { version = "5", optional = true }
+chrono-tz = { version = "0.10", default-features = false, optional = true }
 
 [features]
-default = ["cs101", "cs103", "cs104"]
+default = ["cs101", "cs103", "cs104", "filetransfer"]
 
 # Application layer only (`asdu`) is always built.
 cs104 = []
@@ -60,12 +61,19 @@ cs104 = []
 # port backend; without it cs101/cs103 still work over their TCP transports.
 cs101 = []
 cs103 = ["cs101"]
+# The file transfer procedures (F_* types) on top of the `asdu` layer.
+# Transport agnostic: it drives any endpoint through its `Connect`.
+filetransfer = []
 serial = ["dep:tokio-serial", "cs101"]
 
 tls = ["dep:tokio-rustls"]
 serde = ["dep:serde", "dep:serde_json", "chrono/serde"]
+# Named IANA time zones (`TimeZone::Named`) for time tag interpretation, for a
+# device whose profile fixes a zone that is not the host's.
+tz = ["dep:chrono-tz"]
 
 [dev-dependencies]
+chrono-tz = { version = "0.10", default-features = false }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

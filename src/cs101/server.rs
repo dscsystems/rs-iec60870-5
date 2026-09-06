@@ -540,12 +540,20 @@ impl SecondaryState {
         self.send_resp(f).await
     }
 
+    /// The broadcast link address for the configured address width, or `None`
+    /// when the frames carry no link address at all.
+    fn broadcast_addr(&self) -> Option<u16> {
+        match self.addr_size {
+            1 => Some(0x00ff),
+            2 => Some(0xffff),
+            _ => None,
+        }
+    }
+
     /// True when `addr` addresses this station, including the broadcast address.
     fn addressed_to_us(&self, addr: u16) -> bool {
-        let broadcast = match self.addr_size {
-            1 => 0x00ff,
-            2 => 0xffff,
-            _ => return true,
+        let Some(broadcast) = self.broadcast_addr() else {
+            return true;
         };
         addr == self.link_addr || addr == broadcast
     }
@@ -570,12 +578,27 @@ impl SecondaryState {
             return out;
         }
         let ctrl = frame.control().expect("not a single character ack");
+        let broadcast = self.broadcast_addr() == Some(addr);
 
         if !ctrl.prm {
             if cfg.is_balanced() {
                 self.handle_peer_secondary_frame(ctrl, cfg);
             } else {
                 tracing::warn!("ignoring a frame with PRM=0");
+            }
+            return out;
+        }
+
+        // The broadcast address is only used with SEND/NO REPLY, because every
+        // station on the line would answer at once and the replies would
+        // collide. See IEC 60870-5-2, subclass 5.1.1. Unconfirmed user data is
+        // still acted on; anything else addressed to all stations is not a
+        // service the standard defines, and is dropped rather than answered.
+        if broadcast {
+            if ctrl.fun == prim_fc::USER_DATA_NO_CONF {
+                out.asdu = frame.asdu().map(|a| a.to_vec());
+            } else {
+                tracing::warn!(%ctrl, "broadcast frame is not SEND/NO REPLY, ignored");
             }
             return out;
         }
@@ -754,5 +777,105 @@ impl SecondaryState {
             asdu: raw,
         };
         self.prim_send_confirmed(f, cfg).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asdu::PARAMS_STANDARD_101;
+
+    fn shared() -> Shared {
+        Shared {
+            params: PARAMS_STANDARD_101,
+            max_queue: 16,
+            balanced: false,
+            connected: AtomicBool::new(true),
+            link_active: AtomicBool::new(false),
+            class1: Mutex::new(VecDeque::new()),
+            class2: Mutex::new(VecDeque::new()),
+            prim_queue: Mutex::new(VecDeque::new()),
+            active_notify: Notify::new(),
+        }
+    }
+
+    /// A secondary at link address 1 with a one octet address, plus the
+    /// receiver its outbound frames land in.
+    fn secondary() -> (SecondaryState, Config, mpsc::Receiver<Vec<u8>>) {
+        let cfg = Config {
+            link_address: 1,
+            link_addr_size: 1,
+            ..Config::default()
+        };
+        let (tx, rx) = mpsc::channel(16);
+        (SecondaryState::new(&cfg, tx), cfg, rx)
+    }
+
+    fn primary_frame(fun: u8, fcv: bool, fcb: bool, addr: u16, asdu: Vec<u8>) -> Frame {
+        let control = ControlField::primary(fun, fcv, fcb, false);
+        if asdu.is_empty() {
+            Frame::Fixed { control, link_addr: addr }
+        } else {
+            Frame::Variable { control, link_addr: addr, asdu }
+        }
+    }
+
+    // A frame sent to the broadcast address reaches every station on the line.
+    // If they all answered, the replies would collide, so IEC 60870-5-2
+    // subclass 5.1.1 only defines SEND/NO REPLY there.
+
+    #[tokio::test]
+    async fn a_broadcast_of_unconfirmed_user_data_is_delivered_but_not_answered() {
+        let (mut sec, cfg, mut rx) = secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::USER_DATA_NO_CONF, false, false, 0xff, vec![1, 2, 3]);
+
+        let out = sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(out.asdu, Some(vec![1, 2, 3]), "the ASDU is still delivered");
+        assert!(rx.try_recv().is_err(), "but nothing may go back on the line");
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_broadcast_is_dropped_rather_than_answered() {
+        for fun in [
+            prim_fc::RESET_LINK,
+            prim_fc::REQ_STATUS,
+            prim_fc::REQ_DATA1,
+            prim_fc::REQ_DATA2,
+            prim_fc::USER_DATA_CONF,
+        ] {
+            let (mut sec, cfg, mut rx) = secondary();
+            let sh = shared();
+            let f = primary_frame(fun, false, false, 0xff, Vec::new());
+
+            let out = sec.handle_frame(&f, &sh, &cfg).await;
+            assert!(!out.link_became_active, "fc {fun}");
+            assert!(rx.try_recv().is_err(), "fc {fun} must not be answered");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_does_not_disturb_the_expected_frame_count_bit() {
+        let (mut sec, cfg, _rx) = secondary();
+        let sh = shared();
+        let before = sec.fcb_expected;
+        // A broadcast that wrongly sets FCV must not move the station's FCB
+        // tracking, or the next real frame from the primary looks like a
+        // repeat and gets answered from the cache instead of acted on.
+        let f = primary_frame(prim_fc::USER_DATA_CONF, true, !before, 0xff, vec![9]);
+        sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(sec.fcb_expected, before);
+    }
+
+    #[tokio::test]
+    async fn a_frame_addressed_to_this_station_is_still_answered() {
+        // The guard above must not swallow ordinary traffic.
+        let (mut sec, cfg, mut rx) = secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
+
+        let out = sec.handle_frame(&f, &sh, &cfg).await;
+        assert!(out.link_became_active);
+        assert!(rx.try_recv().is_ok(), "a directed reset is confirmed");
     }
 }

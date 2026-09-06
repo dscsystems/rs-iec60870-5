@@ -319,7 +319,13 @@ pub fn cp32time2a(t: Option<DateTime<Utc>>, zone: TimeZone) -> [u8; CP32TIME2A_S
     };
     let (_, _, _, _, hour, min, sec, milli) = zone.parts(t);
     let msec = milli + sec * 1000;
-    [msec as u8, (msec >> 8) as u8, min as u8, hour as u8]
+    [
+        msec as u8,
+        (msec >> 8) as u8,
+        min as u8,
+        // D7 of the hour octet is SU: the reading is expressed in summer time.
+        hour as u8 | if zone.is_dst(t) { 0x80 } else { 0 },
+    ]
 }
 
 /// Decode a 4-octet CP32Time2a tag.
@@ -340,11 +346,12 @@ pub fn parse_cp32time2a(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
 
     let (year, month, day, _, _) = zone.now_parts();
     let val = zone.instant_from(year, month, day, hour, min, sec, msec)?;
-    if val > Utc::now() + Duration::minutes(5) {
-        Some(val - Duration::days(1))
+    let val = if val > Utc::now() + Duration::minutes(5) {
+        val - Duration::days(1)
     } else {
-        Some(val)
-    }
+        val
+    };
+    Some(zone.resolve_summer_time(val, b[3] & 0x80 != 0))
 }
 
 #[cfg(test)]

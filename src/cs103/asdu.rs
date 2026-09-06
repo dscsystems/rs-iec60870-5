@@ -252,6 +252,18 @@ impl Asdu {
         self
     }
 
+    /// Interpret this ASDU's CP32/CP56 time tags in `zone`.
+    ///
+    /// Defaults to [`TimeZone::Utc`], which is what the standard recommends.
+    /// The endpoints apply their configured zone
+    /// ([`ClientOption::with_time_zone`](crate::cs103::ClientOption::with_time_zone))
+    /// to every ASDU they decode and encode, so this is only needed when
+    /// building or parsing one by hand.
+    pub fn with_time_zone(mut self, zone: TimeZone) -> Self {
+        self.time_zone = zone;
+        self
+    }
+
     /// The function type of the (first) information object.
     pub fn fun(&self) -> u8 {
         self.info_obj.first().copied().unwrap_or(0)
@@ -435,15 +447,22 @@ impl Asdu {
     // -- control-direction builders ---------------------------------------
 
     /// Build a control-direction ASDU 6 (time synchronization).
-    pub fn time_sync(common_addr: u8, t: DateTime<Utc>) -> Asdu {
+    ///
+    /// `zone` is the time zone the tag is expressed in, and decides the SU
+    /// (summer time) bit. It must be the zone the device expects — normally
+    /// [`TimeZone::Utc`], which is what the standard recommends and what
+    /// [`Link::time_sync`](crate::cs103::Link::time_sync) uses unless the
+    /// endpoint is configured otherwise.
+    pub fn time_sync(common_addr: u8, t: DateTime<Utc>, zone: TimeZone) -> Asdu {
         let mut a = Asdu::new(
             TypeId::TIME_SYNC,
             vsq_one(),
             Cause::TIME_SYNC,
             common_addr,
-        );
+        )
+        .with_time_zone(zone);
         a.append(&[fun::GLOBAL, 0]);
-        a.append(&cp56time2a(Some(t), a.time_zone));
+        a.append(&cp56time2a(Some(t), zone));
         a
     }
 
@@ -757,7 +776,7 @@ mod tests {
     #[test]
     fn the_control_direction_builders_match_the_standard_layout() {
         let t = Utc.with_ymd_and_hms(2026, 8, 17, 12, 0, 0).unwrap();
-        let a = Asdu::time_sync(3, t);
+        let a = Asdu::time_sync(3, t, TimeZone::Utc);
         assert_eq!(a.type_id, TypeId::TIME_SYNC);
         assert_eq!(a.coa, Cause::TIME_SYNC);
         assert_eq!(a.info_obj[..2], [fun::GLOBAL, 0]);

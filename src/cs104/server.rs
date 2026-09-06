@@ -243,15 +243,208 @@ impl<H: ServerHandler> Connect for Server<H> {
 
     /// Broadcast a copy of `a` to every connected session.
     ///
-    /// A session that cannot take it right now (its queue is full) is skipped
-    /// with a warning rather than failing the whole broadcast.
+    /// Returns the first session's error when *every* session refused the
+    /// ASDU, and [`Error::PartialBroadcast`] when only some did — a session
+    /// whose queue is full has lost the ASDU, and reporting that is the only
+    /// way the caller can tell. With no sessions connected this is `Ok(())`.
+    ///
+    /// For bulk replies where the data must go out, use
+    /// [`Server::send_wait`], which retries the sessions that are merely
+    /// behind instead of dropping their copy.
     async fn send(&self, a: Asdu) -> Result<()> {
-        for session in self.sessions.all() {
+        let sessions = self.sessions.all();
+        let total = sessions.len();
+        let mut failed = 0usize;
+        let mut first_err = None;
+
+        for session in sessions {
             if let Err(e) = session.send(a.clone()).await {
                 tracing::warn!(peer = ?session.peer_addr(), error = %e, "broadcast to session failed");
+                failed += 1;
+                first_err.get_or_insert(e);
             }
         }
-        Ok(())
+
+        match (failed, first_err) {
+            (0, _) => Ok(()),
+            (f, Some(e)) if f == total => Err(e),
+            (failed, _) => Err(Error::PartialBroadcast { failed, total }),
+        }
+    }
+}
+
+impl<H: ServerHandler> Server<H> {
+    /// Broadcast `a`, waiting for room on a session whose queue is full
+    /// instead of losing its copy.
+    ///
+    /// A session's send buffer is finite, and [`Connect::send`] refuses the
+    /// ASDU with [`Error::BufferFull`] rather than making a protocol task
+    /// wait. That is the right default — an outstation must not stall its own
+    /// APCI state machine because one master is slow — but it puts the burden
+    /// on the caller, and the burden is easy to miss: sending a large
+    /// interrogation reply in a loop works perfectly on a small database and
+    /// quietly loses ASDUs on a large one. The outstation believes it answered
+    /// in full; the master has holes it has no way to detect.
+    ///
+    /// This waits instead, per session, so the sessions that already accepted
+    /// the ASDU are never sent a second copy. It blocks the calling task,
+    /// never a session's protocol task, so the APCI state machine keeps
+    /// running: the buffer drains as the master acknowledges and the wait
+    /// ends. Always bound it with `timeout`, so a master that has stopped
+    /// acknowledging cannot block a handler for ever.
+    ///
+    /// Errors other than a full buffer — a closed connection, an ASDU that
+    /// will not encode — are not retried, and are reported exactly as
+    /// [`Connect::send`] reports them.
+    pub async fn send_wait(&self, a: Asdu, timeout: std::time::Duration) -> Result<()> {
+        let sessions = self.sessions.all();
+        let total = sessions.len();
+        let mut failed = 0usize;
+        let mut first_err = None;
+
+        for session in sessions {
+            if let Err(e) = send_waiting(session.as_ref(), a.clone(), timeout).await {
+                failed += 1;
+                first_err.get_or_insert(e);
+            }
+        }
+
+        match (failed, first_err) {
+            (0, _) => Ok(()),
+            (f, Some(e)) if f == total => Err(e),
+            (failed, _) => Err(Error::PartialBroadcast { failed, total }),
+        }
+    }
+
+    /// The server as a [`Connect`] whose `send` waits for buffer room.
+    ///
+    /// Lets the [`ConnectExt`](crate::asdu::ConnectExt) helpers push bulk data
+    /// without the silent-loss hazard:
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use std::time::Duration;
+    /// # use rs_iec60870_5::asdu::*;
+    /// # use rs_iec60870_5::cs104::{Server, ServerHandler};
+    /// # struct H;
+    /// # #[async_trait::async_trait] impl ServerHandler for H {}
+    /// # async fn f(srv: &Arc<Server<H>>, ca: CommonAddr, points: &[SinglePointInfo])
+    /// #     -> rs_iec60870_5::Result<()> {
+    /// let w = srv.waiting(Duration::from_secs(30));
+    /// w.send_single(false, CauseOfTransmission::new(Cause::SPONTANEOUS), ca, points).await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn waiting(self: &Arc<Self>, timeout: std::time::Duration) -> WaitingServer<H> {
+        WaitingServer {
+            server: Arc::clone(self),
+            timeout,
+        }
+    }
+}
+
+/// Retry `send` on one endpoint while its buffer is full, up to `timeout`.
+async fn send_waiting<C: Connect + ?Sized>(
+    conn: &C,
+    a: Asdu,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    /// Long enough that a busy loop does not burn a core, short enough that a
+    /// draining queue is picked up promptly.
+    const RETRY: std::time::Duration = std::time::Duration::from_millis(2);
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match conn.send(a.clone()).await {
+            // Anything other than a full buffer — a closed connection, a
+            // malformed ASDU — will not be fixed by waiting.
+            Err(Error::BufferFull) => {}
+            other => return other,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::BufferFull);
+        }
+        tokio::time::sleep(RETRY.min(deadline - tokio::time::Instant::now())).await;
+    }
+}
+
+/// Wrap one endpoint so that [`Connect::send`] waits for send-buffer room
+/// instead of failing with [`Error::BufferFull`].
+///
+/// Use it for bulk replies — an interrogation over a large database — where
+/// the data must go out and arriving late is better than not arriving. Inside
+/// a [`ServerHandler`] the `&dyn Connect` argument is the single session the
+/// request came from, which is exactly what this is for:
+///
+/// ```no_run
+/// # use std::time::Duration;
+/// # use rs_iec60870_5::asdu::*;
+/// # use rs_iec60870_5::cs104::waiting;
+/// # async fn interrogation(c: &dyn Connect, pack: &Asdu,
+/// #                        batches: &[Vec<MeasuredValueFloatInfo>])
+/// #     -> rs_iec60870_5::Result<()> {
+/// c.send(pack.reply_mirror(Cause::ACTIVATION_CON)).await?;
+///
+/// // Every send below waits rather than dropping.
+/// let w = waiting(c, Duration::from_secs(30));
+/// let coa = CauseOfTransmission::new(Cause::INTERROGATED_BY_STATION);
+/// for batch in batches {
+///     w.send_measured_value_float(false, coa, pack.common_addr(), batch).await?;
+/// }
+/// c.send(pack.reply_mirror(Cause::ACTIVATION_TERM)).await
+/// # }
+/// ```
+///
+/// It blocks the calling task, never a session's own protocol task, so the
+/// APCI state machine keeps running: the buffer drains as the master
+/// acknowledges, and the wait ends. Always bound `timeout`, so a master that
+/// has stopped acknowledging cannot block a handler for ever.
+///
+/// Do not wrap a [`Server`] with this: retrying a broadcast re-sends to the
+/// sessions that already accepted the ASDU. Use [`Server::waiting`] instead,
+/// which retries only the sessions that are behind.
+pub fn waiting(conn: &dyn Connect, timeout: std::time::Duration) -> Waiting<'_> {
+    Waiting { conn, timeout }
+}
+
+/// One endpoint viewed as a [`Connect`] whose `send` waits for buffer room.
+///
+/// Built by [`waiting`].
+pub struct Waiting<'a> {
+    conn: &'a dyn Connect,
+    timeout: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl Connect for Waiting<'_> {
+    fn params(&self) -> Params {
+        self.conn.params()
+    }
+
+    async fn send(&self, a: Asdu) -> Result<()> {
+        send_waiting(self.conn, a, self.timeout).await
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.conn.peer_addr()
+    }
+}
+
+/// A [`Server`] viewed as a [`Connect`] whose `send` waits for buffer room.
+///
+/// Built by [`Server::waiting`].
+pub struct WaitingServer<H: ServerHandler> {
+    server: Arc<Server<H>>,
+    timeout: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl<H: ServerHandler> Connect for WaitingServer<H> {
+    fn params(&self) -> Params {
+        self.server.params
+    }
+
+    async fn send(&self, a: Asdu) -> Result<()> {
+        self.server.send_wait(a, self.timeout).await
     }
 }
 
@@ -409,5 +602,114 @@ impl<H: ServerHandler> Connect for ServerSpecial<H> {
             .clone()
             .ok_or(Error::UseClosedConnection)?;
         conn.send(a).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asdu::{Cause, CauseOfTransmission, Identifier, TypeId, VariableStruct};
+    use std::sync::atomic::AtomicU32;
+
+    fn asdu() -> Asdu {
+        Asdu::new(
+            PARAMS_WIDE,
+            Identifier::new(
+                TypeId::C_IC_NA_1,
+                VariableStruct::single(),
+                CauseOfTransmission::new(Cause::ACTIVATION),
+                1,
+            ),
+        )
+    }
+
+    /// An endpoint that refuses the first `full_for` sends with `BufferFull`,
+    /// standing in for a session whose queue is draining.
+    struct Flaky {
+        full_for: AtomicU32,
+        accepted: AtomicU32,
+        fatal: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Connect for Flaky {
+        fn params(&self) -> Params {
+            PARAMS_WIDE
+        }
+        async fn send(&self, _: Asdu) -> Result<()> {
+            if self.fatal {
+                return Err(Error::UseClosedConnection);
+            }
+            if self.full_for.load(Ordering::Relaxed) > 0 {
+                self.full_for.fetch_sub(1, Ordering::Relaxed);
+                return Err(Error::BufferFull);
+            }
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn flaky(full_for: u32, fatal: bool) -> Flaky {
+        Flaky {
+            full_for: AtomicU32::new(full_for),
+            accepted: AtomicU32::new(0),
+            fatal,
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_retries_a_full_buffer_until_it_drains() {
+        let c = flaky(3, false);
+        send_waiting(&c, asdu(), std::time::Duration::from_secs(5))
+            .await
+            .expect("the buffer drains before the deadline");
+        assert_eq!(c.accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_gives_up_at_the_deadline() {
+        let c = flaky(u32::MAX, false);
+        assert_eq!(
+            send_waiting(&c, asdu(), std::time::Duration::from_millis(20)).await,
+            Err(Error::BufferFull)
+        );
+        assert_eq!(c.accepted.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn waiting_does_not_retry_an_error_that_waiting_cannot_fix() {
+        // A closed connection is not going to open again; failing fast is the
+        // point, otherwise the caller blocks for the whole timeout.
+        let c = flaky(0, true);
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            send_waiting(&c, asdu(), std::time::Duration::from_secs(30)).await,
+            Err(Error::UseClosedConnection)
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_partial_broadcast_is_distinguishable_from_a_total_one() {
+        assert_ne!(
+            Error::PartialBroadcast {
+                failed: 1,
+                total: 3
+            },
+            Error::PartialBroadcast {
+                failed: 2,
+                total: 3
+            }
+        );
+        assert_eq!(
+            Error::PartialBroadcast {
+                failed: 1,
+                total: 3
+            },
+            Error::PartialBroadcast {
+                failed: 1,
+                total: 3
+            }
+        );
     }
 }

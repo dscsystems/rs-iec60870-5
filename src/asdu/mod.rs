@@ -48,6 +48,7 @@ mod cpara;
 mod cproc;
 mod csys;
 mod display;
+mod filet;
 mod identifier;
 mod info;
 mod mproc;
@@ -62,6 +63,12 @@ pub use cpara::{
 pub use cproc::{
     BitsString32CommandInfo, DoubleCommandInfo, SetpointCommandFloatInfo,
     SetpointCommandNormalInfo, SetpointCommandScaledInfo, SingleCommandInfo, StepCommandInfo,
+};
+pub use filet::{
+    AckFileOrSectionInfo, AckFileOrSectionQualifier, AfqAction, CallOrSelectFileInfo,
+    DirectoryInfo, FileError, FileReadyInfo, FileReadyQualifier, LENGTH_OF_FILE_MAX,
+    LastSectionOrSegmentInfo, LastSectionQualifier, NameOfFile, ScqAction, SectionReadyInfo,
+    SectionReadyQualifier, SegmentInfo, SelectAndCallQualifier, StatusOfFile, file_checksum,
 };
 pub use identifier::{
     Cause, CauseOfTransmission, CommonAddr, GLOBAL_COMMON_ADDR, INVALID_COMMON_ADDR, Identifier,

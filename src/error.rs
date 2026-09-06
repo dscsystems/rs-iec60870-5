@@ -73,6 +73,31 @@ pub enum Error {
     #[error("asdu: unexpected end of information object buffer")]
     UnexpectedEof,
 
+    // -- file transfer ----------------------------------------------------
+    /// The requested file does not exist in the store.
+    ///
+    /// Answered on the wire with a negative acknowledgement carrying
+    /// [`FileError::UNEXPECTED_NAME_OF_FILE`](crate::asdu::FileError::UNEXPECTED_NAME_OF_FILE).
+    #[error("filetransfer: file not found")]
+    FileNotFound,
+
+    /// An ASDU arrived for a transfer that is not running.
+    #[error("filetransfer: no transfer in progress")]
+    NoTransfer,
+
+    /// A new transfer was requested while another is still running.
+    #[error("filetransfer: a transfer is already in progress")]
+    TransferBusy,
+
+    /// A section's checksum did not match the one its sender reported.
+    #[error("filetransfer: section checksum mismatch")]
+    FileChecksum,
+
+    /// A file transfer service this implementation does not provide, or one
+    /// requested in the wrong direction.
+    #[error("filetransfer: unsupported service")]
+    FileServiceUnsupported,
+
     // -- link and transport layers ----------------------------------------
     /// The connection is closed or was never established.
     #[error("use of closed connection")]
@@ -81,6 +106,18 @@ pub enum Error {
     /// The outbound queue is full; back off and retry.
     #[error("buffer is full")]
     BufferFull,
+
+    /// A broadcast reached some of the connected sessions but not all of them.
+    ///
+    /// Carries how many of how many refused the ASDU. The sessions that
+    /// accepted it have it queued; the rest have lost it.
+    #[error("{failed} of {total} sessions could not accept the ASDU")]
+    PartialBroadcast {
+        /// Sessions that refused the ASDU.
+        failed: usize,
+        /// Sessions the broadcast was offered to.
+        total: usize,
+    },
 
     /// The outbound ASDU or class buffer is full.
     #[error("send queue is full")]
@@ -101,6 +138,20 @@ pub enum Error {
     /// An FT1.2 frame failed its checksum or length check.
     #[error("frame: {0}")]
     Frame(&'static str),
+
+    /// An IEC 60870-5-104 APDU control field is not one the standard defines.
+    ///
+    /// The frame is not acted on: a peer must not be able to change the state
+    /// of the link with a frame it had no right to send.
+    #[error("cs104: malformed APCI: {0}")]
+    Apci(&'static str),
+
+    /// An ASDU carries more information object octets than its variable
+    /// structure qualifier and type identification account for.
+    ///
+    /// See [`Params::allow_trailing_octets`](crate::asdu::Params::allow_trailing_octets).
+    #[error("asdu: trailing octets after the information objects")]
+    TrailingOctets,
 
     /// The configuration is invalid.
     #[error("config: {0}")]
@@ -129,6 +180,11 @@ impl PartialEq for Error {
         match (self, other) {
             (Io(_), _) | (_, Io(_)) => false,
             (Frame(a), Frame(b)) => a == b,
+            (Apci(a), Apci(b)) => a == b,
+            (
+                PartialBroadcast { failed: fa, total: ta },
+                PartialBroadcast { failed: fb, total: tb },
+            ) => fa == fb && ta == tb,
             (Config(a), Config(b)) => a == b,
             (InvalidAddress(a), InvalidAddress(b)) => a == b,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),

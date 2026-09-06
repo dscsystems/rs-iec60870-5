@@ -246,14 +246,19 @@ impl<H: ServerHandler> Dispatcher for ServerDispatcher<H> {
 }
 
 impl<H: ServerHandler> ServerDispatcher<H> {
-    /// Validate a dedicated request and reply with the appropriate protocol
-    /// error mirror if it is malformed. `Ok(None)` means "already answered".
-    async fn precheck(
+    /// Check the cause of transmission and common address of a dedicated
+    /// request, replying with the matching protocol error mirror when either is
+    /// wrong. `Ok(false)` means the request was already answered.
+    ///
+    /// This runs *before* the information object is decoded: a request with a
+    /// cause the type does not permit earns an `UnknownCOT` mirror whether or
+    /// not its payload also happens to be malformed, and a decode error must
+    /// not swallow that answer.
+    async fn precheck_header(
         &self,
         conn: &dyn Connect,
         pack: &Asdu,
         cause_ok: bool,
-        ioa: Option<InfoObjAddr>,
     ) -> Result<bool> {
         if !cause_ok {
             conn.send(pack.reply_mirror(Cause::UNKNOWN_COT)).await?;
@@ -263,7 +268,18 @@ impl<H: ServerHandler> ServerDispatcher<H> {
             conn.send(pack.reply_mirror(Cause::UNKNOWN_CA)).await?;
             return Ok(false);
         }
-        if ioa.is_some_and(|a| a != INFO_OBJ_ADDR_IRRELEVANT) {
+        Ok(true)
+    }
+
+    /// Check the information object address of a request that must carry the
+    /// irrelevant one, replying `UnknownIOA` when it does not.
+    async fn precheck_ioa(
+        &self,
+        conn: &dyn Connect,
+        pack: &Asdu,
+        ioa: InfoObjAddr,
+    ) -> Result<bool> {
+        if ioa != INFO_OBJ_ADDR_IRRELEVANT {
             conn.send(pack.reply_mirror(Cause::UNKNOWN_IOA)).await?;
             return Ok(false);
         }
@@ -274,54 +290,66 @@ impl<H: ServerHandler> ServerDispatcher<H> {
         let cause = pack.coa().cause;
         match pack.type_id() {
             TypeId::C_IC_NA_1 => {
-                let (ioa, qoi) = pack.get_interrogation_cmd()?;
                 let ok = cause == Cause::ACTIVATION || cause == Cause::DEACTIVATION;
-                if self.precheck(conn, pack, ok, Some(ioa)).await? {
-                    self.handler.interrogation(conn, pack, qoi).await?;
+                if self.precheck_header(conn, pack, ok).await? {
+                    let (ioa, qoi) = pack.get_interrogation_cmd()?;
+                    if self.precheck_ioa(conn, pack, ioa).await? {
+                        self.handler.interrogation(conn, pack, qoi).await?;
+                    }
                 }
             }
             TypeId::C_CI_NA_1 => {
-                let (ioa, qcc) = pack.get_counter_interrogation_cmd()?;
                 let ok = cause == Cause::ACTIVATION;
-                if self.precheck(conn, pack, ok, Some(ioa)).await? {
-                    self.handler.counter_interrogation(conn, pack, qcc).await?;
+                if self.precheck_header(conn, pack, ok).await? {
+                    let (ioa, qcc) = pack.get_counter_interrogation_cmd()?;
+                    if self.precheck_ioa(conn, pack, ioa).await? {
+                        self.handler.counter_interrogation(conn, pack, qcc).await?;
+                    }
                 }
             }
             TypeId::C_RD_NA_1 => {
-                let ioa = pack.get_read_cmd()?;
-                // A read command names a real point, so the IOA is not checked.
                 let ok = cause == Cause::REQUEST;
-                if self.precheck(conn, pack, ok, None).await? {
+                if self.precheck_header(conn, pack, ok).await? {
+                    // A read command names a real point, so the IOA is not checked.
+                    let ioa = pack.get_read_cmd()?;
                     self.handler.read(conn, pack, ioa).await?;
                 }
             }
             TypeId::C_CS_NA_1 => {
-                let (ioa, time) = pack.get_clock_synchronization_cmd()?;
                 let ok = cause == Cause::ACTIVATION;
-                if self.precheck(conn, pack, ok, Some(ioa)).await? {
-                    self.handler.clock_sync(conn, pack, time).await?;
+                if self.precheck_header(conn, pack, ok).await? {
+                    let (ioa, time) = pack.get_clock_synchronization_cmd()?;
+                    if self.precheck_ioa(conn, pack, ioa).await? {
+                        self.handler.clock_sync(conn, pack, time).await?;
+                    }
                 }
             }
             TypeId::C_TS_NA_1 => {
-                let (ioa, _) = pack.get_test_command()?;
                 let ok = cause == Cause::ACTIVATION;
-                if self.precheck(conn, pack, ok, Some(ioa)).await? {
-                    // Test commands are confirmed by the session itself.
-                    conn.send(pack.reply_mirror(Cause::ACTIVATION_CON)).await?;
+                if self.precheck_header(conn, pack, ok).await? {
+                    let (ioa, _) = pack.get_test_command()?;
+                    if self.precheck_ioa(conn, pack, ioa).await? {
+                        // Test commands are confirmed by the session itself.
+                        conn.send(pack.reply_mirror(Cause::ACTIVATION_CON)).await?;
+                    }
                 }
             }
             TypeId::C_RP_NA_1 => {
-                let (ioa, qrp) = pack.get_reset_process_cmd()?;
                 let ok = cause == Cause::ACTIVATION;
-                if self.precheck(conn, pack, ok, Some(ioa)).await? {
-                    self.handler.reset_process(conn, pack, qrp).await?;
+                if self.precheck_header(conn, pack, ok).await? {
+                    let (ioa, qrp) = pack.get_reset_process_cmd()?;
+                    if self.precheck_ioa(conn, pack, ioa).await? {
+                        self.handler.reset_process(conn, pack, qrp).await?;
+                    }
                 }
             }
             TypeId::C_CD_NA_1 => {
-                let (ioa, msec) = pack.get_delay_acquire_command()?;
                 let ok = cause == Cause::ACTIVATION || cause == Cause::SPONTANEOUS;
-                if self.precheck(conn, pack, ok, Some(ioa)).await? {
-                    self.handler.delay_acquisition(conn, pack, msec).await?;
+                if self.precheck_header(conn, pack, ok).await? {
+                    let (ioa, msec) = pack.get_delay_acquire_command()?;
+                    if self.precheck_ioa(conn, pack, ioa).await? {
+                        self.handler.delay_acquisition(conn, pack, msec).await?;
+                    }
                 }
             }
             _ => {

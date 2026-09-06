@@ -109,5 +109,5 @@ pub use config::{
 };
 pub use connection::{Connection, IoStream};
 pub use handler::{ClientContext, ClientHandler, ServerHandler};
-pub use server::{Server, ServerSpecial};
+pub use server::{Server, ServerSpecial, Waiting, WaitingServer, waiting};
 pub use crate::net::{Endpoint, Stream, TlsClientConfig, TlsServerConfig};

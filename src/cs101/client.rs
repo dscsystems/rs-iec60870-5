@@ -55,6 +55,12 @@ struct Secondary {
     fcb: bool,
     /// A response set ACD: a class 1 request is due.
     want_class1: bool,
+    /// The last response set DFC: the station's buffers are full, so it must
+    /// not be sent more user data until it clears the bit.
+    ///
+    /// See IEC 60870-5-2, subclass 5.1.3. Class polls and link management stay
+    /// allowed — they are what lets the station report that it has drained.
+    busy: bool,
 }
 
 /// A confirmed frame awaiting an acknowledgement.
@@ -658,6 +664,7 @@ impl LinkState {
                         phase: Phase::Status,
                         fcb: false,
                         want_class1: false,
+                        busy: false,
                     },
                 )
             })
@@ -795,6 +802,7 @@ impl LinkState {
         if let Some(sec) = self.secs.get_mut(&p.addr) {
             sec.phase = Phase::Status;
             sec.want_class1 = false;
+            sec.busy = false;
         }
         self.retry_count = 0;
         self.t1_at = None;
@@ -829,8 +837,15 @@ impl LinkState {
             return active;
         }
 
-        if ctrl.dfc {
-            tracing::warn!(addr, "the station signals data flow control (buffers full)");
+        // DFC is carried by every secondary frame, so each one is also the
+        // station's latest word on whether it can take more user data.
+        if let Some(sec) = self.secs.get_mut(&addr) {
+            if ctrl.dfc && !sec.busy {
+                tracing::warn!(addr, "station signals data flow control, holding user data");
+            } else if !ctrl.dfc && sec.busy {
+                tracing::debug!(addr, "station cleared data flow control");
+            }
+            sec.busy = ctrl.dfc;
         }
 
         match frame {
@@ -983,11 +998,12 @@ impl LinkState {
                         tracing::error!(addr, "dropping a queued ASDU for an unknown station");
                         q.remove(i);
                     }
-                    Some(sec) if sec.phase == Phase::Active => {
+                    Some(sec) if sec.phase == Phase::Active && !sec.busy => {
                         found = q.remove(i);
                         break;
                     }
-                    // Not active yet: leave it queued and look further on.
+                    // Not active, or holding off under DFC: leave it queued
+                    // and look further on.
                     Some(_) => i += 1,
                 }
             }
@@ -1051,6 +1067,7 @@ impl LinkState {
         if let Some(sec) = self.secs.get_mut(&addr) {
             sec.phase = Phase::Status;
             sec.want_class1 = false;
+            sec.busy = false;
         }
         // Point to point: losing the only peer means losing the connection, so
         // the manager can reopen it. On a multi-drop line keep serving the rest.
@@ -1101,5 +1118,105 @@ impl LinkState {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asdu::{Cause, CauseOfTransmission, Identifier, TypeId, VariableStruct};
+
+    fn shared() -> Shared {
+        Shared {
+            params: PARAMS_STANDARD_101,
+            max_queue: 16,
+            default_addr: 1,
+            connected: AtomicBool::new(true),
+            link_active: AtomicBool::new(true),
+            queue: Mutex::new(VecDeque::new()),
+            link_req: mpsc::unbounded_channel().0,
+            active_notify: Notify::new(),
+        }
+    }
+
+    fn asdu() -> Asdu {
+        Asdu::new(
+            PARAMS_STANDARD_101,
+            Identifier::new(
+                TypeId::C_IC_NA_1,
+                VariableStruct::single(),
+                CauseOfTransmission::new(Cause::ACTIVATION),
+                1,
+            ),
+        )
+    }
+
+    /// A primary with one active secondary at address 1, plus the receiver its
+    /// outbound frames land in.
+    fn primary() -> (LinkState, mpsc::Receiver<Vec<u8>>) {
+        let option = ClientOption::new();
+        let (tx, rx) = mpsc::channel(16);
+        let mut link = LinkState::new(&option, tx);
+        link.secs.get_mut(&1).unwrap().phase = Phase::Active;
+        (link, rx)
+    }
+
+    fn secondary_frame(fun: u8, acd: bool, dfc: bool) -> Frame {
+        let mut control = ControlField::secondary(fun, acd, false);
+        control.dfc = dfc;
+        Frame::Fixed { control, link_addr: 1 }
+    }
+
+    // DFC is the secondary saying its buffers are full. IEC 60870-5-2 subclass
+    // 5.1.3 requires the primary to stop sending user data until it clears —
+    // sending anyway is how a station's buffer overruns and drops data.
+
+    #[tokio::test]
+    async fn user_data_is_held_while_the_station_signals_dfc() {
+        let (mut link, mut rx) = primary();
+        let sh = shared();
+        sh.queue.lock().unwrap().push_back(Outgoing { asdu: asdu(), addr: 1 });
+
+        link.handle_frame(&secondary_frame(sec_fc::CONF_ACK, false, true), false)
+            .await;
+        assert!(link.secs[&1].busy, "the station reported DFC");
+
+        let sent = link.try_send_queued(&sh, Duration::from_secs(1)).await;
+        assert!(!sent, "no user data may go out while DFC is set");
+        assert_eq!(sh.queue.lock().unwrap().len(), 1, "and it stays queued");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_data_goes_out_once_the_station_clears_dfc() {
+        let (mut link, _rx) = primary();
+        let sh = shared();
+        sh.queue.lock().unwrap().push_back(Outgoing { asdu: asdu(), addr: 1 });
+
+        link.handle_frame(&secondary_frame(sec_fc::CONF_ACK, false, true), false)
+            .await;
+        assert!(!link.try_send_queued(&sh, Duration::from_secs(1)).await);
+
+        // The next response clears DFC: the station has drained.
+        link.last_sent = None;
+        link.handle_frame(&secondary_frame(sec_fc::CONF_ACK, false, false), false)
+            .await;
+        assert!(!link.secs[&1].busy);
+
+        assert!(link.try_send_queued(&sh, Duration::from_secs(1)).await);
+        assert!(sh.queue.lock().unwrap().is_empty(), "the ASDU went out");
+    }
+
+    #[tokio::test]
+    async fn a_busy_station_is_still_polled() {
+        // Class polls and link management stay allowed under DFC — they are
+        // what lets the station report that it has drained. Only user data is
+        // held back.
+        let (mut link, mut rx) = primary();
+        let sh = shared();
+        link.secs.get_mut(&1).unwrap().busy = true;
+
+        link.tick(&sh, false).await;
+        assert!(rx.try_recv().is_ok(), "the poll still goes out");
     }
 }

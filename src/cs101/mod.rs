@@ -105,8 +105,8 @@ pub use config::{
     TcpConfig, TransmissionMode, TransportType,
 };
 pub use frame::{
-    ControlField, Frame, MAX_FRAME_LEN, SINGLE_CHAR_ACK, START_FIXED, START_VARIABLE, prim_fc,
-    read_frame, sec_fc,
+    ControlField, Frame, MAX_FRAME_LEN, MAX_LENGTH_FIELD, SINGLE_CHAR_ACK, START_FIXED,
+    START_VARIABLE, max_asdu_len, prim_fc, read_frame, sec_fc,
 };
 pub use handler::{ClientHandler, ServerHandler};
 pub use server::Server;
