@@ -52,12 +52,11 @@ jobs:
     name: ${{ matrix.target }}
     needs: verify
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional || false }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # -- tier 1 --------------------------------------------------------
+          # -- tier 1: major platforms ------------------------------------------
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
@@ -69,40 +68,6 @@ jobs:
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-
-          # -- statically linked Linux, for containers and appliances --------
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            cross: true
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            cross: true
-
-          # -- 32-bit ARM, the usual substation gateway and RTU hardware -----
-          - target: armv7-unknown-linux-gnueabihf
-            os: ubuntu-latest
-            cross: true
-          - target: armv7-unknown-linux-musleabihf
-            os: ubuntu-latest
-            cross: true
-          - target: arm-unknown-linux-gnueabihf
-            os: ubuntu-latest
-            cross: true
-
-          # -- other 64-bit hosts --------------------------------------------
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-          - target: i686-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-          - target: riscv64gc-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-            optional: true
-          - target: x86_64-unknown-freebsd
-            os: ubuntu-latest
-            cross: true
-            optional: true # build only; no runner exists to test it
 
     steps:
       - uses: actions/checkout@v4
