@@ -90,6 +90,30 @@ pub mod prim_fc {
     pub const REQ_DATA2: u8 = 11;
 }
 
+/// The FCV a primary frame must carry for its function code, or `None` for a
+/// code the standard does not define.
+///
+/// IEC 60870-5-2, table 1: the SEND/CONFIRM user data and test services and
+/// the class 1/2 requests count frames (FCV = 1); the resets, SEND/NO REPLY and
+/// the status and access-demand requests do not (FCV = 0). A frame that
+/// disagrees was not produced by a conforming primary, and letting it move the
+/// frame count bit would make the next genuine frame look like a repeat.
+pub(crate) const fn fcv_required(fun: u8) -> Option<bool> {
+    match fun {
+        prim_fc::RESET_LINK
+        | prim_fc::RESET_USER
+        | prim_fc::USER_DATA_NO_CONF
+        | prim_fc::REQ_ACCESS
+        | prim_fc::REQ_STATUS => Some(false),
+        // Function code 7 is the IEC 60870-5-103 reset of the frame count bit.
+        7 => Some(false),
+        prim_fc::TEST_LINK | prim_fc::USER_DATA_CONF | prim_fc::REQ_DATA1 | prim_fc::REQ_DATA2 => {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
 /// Function codes sent by the secondary station (PRM = 0).
 pub mod sec_fc {
     /// 0: positive acknowledgement

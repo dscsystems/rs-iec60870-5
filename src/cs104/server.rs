@@ -17,6 +17,7 @@ use crate::cs104::client::ClientOption;
 use crate::cs104::config::Config;
 use crate::cs104::connection::{Callbacks, Connection, Role, RunOptions, run};
 use crate::cs104::handler::{ServerDispatcher, ServerHandler};
+use crate::cs104::redundancy::{Groups, Route, ServerMode, outcome};
 use crate::net::{TlsServerConfig, accept_stream, connect_endpoint};
 use crate::error::{Error, Result};
 
@@ -38,10 +39,6 @@ impl Sessions {
         self.live.lock().unwrap().remove(&id);
     }
 
-    fn all(&self) -> Vec<Arc<Connection>> {
-        self.live.lock().unwrap().values().cloned().collect()
-    }
-
     fn len(&self) -> usize {
         self.live.lock().unwrap().len()
     }
@@ -50,16 +47,26 @@ impl Sessions {
 /// An IEC 60870-5-104 controlled station (outstation / slave) that listens for
 /// masters.
 ///
-/// Any number of masters may be connected at once. [`Connect::send`] on the
-/// server **broadcasts a copy to every session**, which is how spontaneous data
-/// is published; inside a handler, the `&dyn Connect` argument is the single
-/// session the request came from, so replies go only to that master.
+/// Any number of masters may be connected at once, up to
+/// [`Server::with_max_connections`]. [`Connect::send`] on the server
+/// **broadcasts** spontaneous data, once per redundancy group (see
+/// [`ServerMode`]): to the group's connection in data transfer, or into the
+/// group's event buffer while none is. Inside a handler, the `&dyn Connect`
+/// argument is the single session the request came from, so replies go only
+/// to that master.
 pub struct Server<H: ServerHandler> {
     config: Config,
     params: Params,
     handler: Arc<H>,
     tls: Option<TlsServerConfig>,
     sessions: Arc<Sessions>,
+    mode: ServerMode,
+    event_buffer: usize,
+    groups: Arc<Mutex<Groups>>,
+    max_connections: Option<usize>,
+    /// Connections accepted and not yet closed, counted from the accept so a
+    /// burst of connections cannot slip past the limit.
+    open: Arc<AtomicUsize>,
     shutdown: watch::Sender<bool>,
     server_number: usize,
     serving: AtomicBool,
@@ -75,6 +82,11 @@ impl<H: ServerHandler> Server<H> {
             handler: Arc::new(handler),
             tls: None,
             sessions: Arc::new(Sessions::default()),
+            mode: ServerMode::default(),
+            event_buffer: 0,
+            groups: Arc::new(Mutex::new(Groups::new(ServerMode::default(), 0))),
+            max_connections: None,
+            open: Arc::new(AtomicUsize::new(0)),
             shutdown: watch::channel(false).0,
             server_number: 0,
             serving: AtomicBool::new(false),
@@ -122,9 +134,52 @@ impl<H: ServerHandler> Server<H> {
         self
     }
 
+    /// Set how connected masters are grouped for spontaneous data.
+    ///
+    /// The default, [`ServerMode::ConnectionIsRedundancyGroup`], sends every
+    /// broadcast to every master in data transfer. Use
+    /// [`ServerMode::SingleRedundancyGroup`] when the masters are one
+    /// redundant control system — a main and a standby — so that only the one
+    /// in data transfer is sent data, and starting another switches over.
+    pub fn with_mode(mut self: Arc<Self>, mode: ServerMode) -> Arc<Self> {
+        let s = Arc::get_mut(&mut self).expect("configure before serving");
+        s.mode = mode;
+        s.groups = Arc::new(Mutex::new(Groups::new(s.mode.clone(), s.event_buffer)));
+        self
+    }
+
+    /// Keep up to `n` ASDUs per redundancy group while none of its masters is
+    /// in data transfer, and replay them, oldest first, to the next one that
+    /// starts. Zero, the default, keeps nothing.
+    ///
+    /// With a fixed group ([`ServerMode::SingleRedundancyGroup`] or
+    /// [`ServerMode::MultipleRedundancyGroups`]) the buffer exists even while
+    /// no master is connected, so events raised during an outage of the
+    /// control centre are delivered when it returns. A full buffer refuses
+    /// further data — reported by `send` — rather than overwriting what it
+    /// holds.
+    pub fn with_event_buffer(mut self: Arc<Self>, n: usize) -> Arc<Self> {
+        let s = Arc::get_mut(&mut self).expect("configure before serving");
+        s.event_buffer = n;
+        s.groups = Arc::new(Mutex::new(Groups::new(s.mode.clone(), n)));
+        self
+    }
+
+    /// Refuse connections beyond `n` open at once. Unlimited by default.
+    pub fn with_max_connections(mut self: Arc<Self>, n: usize) -> Arc<Self> {
+        let s = Arc::get_mut(&mut self).expect("configure before serving");
+        s.max_connections = Some(n);
+        self
+    }
+
     /// The ASDU parameters in use.
     pub fn params(&self) -> Params {
         self.params
+    }
+
+    /// How many ASDUs wait in the redundancy groups' event buffers.
+    pub fn buffered_count(&self) -> usize {
+        self.groups.lock().unwrap().buffered()
     }
 
     /// How many masters are connected.
@@ -165,8 +220,25 @@ impl<H: ServerHandler> Server<H> {
                 }
             };
 
+            if self
+                .max_connections
+                .is_some_and(|max| self.open.load(Ordering::Acquire) >= max)
+            {
+                tracing::warn!(%peer, "connection limit reached, refusing the master");
+                continue;
+            }
+            let Some(group) = self.groups.lock().unwrap().admit(peer.ip()) else {
+                tracing::warn!(%peer, "the master belongs to no redundancy group, refused");
+                continue;
+            };
+
+            self.open.fetch_add(1, Ordering::AcqRel);
             let this = Arc::clone(self);
-            tokio::spawn(async move { this.serve_one(tcp, peer).await });
+            let open = Arc::clone(&self.open);
+            tokio::spawn(async move {
+                this.serve_one(tcp, peer, group).await;
+                open.fetch_sub(1, Ordering::AcqRel);
+            });
         }
 
         self.serving.store(false, Ordering::Release);
@@ -174,7 +246,7 @@ impl<H: ServerHandler> Server<H> {
         Ok(())
     }
 
-    async fn serve_one(self: Arc<Self>, tcp: tokio::net::TcpStream, peer: SocketAddr) {
+    async fn serve_one(self: Arc<Self>, tcp: tokio::net::TcpStream, peer: SocketAddr, group: usize) {
         let stream = match accept_stream(tcp, self.tls.as_ref()).await {
             Ok(s) => s,
             Err(e) => {
@@ -194,22 +266,27 @@ impl<H: ServerHandler> Server<H> {
             role: Role::Controlled,
             peer: Some(peer),
             auto_start_dt: false,
-            callbacks: server_callbacks(&self.handler),
+            callbacks: server_callbacks(&self.handler, Some(&self.groups)),
         };
 
         let sessions = Arc::clone(&self.sessions);
-        let mut id = None;
+        let groups = Arc::clone(&self.groups);
+        let mut joined: Option<(usize, Arc<Connection>)> = None;
         run(
             stream,
             opts,
             dispatcher,
             self.shutdown.subscribe(),
-            |c| id = Some(sessions.insert(c)),
+            |c| {
+                groups.lock().unwrap().join(group, Arc::clone(&c));
+                joined = Some((sessions.insert(Arc::clone(&c)), c));
+            },
         )
         .await;
 
-        if let Some(id) = id {
+        if let Some((id, conn)) = joined {
             self.sessions.remove(id);
+            self.groups.lock().unwrap().leave(&conn);
         }
         tracing::debug!(%peer, "master disconnected");
     }
@@ -220,8 +297,27 @@ impl<H: ServerHandler> Server<H> {
     }
 }
 
-fn server_callbacks<H: ServerHandler>(handler: &Arc<H>) -> Callbacks {
+/// The callbacks of a controlled-station session. `groups` is `None` for the
+/// single connection of a [`ServerSpecial`], which belongs to no group.
+fn server_callbacks<H: ServerHandler>(
+    handler: &Arc<H>,
+    groups: Option<&Arc<Mutex<Groups>>>,
+) -> Callbacks {
     let mut cb = Callbacks::default();
+    if let Some(groups) = groups {
+        // Group bookkeeping runs inline, under the groups' lock, so a
+        // broadcast racing a switchover sees either the old connection or the
+        // new one and the replayed buffer, never a mixture that reorders or
+        // drops data.
+        let g = Arc::clone(groups);
+        cb.on_activated = Some(Arc::new(move |c: Arc<Connection>| {
+            g.lock().unwrap().activated(&c);
+        }));
+        let g = Arc::clone(groups);
+        cb.on_deactivated = Some(Arc::new(move |c: Arc<Connection>| {
+            g.lock().unwrap().deactivated(&c);
+        }));
+    }
     let h = Arc::clone(handler);
     cb.on_connect = Some(Arc::new(move |c: Arc<Connection>| {
         let h = Arc::clone(&h);
@@ -241,35 +337,35 @@ impl<H: ServerHandler> Connect for Server<H> {
         self.params
     }
 
-    /// Broadcast a copy of `a` to every connected session.
+    /// Broadcast a copy of `a`, once per redundancy group: to the group's
+    /// connection in data transfer, or into its event buffer while none is.
     ///
-    /// Returns the first session's error when *every* session refused the
-    /// ASDU, and [`Error::PartialBroadcast`] when only some did — a session
-    /// whose queue is full has lost the ASDU, and reporting that is the only
-    /// way the caller can tell. With no sessions connected this is `Ok(())`.
+    /// Stopped connections — a master that has not sent STARTDT yet, or a
+    /// standby — are never sent data directly.
+    ///
+    /// Returns [`Error::NotActive`] when the ASDU went nowhere — no connection
+    /// in data transfer and no buffer to keep it; the group's error when
+    /// *every* group refused it; and [`Error::PartialBroadcast`] when only some
+    /// did — a connection whose queue is full, or a full buffer, has lost the
+    /// ASDU, and reporting that is the only way the caller can tell.
     ///
     /// For bulk replies where the data must go out, use
-    /// [`Server::send_wait`], which retries the sessions that are merely
+    /// [`Server::send_wait`], which retries the connections that are merely
     /// behind instead of dropping their copy.
     async fn send(&self, a: Asdu) -> Result<()> {
-        let sessions = self.sessions.all();
-        let total = sessions.len();
-        let mut failed = 0usize;
-        let mut first_err = None;
-
-        for session in sessions {
-            if let Err(e) = session.send(a.clone()).await {
-                tracing::warn!(peer = ?session.peer_addr(), error = %e, "broadcast to session failed");
-                failed += 1;
-                first_err.get_or_insert(e);
-            }
-        }
-
-        match (failed, first_err) {
-            (0, _) => Ok(()),
-            (f, Some(e)) if f == total => Err(e),
-            (failed, _) => Err(Error::PartialBroadcast { failed, total }),
-        }
+        let routes = self.groups.lock().unwrap().route(&a);
+        let results: Vec<Result<()>> = routes
+            .into_iter()
+            .map(|r| match r {
+                Route::Sent | Route::Buffered => Ok(()),
+                Route::Refused(c, e) => {
+                    tracing::warn!(peer = ?c.peer_addr(), error = %e, "broadcast to session failed");
+                    Err(e)
+                }
+                Route::Lost(e) => Err(e),
+            })
+            .collect();
+        outcome(&results)
     }
 }
 
@@ -297,23 +393,20 @@ impl<H: ServerHandler> Server<H> {
     /// will not encode — are not retried, and are reported exactly as
     /// [`Connect::send`] reports them.
     pub async fn send_wait(&self, a: Asdu, timeout: std::time::Duration) -> Result<()> {
-        let sessions = self.sessions.all();
-        let total = sessions.len();
-        let mut failed = 0usize;
-        let mut first_err = None;
-
-        for session in sessions {
-            if let Err(e) = send_waiting(session.as_ref(), a.clone(), timeout).await {
-                failed += 1;
-                first_err.get_or_insert(e);
-            }
+        let routes = self.groups.lock().unwrap().route(&a);
+        let mut results = Vec::with_capacity(routes.len());
+        for r in routes {
+            results.push(match r {
+                Route::Sent | Route::Buffered => Ok(()),
+                // Only a connection that is merely behind is worth waiting
+                // for; the retry runs with the lock released.
+                Route::Refused(c, Error::BufferFull) => {
+                    send_waiting(c.as_ref(), a.clone(), timeout).await
+                }
+                Route::Refused(_, e) | Route::Lost(e) => Err(e),
+            });
         }
-
-        match (failed, first_err) {
-            (0, _) => Ok(()),
-            (f, Some(e)) if f == total => Err(e),
-            (failed, _) => Err(Error::PartialBroadcast { failed, total }),
-        }
+        outcome(&results)
     }
 
     /// The server as a [`Connect`] whose `send` waits for buffer room.
@@ -563,7 +656,7 @@ impl<H: ServerHandler> ServerSpecial<H> {
                 role: Role::Controlled,
                 peer,
                 auto_start_dt: false,
-                callbacks: server_callbacks(&self.handler),
+                callbacks: server_callbacks(&self.handler, None),
             };
 
             let this = Arc::clone(&self);

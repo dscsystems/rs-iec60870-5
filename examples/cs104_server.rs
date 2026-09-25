@@ -11,7 +11,7 @@
 //! ```
 //!
 //! Point a master at it — `cargo run --example cs104_client`, QTester104,
-//! `lib60870`, or anything else that speaks 104.
+//! OpenMUC j60870, or anything else that speaks 104.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,6 +96,7 @@ impl ServerHandler for Outstation {
                 value: image.temperature,
                 qds: QualityDescriptor::GOOD,
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -126,6 +127,7 @@ impl ServerHandler for Outstation {
                     ..Default::default()
                 },
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -265,6 +267,7 @@ async fn main() -> rs_iec60870_5::Result<()> {
                             value: temperature,
                             qds: QualityDescriptor::GOOD,
                             time: now,
+                            time_flags: TimeTagFlags::GOOD,
                         }],
                     )
                     .await;
@@ -281,6 +284,7 @@ async fn main() -> rs_iec60870_5::Result<()> {
                                 ..Default::default()
                             },
                             time: now,
+                            time_flags: TimeTagFlags::GOOD,
                         }],
                     )
                     .await;

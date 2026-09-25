@@ -93,6 +93,7 @@ impl ServerHandler for Outstation {
                 value: image.temperature,
                 qds: QualityDescriptor::GOOD,
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -226,6 +227,7 @@ async fn main() -> rs_iec60870_5::Result<()> {
                     value: temperature,
                     qds: QualityDescriptor::GOOD,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 }],
             )
             .await

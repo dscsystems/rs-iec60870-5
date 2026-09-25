@@ -23,7 +23,7 @@ use crate::asdu::{
     QualifierCountCall, QualifierOfInterrogation, QualifierOfResetProcessCmd,
 };
 use crate::cs101::config::Config;
-use crate::cs101::frame::{ControlField, Frame, prim_fc, read_frame, sec_fc};
+use crate::cs101::frame::{ControlField, Frame, fcv_required, prim_fc, read_frame, sec_fc};
 use crate::cs101::handler::{ClientHandler, dispatch_client};
 use crate::cs101::transport::Transporter;
 use crate::error::{Error, Result};
@@ -61,6 +61,25 @@ struct Secondary {
     /// See IEC 60870-5-2, subclass 5.1.3. Class polls and link management stay
     /// allowed — they are what lets the station report that it has drained.
     busy: bool,
+}
+
+/// What a positive confirmation completed.
+struct Confirmed {
+    /// Function code of the primary frame that was confirmed.
+    fun: u8,
+    /// The station whose link it activated, when it was a link reset.
+    became_active: Option<u16>,
+}
+
+/// What handling one received frame produced.
+#[derive(Default)]
+struct FrameOutcome {
+    /// Stations whose link just became active.
+    newly_active: Vec<u16>,
+    /// The frame carries user data that is new and belongs to the
+    /// application. False for a repeat, an unsolicited response, and anything
+    /// from a station this client does not serve.
+    deliver: bool,
 }
 
 /// A confirmed frame awaiting an acknowledgement.
@@ -435,13 +454,13 @@ impl<H: ClientHandler> Client<H> {
                         self.handler.on_connect(self.as_connect()).await;
                     }
 
-                    let newly_active = link.handle_frame(&frame, balanced).await;
-                    for addr in newly_active {
+                    let outcome = link.handle_frame(&frame, balanced).await;
+                    for addr in outcome.newly_active {
                         self.handler.on_link_active(self.as_connect(), addr).await;
                     }
                     self.publish_link_active(&link);
 
-                    if let Some(asdu) = frame.asdu() {
+                    if let Some(asdu) = frame.asdu().filter(|_| outcome.deliver) {
                         match Asdu::unmarshal_binary(self.option.params, asdu) {
                             Ok(pack) => {
                                 dispatch_client(
@@ -642,6 +661,8 @@ struct LinkState {
     retry_count: u32,
     /// Balanced mode: the FCB expected on the peer's next FCV frame.
     fcb_expected: bool,
+    /// Acknowledge the peer's frames with `E5` in balanced mode.
+    single_char_ack: bool,
     t1_at: Option<Instant>,
     addr_size: u8,
     dir: bool,
@@ -680,6 +701,7 @@ impl LinkState {
             addr_size: option.config.link_addr_size,
             // In balanced mode this station is station A and sets DIR.
             dir: option.config.is_balanced(),
+            single_char_ack: option.config.use_single_char_ack,
             t1_duration: option.config.timeout_response_t1,
             default_addr: option.default_addr(),
             out,
@@ -735,19 +757,25 @@ impl LinkState {
     /// Send a secondary (PRM = 0) response; used by the balanced-mode
     /// secondary role of this station.
     async fn send_sec_fixed(&self, fun: u8, addr: u16) -> bool {
-        self.write(&Frame::Fixed {
-            control: ControlField::secondary(fun, false, self.dir),
-            link_addr: addr,
-        })
-        .await
+        // A positive acknowledgement may be the single character E5 when that
+        // is configured; balanced mode has no access demand to lose by it.
+        let frame = if fun == sec_fc::CONF_ACK && self.single_char_ack {
+            Frame::SingleCharAck
+        } else {
+            Frame::Fixed {
+                control: ControlField::secondary(fun, false, self.dir),
+                link_addr: addr,
+            }
+        };
+        self.write(&frame).await
     }
 
     /// Complete the outstanding transaction positively.
     ///
     /// `addr_valid` is false for a single-character acknowledgement, which
-    /// carries no link address. Returns the station whose link just became
-    /// active, if any.
-    fn confirm_positive(&mut self, addr: u16, addr_valid: bool) -> Option<u16> {
+    /// carries no link address. Returns `None` when there was no transaction
+    /// from that station to complete.
+    fn confirm_positive(&mut self, addr: u16, addr_valid: bool) -> Option<Confirmed> {
         let Some(p) = self.last_sent.take() else {
             tracing::warn!("received a confirmation with no frame outstanding");
             return None;
@@ -788,7 +816,10 @@ impl LinkState {
         }
         self.retry_count = 0;
         self.t1_at = None;
-        became_active
+        Some(Confirmed {
+            fun: p.ctrl.fun,
+            became_active,
+        })
     }
 
     /// Abort the outstanding transaction without toggling the FCB and send the
@@ -808,21 +839,23 @@ impl LinkState {
         self.t1_at = None;
     }
 
-    /// Process one received frame; returns the stations that became active.
-    async fn handle_frame(&mut self, frame: &Frame, balanced: bool) -> Vec<u16> {
-        let mut active = Vec::new();
+    /// Process one received frame.
+    async fn handle_frame(&mut self, frame: &Frame, balanced: bool) -> FrameOutcome {
+        let mut out = FrameOutcome::default();
 
         // A single-character acknowledgement carries neither address nor
         // control field.
         if matches!(frame, Frame::SingleCharAck) {
-            active.extend(self.confirm_positive(0, false));
-            return active;
+            if let Some(c) = self.confirm_positive(0, false) {
+                out.newly_active.extend(c.became_active);
+            }
+            return out;
         }
 
         let addr = frame.link_addr().unwrap_or(0);
         if self.addr_size > 0 && !self.secs.contains_key(&addr) {
             tracing::warn!(addr, "ignoring a frame from an unexpected link address");
-            return active;
+            return out;
         }
         let ctrl = frame.control().expect("not a single character ack");
 
@@ -831,10 +864,10 @@ impl LinkState {
             // primary station.
             if !balanced {
                 tracing::warn!(%ctrl, "unexpected PRM=1 frame in unbalanced mode");
-                return active;
+                return out;
             }
-            self.handle_peer_primary_frame(frame, ctrl, addr).await;
-            return active;
+            out.deliver = self.handle_peer_primary_frame(ctrl, addr).await;
+            return out;
         }
 
         // DFC is carried by every secondary frame, so each one is also the
@@ -848,18 +881,29 @@ impl LinkState {
             sec.busy = ctrl.dfc;
         }
 
+        let mut confirm = |link: &mut LinkState| {
+            if let Some(c) = link.confirm_positive(addr, true) {
+                out.newly_active.extend(c.became_active);
+                Some(c.fun)
+            } else {
+                None
+            }
+        };
+
         match frame {
             Frame::Fixed { .. } => match ctrl.fun {
-                sec_fc::CONF_ACK => active.extend(self.confirm_positive(addr, true)),
+                sec_fc::CONF_ACK => {
+                    confirm(self);
+                }
                 // Link busy: keep the frame outstanding, t1 will repeat it.
                 sec_fc::CONF_NACK => tracing::warn!(addr, "station reports the link busy"),
                 sec_fc::USER_DATA_NO_REP => {
                     tracing::debug!(addr, "requested data not available");
-                    active.extend(self.confirm_positive(addr, true));
+                    confirm(self);
                 }
                 sec_fc::RESP_STATUS => {
                     tracing::debug!(addr, dfc = ctrl.dfc, "received link status");
-                    active.extend(self.confirm_positive(addr, true));
+                    confirm(self);
                 }
                 sec_fc::RESP_LINK_NF | sec_fc::RESP_LINK_NI => {
                     tracing::warn!(addr, fc = ctrl.fun, "link service not available");
@@ -869,13 +913,24 @@ impl LinkState {
             },
 
             Frame::Variable { .. } => match ctrl.fun {
-                sec_fc::USER_DATA_CONF | sec_fc::RESP_STATUS => {
-                    tracing::debug!(addr, "received user data");
-                    active.extend(self.confirm_positive(addr, true));
+                sec_fc::USER_DATA_CONF => {
+                    // User data is only ever the answer to a class 1 or class 2
+                    // request. Anything else is a response that arrives after
+                    // its request was repeated — the second copy of the same
+                    // ASDU — or one from a station that was never asked, and
+                    // delivering it would hand the application the same event
+                    // or command confirmation twice.
+                    match confirm(self) {
+                        Some(prim_fc::REQ_DATA1 | prim_fc::REQ_DATA2) => {
+                            tracing::debug!(addr, "received user data");
+                            out.deliver = true;
+                        }
+                        _ => tracing::warn!(addr, "unsolicited user data discarded"),
+                    }
                 }
-                sec_fc::USER_DATA_NO_REP => {
-                    tracing::debug!(addr, "no user data available");
-                    active.extend(self.confirm_positive(addr, true));
+                sec_fc::RESP_STATUS | sec_fc::USER_DATA_NO_REP => {
+                    tracing::debug!(addr, fc = ctrl.fun, "response without user data");
+                    confirm(self);
                 }
                 _ => tracing::warn!(addr, %ctrl, "unhandled variable-length frame"),
             },
@@ -897,18 +952,29 @@ impl LinkState {
                     .await;
             }
         }
-        active
+        out
     }
 
     /// Service the secondary role of this station in balanced mode: the peer
     /// acts as a primary and sends link commands and user data to acknowledge.
-    async fn handle_peer_primary_frame(&mut self, frame: &Frame, ctrl: ControlField, addr: u16) {
-        // Duplicate detection over the peer's FCV frames.
+    ///
+    /// Returns whether the frame's user data is new and should be delivered.
+    async fn handle_peer_primary_frame(&mut self, ctrl: ControlField, addr: u16) -> bool {
+        // A frame whose FCV contradicts its function code was not produced by a
+        // conforming peer, and acting on it would move the FCB.
+        if fcv_required(ctrl.fun).is_some_and(|fcv| fcv != ctrl.fcv) {
+            tracing::warn!(%ctrl, "FCV does not match the function code, frame ignored");
+            return false;
+        }
+
+        // Duplicate detection over the peer's FCV frames. A repeat means the
+        // acknowledgement was lost: acknowledge again, but the data was
+        // already delivered the first time.
         if ctrl.fcv {
             if ctrl.fcb != self.fcb_expected {
                 tracing::warn!("repeated peer frame, re-sending the acknowledgement");
                 self.send_sec_fixed(sec_fc::CONF_ACK, addr).await;
-                return;
+                return false;
             }
             self.fcb_expected = !self.fcb_expected;
         }
@@ -926,9 +992,11 @@ impl LinkState {
             prim_fc::USER_DATA_CONF => {
                 tracing::debug!("the peer sent confirmed user data");
                 self.send_sec_fixed(sec_fc::CONF_ACK, addr).await;
+                return true;
             }
             prim_fc::USER_DATA_NO_CONF => {
                 tracing::debug!("the peer sent unconfirmed user data");
+                return true;
             }
             prim_fc::REQ_STATUS => {
                 self.send_sec_fixed(sec_fc::RESP_STATUS, addr).await;
@@ -938,7 +1006,7 @@ impl LinkState {
                 self.send_sec_fixed(sec_fc::RESP_LINK_NI, addr).await;
             }
         }
-        let _ = frame;
+        false
     }
 
     /// Drive the link when it is free: queued user data first, then link
@@ -1040,15 +1108,15 @@ impl LinkState {
         true
     }
 
-    /// A confirmed frame went unanswered. Repeat it once with the same FCB,
-    /// then give up on the station.
+    /// A confirmed frame went unanswered. Repeat it with the same FCB up to
+    /// the configured number of times, then give up on the station.
     async fn on_t1_timeout(&mut self, cfg: &Config) -> Result<()> {
         let Some(p) = self.last_sent.as_ref() else {
             self.t1_at = None;
             return Ok(());
         };
 
-        if self.retry_count < 1 {
+        if self.retry_count < u32::from(cfg.max_repetitions) {
             self.retry_count += 1;
             tracing::warn!(retry = self.retry_count, "t1 expired, repeating the frame");
             let frame = p.frame.clone();
@@ -1060,7 +1128,7 @@ impl LinkState {
         }
 
         let addr = p.addr;
-        tracing::error!(station = addr, "t1 expired after the repetition");
+        tracing::error!(station = addr, "t1 expired after the repetitions");
         self.last_sent = None;
         self.retry_count = 0;
         self.t1_at = None;
@@ -1218,5 +1286,143 @@ mod tests {
 
         link.tick(&sh, false).await;
         assert!(rx.try_recv().is_ok(), "the poll still goes out");
+    }
+
+    fn user_data(addr: u16) -> Frame {
+        Frame::Variable {
+            control: ControlField::secondary(sec_fc::USER_DATA_CONF, false, false),
+            link_addr: addr,
+            asdu: asdu().marshal_binary().unwrap(),
+        }
+    }
+
+    /// Put a class 2 request to station 1 on the wire, as the poll would.
+    async fn poll(link: &mut LinkState) {
+        link.send_prim_confirmed(1, prim_fc::REQ_DATA2, true, Duration::from_secs(1))
+            .await;
+    }
+
+    // User data from a secondary is only ever the answer to a class 1 or
+    // class 2 request. A second copy — a late answer to a request that was
+    // then repeated — must not reach the application again.
+
+    #[tokio::test]
+    async fn the_answer_to_a_poll_is_delivered_once() {
+        let (mut link, _rx) = primary();
+        poll(&mut link).await;
+        assert!(link.handle_frame(&user_data(1), false).await.deliver);
+
+        // The same response again, with no request outstanding.
+        assert!(
+            !link.handle_frame(&user_data(1), false).await.deliver,
+            "a repeated response was delivered twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_data_nobody_asked_for_is_not_delivered() {
+        let (mut link, _rx) = primary();
+        assert!(!link.handle_frame(&user_data(1), false).await.deliver);
+    }
+
+    #[tokio::test]
+    async fn user_data_from_an_unknown_station_is_not_delivered() {
+        // The client logs that it ignores such a frame; it must not then hand
+        // the ASDU to the application anyway.
+        let (mut link, _rx) = primary();
+        poll(&mut link).await;
+        assert!(!link.handle_frame(&user_data(42), false).await.deliver);
+        assert!(link.last_sent.is_some(), "the real answer is still awaited");
+    }
+
+    #[tokio::test]
+    async fn user_data_answering_a_non_request_is_not_delivered() {
+        // A station that answers confirmed user data with user data is not
+        // following the standard; the frame completes the transaction but its
+        // payload is not an answer to anything.
+        let (mut link, _rx) = primary();
+        link.send_prim_confirmed(1, prim_fc::TEST_LINK, true, Duration::from_secs(1))
+            .await;
+        assert!(!link.handle_frame(&user_data(1), false).await.deliver);
+    }
+
+    fn peer_user_data(fcb: bool, fcv: bool) -> Frame {
+        Frame::Variable {
+            control: ControlField::primary(prim_fc::USER_DATA_CONF, fcv, fcb, false),
+            link_addr: 1,
+            asdu: asdu().marshal_binary().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_balanced_frame_is_acknowledged_but_not_delivered_again() {
+        let (mut link, mut rx) = primary();
+        // The peer's first FCV frame after a reset carries FCB = 1.
+        assert!(link.handle_frame(&peer_user_data(true, true), true).await.deliver);
+        assert!(rx.try_recv().is_ok(), "acknowledged");
+
+        // Our acknowledgement was lost; the peer repeats with the same FCB.
+        assert!(
+            !link.handle_frame(&peer_user_data(true, true), true).await.deliver,
+            "the repeat was delivered as new data"
+        );
+        assert!(rx.try_recv().is_ok(), "the repeat is acknowledged again");
+
+        // The next genuine frame toggles the FCB and is delivered.
+        assert!(link.handle_frame(&peer_user_data(false, true), true).await.deliver);
+    }
+
+    #[tokio::test]
+    async fn a_balanced_frame_whose_fcv_contradicts_its_function_is_ignored() {
+        let (mut link, mut rx) = primary();
+        let before = link.fcb_expected;
+        // Confirmed user data always counts frames; FCV = 0 is malformed.
+        assert!(!link.handle_frame(&peer_user_data(true, false), true).await.deliver);
+        assert!(rx.try_recv().is_err(), "not answered");
+        assert_eq!(link.fcb_expected, before, "the FCB did not move");
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_frame_is_repeated_the_configured_number_of_times() {
+        for repetitions in [0u8, 1, 3] {
+            let cfg = Config {
+                max_repetitions: repetitions,
+                ..Config::default()
+            };
+            let (mut link, mut rx) = primary();
+            poll_station(&mut link).await;
+            let first = rx.try_recv().unwrap();
+
+            for n in 0..repetitions {
+                link.on_t1_timeout(&cfg).await.unwrap();
+                assert_eq!(
+                    rx.try_recv().unwrap(),
+                    first,
+                    "repetition {n} must be the same frame, FCB included"
+                );
+            }
+            // One more timeout gives the only station up, which ends the line.
+            assert_eq!(link.on_t1_timeout(&cfg).await, Err(Error::TimeoutT1));
+            assert!(rx.try_recv().is_err(), "no repetition beyond {repetitions}");
+        }
+    }
+
+    async fn poll_station(link: &mut LinkState) {
+        link.send_prim_confirmed(1, prim_fc::REQ_DATA2, true, Duration::from_secs(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_balanced_secondary_role_may_acknowledge_with_the_single_character() {
+        let mut option = ClientOption::new();
+        option.config.use_single_char_ack = true;
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut link = LinkState::new(&option, tx);
+        let f = Frame::Fixed {
+            control: ControlField::primary(prim_fc::RESET_LINK, false, false, false),
+            link_addr: 1,
+        };
+        link.handle_frame(&f, true).await;
+        assert_eq!(rx.try_recv().unwrap(), vec![crate::cs101::SINGLE_CHAR_ACK]);
     }
 }

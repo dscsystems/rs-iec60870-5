@@ -9,7 +9,7 @@ use crate::asdu::{
     AckFileOrSectionInfo, AckFileOrSectionQualifier, AfqAction, Asdu, CallOrSelectFileInfo, Cause,
     CauseOfTransmission, CommonAddr, Connect, DirectoryInfo, FileError, FileReadyInfo, InfoObjAddr,
     LastSectionOrSegmentInfo, LastSectionQualifier, NameOfFile, Params, ScqAction, SectionReadyInfo,
-    SegmentInfo, StatusOfFile, TypeId, file_checksum,
+    SegmentInfo, StatusOfFile, TimeTagFlags, TypeId, file_checksum,
 };
 use crate::error::{Error, Result};
 use crate::filetransfer::store::{Store, is_file_asdu, split_sections};
@@ -364,7 +364,10 @@ impl Sender {
                     is_directory: e.is_directory,
                     ..Default::default()
                 },
-                time: e.time.or_else(|| Some(chrono::Utc::now())),
+                // A file whose creation time the store does not know is sent
+                // with no valid time — IV set — rather than a made-up one.
+                time: e.time,
+                time_flags: TimeTagFlags::GOOD,
             })
             .collect();
         Asdu::file_directory(params, CauseOfTransmission::new(Cause::REQUEST), ca, &infos)

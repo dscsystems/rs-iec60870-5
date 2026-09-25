@@ -34,6 +34,7 @@ use crate::asdu::identifier::{
 };
 use crate::asdu::info::InfoObjAddr;
 use crate::asdu::params::Params;
+use crate::asdu::time::TimeTagFlags;
 use crate::error::{Error, Result};
 
 /// The name (identification) of a file.
@@ -534,6 +535,12 @@ pub struct DirectoryInfo {
     pub sof: StatusOfFile,
     /// Creation time of the file.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 impl Asdu {
@@ -792,7 +799,7 @@ impl Asdu {
                 .u16(v.nof.0)
                 .length_of_file(v.length_of_file)
                 .byte(v.sof.value())
-                .cp56time2a(v.time);
+                .cp56time2a_tag(v.time, v.time_flags);
         }
         Ok(u)
     }
@@ -808,7 +815,8 @@ impl Asdu {
                 nof: NameOfFile(r.u16()?),
                 length_of_file: r.length_of_file()?,
                 sof: StatusOfFile::parse(r.byte()?),
-                time: r.cp56time2a()?,
+                time: r.cp56time2a_tag()?,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -954,6 +962,7 @@ mod tests {
                     length_of_file: 1024,
                     sof: StatusOfFile { status: 1, ..Default::default() },
                     time: Some(t),
+                    time_flags: TimeTagFlags::GOOD,
                 },
                 DirectoryInfo {
                     ioa: 2,
@@ -966,6 +975,7 @@ mod tests {
                         is_transfer_active: true,
                     },
                     time: Some(t),
+                    time_flags: TimeTagFlags::GOOD,
                 },
             ];
             let a = Asdu::file_directory(params, coa(Cause::REQUEST), 1, &dir).unwrap();

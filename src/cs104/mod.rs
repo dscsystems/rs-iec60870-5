@@ -89,14 +89,25 @@
 //! * Sends are queued and packed into I-frames by the connection task. A full
 //!   queue yields [`Error::BufferFull`](crate::Error::BufferFull) — back off
 //!   and retry rather than dropping data silently.
-//! * I-frames received while the connection is not activated (STOPDT) are
-//!   discarded with a warning.
+//! * An I-frame received while the connection is stopped closes a controlled
+//!   station's connection, since a master may not send one there. A master
+//!   accepts one and numbers it, which keeps the link consistent.
+//! * STOPDT is a handshake, not a switch: a master sends no more I-frames once
+//!   it has sent STOPDT act, and a controlled station acknowledges what it has
+//!   received, stops sending, and confirms only when its own I-frames have been
+//!   acknowledged.
+//! * [`Server`] sends spontaneous data once per redundancy group, to the
+//!   group's connection in data transfer (see [`ServerMode`]). A standby is sent
+//!   nothing; an optional event buffer keeps data for the next master to start.
+//! * t₃ measures how long the peer has been silent: only received frames
+//!   restart it, so a station that keeps transmitting still tests the link.
 
 mod apci;
 mod client;
 mod config;
 mod connection;
 mod handler;
+mod redundancy;
 mod server;
 
 pub use apci::{Apci, UFunction};
@@ -109,5 +120,6 @@ pub use config::{
 };
 pub use connection::{Connection, IoStream};
 pub use handler::{ClientContext, ClientHandler, ServerHandler};
+pub use redundancy::{RedundancyGroup, ServerMode};
 pub use server::{Server, ServerSpecial, Waiting, WaitingServer, waiting};
 pub use crate::net::{Endpoint, Stream, TlsClientConfig, TlsServerConfig};

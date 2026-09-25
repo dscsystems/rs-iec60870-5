@@ -411,4 +411,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_clock_sync_with_an_invalid_time_carries_no_time() {
+        // A clock must never be set from a time its sender marks invalid, so
+        // this decoder keeps the strict reading.
+        let t = chrono::Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap();
+        let mut a = Asdu::clock_synchronization_cmd(
+            PARAMS_WIDE,
+            CauseOfTransmission::new(Cause::ACTIVATION),
+            1,
+            t,
+        )
+        .unwrap();
+        a.info_obj[3 + 2] |= 0x80;
+        assert_eq!(a.get_clock_synchronization_cmd().unwrap().1, None);
+    }
 }

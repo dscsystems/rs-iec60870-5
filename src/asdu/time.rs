@@ -6,15 +6,25 @@
 //! ```text
 //! |         Milliseconds(D7--D0)        | Milliseconds = 0..59999
 //! |         Milliseconds(D15--D8)       |
-//! | IV(D7)   RES1(D6)  Minutes(D5--D0)  | Minutes = 0..59, IV: 0 = valid, 1 = invalid
+//! | IV(D7)   SB(D6)    Minutes(D5--D0)  | Minutes = 0..59, IV: 0 = valid, 1 = invalid
 //! | SU(D7)   RES2(D6-D5)  Hours(D4--D0) | Hours = 0..23, SU: 0 = standard, 1 = summer time
 //! | DayOfWeek(D7--D5) DayOfMonth(D4--D0)| DayOfMonth = 1..31, DayOfWeek = 1..7
 //! | RES3(D7--D4)        Months(D3--D0)  | Months = 1..12
 //! | RES4(D7)            Year(D6--D0)    | Year = 0..99
 //! ```
 //!
-//! An invalid (IV bit set) or truncated tag decodes to `None`, which is the
-//! equivalent of Go's zero `time.Time`.
+//! Bit 6 of the minutes octet, reserved in IEC 60870-5-4, is SB in the
+//! companion standards: the time was substituted by an intermediate station
+//! rather than tagged by the one that acquired the value. CP24Time2a and
+//! CP32Time2a carry IV and SB in the same octet.
+//!
+//! Two decoders are offered. [`parse_cp56time2a`] returns only a time that can
+//! be trusted — `None` for an invalid tag — which is what a clock
+//! synchronization must use. [`parse_cp56time2a_tag`] returns the reading
+//! whatever its validity, together with the [`TimeTagFlags`], which is what an
+//! event log needs: a device whose clock has not been synchronized yet still
+//! tags its events, and the order of those tags is worth keeping even when
+//! their absolute value is not.
 
 use chrono::{DateTime, Utc};
 
@@ -22,6 +32,45 @@ use crate::asdu::params::TimeZone;
 
 /// Octet length of a CP56Time2a time tag.
 pub const CP56TIME2A_SIZE: usize = 7;
+
+/// The validity flags of a CP24Time2a, CP32Time2a or CP56Time2a time tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TimeTagFlags {
+    /// IV: the time is invalid — the station's clock was not synchronized, or
+    /// could not be read. The reading may still be carried, but must not be
+    /// taken as the time of the event.
+    pub invalid: bool,
+    /// SB: the time was substituted by an intermediate station, not tagged by
+    /// the station that acquired the value.
+    pub substituted: bool,
+}
+
+impl TimeTagFlags {
+    /// A time that is neither invalid nor substituted.
+    pub const GOOD: TimeTagFlags = TimeTagFlags {
+        invalid: false,
+        substituted: false,
+    };
+
+    /// True when the time may be taken as the time of the event.
+    pub const fn is_valid(self) -> bool {
+        !self.invalid
+    }
+
+    /// Decode from the minutes octet, where IV is bit 7 and SB bit 6.
+    pub const fn from_minutes_octet(b: u8) -> Self {
+        TimeTagFlags {
+            invalid: b & 0x80 != 0,
+            substituted: b & 0x40 != 0,
+        }
+    }
+
+    /// The IV and SB bits of the minutes octet.
+    pub const fn minutes_bits(self) -> u8 {
+        (if self.invalid { 0x80 } else { 0 }) | (if self.substituted { 0x40 } else { 0 })
+    }
+}
 /// Octet length of a CP24Time2a time tag.
 pub const CP24TIME2A_SIZE: usize = 3;
 /// Octet length of a CP16Time2a time tag.
@@ -50,14 +99,43 @@ pub fn cp56time2a(t: Option<DateTime<Utc>>, zone: TimeZone) -> [u8; CP56TIME2A_S
     ]
 }
 
+/// Encode an instant as a CP56Time2a tag carrying the given validity flags.
+///
+/// A `None` instant is encoded as by [`cp56time2a`], with IV set whatever
+/// `flags` says, since there is no time to be valid.
+pub fn cp56time2a_tag(
+    t: Option<DateTime<Utc>>,
+    flags: TimeTagFlags,
+    zone: TimeZone,
+) -> [u8; CP56TIME2A_SIZE] {
+    let mut b = cp56time2a(t, zone);
+    b[2] |= flags.minutes_bits();
+    b
+}
+
 /// Decode a 7-octet CP56Time2a tag interpreted in the given zone.
 ///
 /// Returns `None` when the buffer is short, the IV bit is set, or the calendar
-/// fields do not name a real instant.
+/// fields do not name a real instant: only a time that can be trusted.
 pub fn parse_cp56time2a(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     if b.len() < CP56TIME2A_SIZE || b[2] & 0x80 == 0x80 {
         return None;
     }
+    decode_cp56(b, zone)
+}
+
+/// Decode a CP56Time2a tag into its reading and its validity flags.
+///
+/// The reading is returned even when IV is set, as long as the calendar fields
+/// name a real instant; `None` means the octets hold no time at all.
+pub fn parse_cp56time2a_tag(b: &[u8], zone: TimeZone) -> (Option<DateTime<Utc>>, TimeTagFlags) {
+    if b.len() < CP56TIME2A_SIZE {
+        return (None, TimeTagFlags::default());
+    }
+    (decode_cp56(b, zone), TimeTagFlags::from_minutes_octet(b[2]))
+}
+
+fn decode_cp56(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     let x = u16::from_le_bytes([b[0], b[1]]) as u32;
     let msec = x % 1000;
     let sec = x / 1000;
@@ -86,16 +164,42 @@ pub fn cp24time2a(t: Option<DateTime<Utc>>, zone: TimeZone) -> [u8; CP24TIME2A_S
     [msec as u8, (msec >> 8) as u8, min as u8]
 }
 
+/// Encode an instant as a CP24Time2a tag carrying the given validity flags.
+pub fn cp24time2a_tag(
+    t: Option<DateTime<Utc>>,
+    flags: TimeTagFlags,
+    zone: TimeZone,
+) -> [u8; CP24TIME2A_SIZE] {
+    let mut b = cp24time2a(t, zone);
+    b[2] |= flags.minutes_bits();
+    b
+}
+
 /// Decode a 3-octet CP24Time2a tag interpreted in the given zone.
 ///
 /// CP24Time2a carries only minutes and milliseconds; the date and hour come
 /// from the host clock. A tag whose minute is more than five minutes *ahead*
 /// of the current minute is taken to belong to the previous hour, which keeps
 /// events that cross an hour boundary in order.
+///
+/// Returns `None` for an invalid tag; see [`parse_cp24time2a_tag`] for the
+/// reading regardless of validity.
 pub fn parse_cp24time2a(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     if b.len() < CP24TIME2A_SIZE || b[2] & 0x80 == 0x80 {
         return None;
     }
+    decode_cp24(b, zone)
+}
+
+/// Decode a CP24Time2a tag into its reading and its validity flags.
+pub fn parse_cp24time2a_tag(b: &[u8], zone: TimeZone) -> (Option<DateTime<Utc>>, TimeTagFlags) {
+    if b.len() < CP24TIME2A_SIZE {
+        return (None, TimeTagFlags::default());
+    }
+    (decode_cp24(b, zone), TimeTagFlags::from_minutes_octet(b[2]))
+}
+
+fn decode_cp24(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     let x = u16::from_le_bytes([b[0], b[1]]) as u32;
     let msec = x % 1000;
     let sec = x / 1000;
@@ -319,6 +423,63 @@ mod tests {
         assert_eq!(parse_cp56time2a(&b, TimeZone::Utc), None);
         b[6] = 99;
         assert!(parse_cp56time2a(&b, TimeZone::Utc).is_some());
+    }
+
+    #[test]
+    fn an_invalid_tag_keeps_its_reading_for_those_who_ask() {
+        let t = utc(2026, 3, 4, 5, 6, 7, 800);
+        let flags = TimeTagFlags {
+            invalid: true,
+            substituted: false,
+        };
+        let b = cp56time2a_tag(Some(t), flags, TimeZone::Utc);
+        assert_eq!(b[2] & 0xc0, 0x80, "IV set, SB clear");
+        assert_eq!(b[2] & 0x3f, 6, "the minutes are untouched");
+
+        // The trusted-time decoder refuses it, as a clock sync must...
+        assert_eq!(parse_cp56time2a(&b, TimeZone::Utc), None);
+        // ...while the tag decoder keeps the reading and says it is invalid.
+        assert_eq!(parse_cp56time2a_tag(&b, TimeZone::Utc), (Some(t), flags));
+    }
+
+    #[test]
+    fn the_substituted_flag_round_trips_and_leaves_the_time_valid() {
+        let t = utc(2026, 3, 4, 5, 6, 7, 800);
+        let flags = TimeTagFlags {
+            invalid: false,
+            substituted: true,
+        };
+        let b = cp56time2a_tag(Some(t), flags, TimeZone::Utc);
+        assert_eq!(b[2] & 0xc0, 0x40);
+        assert_eq!(parse_cp56time2a_tag(&b, TimeZone::Utc), (Some(t), flags));
+        assert_eq!(
+            parse_cp56time2a(&b, TimeZone::Utc),
+            Some(t),
+            "a substituted time is still a valid time"
+        );
+    }
+
+    #[test]
+    fn cp24_carries_the_same_flags_in_its_minutes_octet() {
+        for flags in [
+            TimeTagFlags::GOOD,
+            TimeTagFlags { invalid: true, substituted: false },
+            TimeTagFlags { invalid: false, substituted: true },
+            TimeTagFlags { invalid: true, substituted: true },
+        ] {
+            let b = cp24time2a_tag(Some(Utc::now()), flags, TimeZone::Utc);
+            let (t, got) = parse_cp24time2a_tag(&b, TimeZone::Utc);
+            assert_eq!(got, flags);
+            assert!(t.is_some(), "the reading survives {flags:?}");
+        }
+    }
+
+    #[test]
+    fn no_time_is_always_invalid() {
+        let b = cp56time2a_tag(None, TimeTagFlags::GOOD, TimeZone::Utc);
+        let (t, flags) = parse_cp56time2a_tag(&b, TimeZone::Utc);
+        assert_eq!(t, None);
+        assert!(flags.invalid);
     }
 
     #[test]

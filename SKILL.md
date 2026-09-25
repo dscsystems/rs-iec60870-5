@@ -111,7 +111,7 @@ impl ServerHandler for H {
 async fn main() -> rs_iec60870_5::Result<()> {
     let srv = Server::new(H);
 
-    // Server::send broadcasts to every connected master.
+    // Server::send broadcasts to every started master (NotActive if none).
     let publisher = Arc::clone(&srv);
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(10));
@@ -120,7 +120,7 @@ async fn main() -> rs_iec60870_5::Result<()> {
             let _ = publisher.send_single_cp56time2a(
                 CauseOfTransmission::new(Cause::SPONTANEOUS), 1,
                 &[SinglePointInfo { ioa: 100, value: true,
-                    qds: QualityDescriptor::GOOD, time: Some(chrono::Utc::now()) }],
+                    time: Some(chrono::Utc::now()), ..Default::default() }],
             ).await;
         }
     });
@@ -338,7 +338,7 @@ services codecs, disturbance data, the device side.
   `tests/common/relay.rs` is a working one.
 - Read `tests/cs104_loopback.rs`, `tests/cs101_loopback.rs` and
   `tests/cs103_loopback.rs` as recipes.
-- Third-party: `lib60870` (C), OpenMUC j60870, QTester104, or any 104 test set
+- Third-party: OpenMUC j60870, QTester104, or any 104 test set
   at the defaults k=12, w=8, t1=15 s, t2=10 s, t3=20 s.
 
 ## Pitfalls (read before debugging)

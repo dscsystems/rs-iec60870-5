@@ -161,6 +161,8 @@ pub const DEFAULT_MAX_SEND_QUEUE_SIZE: usize = 100;
 pub const DEFAULT_LINK_ADDR_SIZE: u8 = 1;
 /// Default maximum ASDU length carried in one frame.
 pub const DEFAULT_MAX_APDU_LENGTH: u8 = 253;
+/// Default number of times an unanswered confirmed frame is repeated.
+pub const DEFAULT_MAX_REPETITIONS: u8 = 1;
 
 /// IEC 60870-5-101 link-layer configuration.
 ///
@@ -193,6 +195,21 @@ pub struct Config {
     pub max_send_queue_size: usize,
     /// Maximum ASDU length carried in one frame, `1..=253`.
     pub max_apdu_length: u8,
+    /// How many times a primary repeats a confirmed frame that went
+    /// unanswered before it gives the station up and restarts the link.
+    ///
+    /// IEC 60870-5-2 leaves the number to the system: the frame is repeated
+    /// with the same frame count bit, t₂ apart, after the first wait of t₁.
+    /// Zero means no repetition at all. Default 1.
+    pub max_repetitions: u8,
+    /// Acknowledge with the single character `E5` rather than a fixed-length
+    /// frame, where the standard allows it.
+    ///
+    /// A secondary then answers a positive confirmation, and a request for
+    /// data it does not have, with `E5` — but only while it has no class 1
+    /// data waiting, because `E5` has no control field to carry the access
+    /// demand bit. Both stations must be configured for it. Default off.
+    pub use_single_char_ack: bool,
 }
 
 impl Default for Config {
@@ -210,6 +227,8 @@ impl Default for Config {
             timeout_send_link_msg: DEFAULT_TIMEOUT_SEND_LINK_MSG,
             max_send_queue_size: DEFAULT_MAX_SEND_QUEUE_SIZE,
             max_apdu_length: DEFAULT_MAX_APDU_LENGTH,
+            max_repetitions: DEFAULT_MAX_REPETITIONS,
+            use_single_char_ack: false,
         }
     }
 }

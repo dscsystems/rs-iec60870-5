@@ -183,7 +183,7 @@ let a = Asdu::single_cp56time2a(
     PARAMS_WIDE,
     CauseOfTransmission::new(Cause::SPONTANEOUS),
     1,
-    &[SinglePointInfo { ioa: 100, value: true, qds: QualityDescriptor::GOOD, time: Some(chrono::Utc::now()) }],
+    &[SinglePointInfo { ioa: 100, value: true, time: Some(chrono::Utc::now()), ..Default::default() }],
 )?;
 
 // Control direction. The type identification selects the time-tag variant.
@@ -192,7 +192,7 @@ let a = Asdu::single_cmd(
     TypeId::C_SC_NA_1,
     CauseOfTransmission::new(Cause::ACTIVATION),
     1,
-    SingleCommandInfo { ioa: 6000, value: true, qoc: QualifierOfCommand::default(), time: None },
+    SingleCommandInfo { ioa: 6000, value: true, ..Default::default() },
 )?;
 # let _ = a;
 # Ok(())
@@ -413,9 +413,30 @@ The `asdu::time` module encodes and decodes the three binary time formats.
   the current minute is taken to belong to the previous hour.
 * **CP16Time2a** — 2 octets, an elapsed millisecond count.
 
-An invalid (IV bit) or truncated tag decodes to `None`, which is what an
-untagged type also yields. Encoding `None` produces an all-zero tag with the IV
-bit set.
+Each tagged information object carries its tag in two fields: `time`, the
+reading, and `time_flags`, a [`TimeTagFlags`] with the two validity bits of the
+minutes octet:
+
+| Flag | Bit | Meaning |
+|------|-----|---------|
+| `invalid` | IV, bit 7 | the station's clock was not synchronized or could not be read |
+| `substituted` | SB, bit 6 | the time was substituted by an intermediate station |
+
+`time` holds the reading **even when IV is set**, as long as the octets name a
+real instant: a device whose clock has not been synchronized still tags its
+events, and their order is worth keeping even when their absolute value is
+not. So check `time_flags.is_valid()` before taking `time` as the time of the
+event. `time` is `None` only when the octets hold no time at all, and
+`time_flags` is `TimeTagFlags::GOOD` for the untagged types. On the sending
+side, set `time_flags` to mark an unsynchronized clock; `time: None` always
+encodes an all-zero tag with IV set.
+
+Two decoders are available when working with raw octets:
+`parse_cp56time2a` returns only a time that can be trusted (`None` when IV is
+set) and `parse_cp56time2a_tag` returns the reading and the flags; likewise for
+CP24Time2a and, in `cs103`, CP32Time2a. The clock synchronization command
+uses the strict one: a clock is never set from a time its sender marks
+invalid.
 
 ## Wire format
 
@@ -479,6 +500,7 @@ failing. With the `serde` feature the ASDU types also derive `Serialize` and
 [`Identifier`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Identifier.html
 [`Params`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Params.html
 [`TimeZone`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/enum.TimeZone.html
+[`TimeTagFlags`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.TimeTagFlags.html
 [`Error::TrailingOctets`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 [`Normalize`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Normalize.html
 [`StepPosition`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.StepPosition.html

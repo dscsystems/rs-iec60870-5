@@ -129,6 +129,37 @@ impl Connection {
         }
     }
 
+    /// Queue an ASDU for transmission without waiting.
+    ///
+    /// The body of [`Connect::send`], callable where an `await` is not
+    /// possible, such as while a lock is held so that several queues are
+    /// filled in one consistent order.
+    pub(crate) fn try_enqueue(&self, a: &Asdu) -> Result<()> {
+        if !self.is_connected() {
+            return Err(Error::UseClosedConnection);
+        }
+        // A master must not queue process data before StartDT is confirmed; a
+        // controlled station may, and delivers it once the master activates.
+        if self.role == Role::Master && !self.is_active() {
+            return Err(Error::NotActive);
+        }
+        let data = a.marshal_binary()?;
+        self.tx_asdu.try_send(data).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => Error::BufferFull,
+            mpsc::error::TrySendError::Closed(_) => Error::UseClosedConnection,
+        })
+    }
+
+    /// Take a controlled station's session out of data transfer because
+    /// another connection of its redundancy group has been started.
+    ///
+    /// The session stops transmitting I-frames at once. Its master was not
+    /// asked, so it may still believe it is started; an I-frame from it is
+    /// then a frame in the stopped state, and closes the connection.
+    pub(crate) fn demote(&self) {
+        self.set_active(false);
+    }
+
     fn set_active(&self, active: bool) {
         self.active.store(active, Ordering::Release);
         if active {
@@ -144,19 +175,7 @@ impl Connect for Connection {
     }
 
     async fn send(&self, a: Asdu) -> Result<()> {
-        if !self.is_connected() {
-            return Err(Error::UseClosedConnection);
-        }
-        // A master must not queue process data before StartDT is confirmed; a
-        // controlled station may, and delivers it once the master activates.
-        if self.role == Role::Master && !self.is_active() {
-            return Err(Error::NotActive);
-        }
-        let data = a.marshal_binary()?;
-        self.tx_asdu.try_send(data).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => Error::BufferFull,
-            mpsc::error::TrySendError::Closed(_) => Error::UseClosedConnection,
-        })
+        self.try_enqueue(&a)
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
@@ -311,6 +330,15 @@ pub(crate) async fn run<S, D>(
     let mut test_fr_since: Option<Instant> = None;
     let mut start_dt_since: Option<Instant> = None;
     let mut stop_dt_since: Option<Instant> = None;
+    // Master: STOPDT act has been sent. From then on no new I-frame may be
+    // transmitted, although data transfer is still active until the peer
+    // confirms. See IEC 60870-5-104, subclause 5.3.
+    let mut stopping = false;
+    // Controlled station: STOPDT act was received but some of this station's
+    // I-frames are still unacknowledged, so STOPDT con is held back until they
+    // are. Confirming earlier would stop a connection whose data the master
+    // may never have received.
+    let mut stop_con_pending = false;
 
     let mut ticker = tokio::time::interval(TIMEOUT_RESOLUTION);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -318,7 +346,7 @@ pub(crate) async fn run<S, D>(
     loop {
         // "k" caps the number of unacknowledged I-frames in flight.
         let window_open = seq_no_count(ack_no_send, seq_no_send) < cfg.send_unack_limit_k;
-        let may_send = conn.is_active() && window_open;
+        let may_send = conn.is_active() && !stopping && window_open;
 
         tokio::select! {
             biased;
@@ -338,7 +366,9 @@ pub(crate) async fn run<S, D>(
                 ack_no_rcv = seq_no_rcv;
                 pending.push_back((seq_no_send, Instant::now()));
                 seq_no_send = (seq_no_send + 1) & SEQ_MASK;
-                idle_since = Instant::now();
+                // Transmitting does not restart t3: it measures how long the
+                // peer has been silent, and a station that only talks can
+                // still have lost its peer.
                 if tx_raw.send(frame).await.is_err() {
                     break;
                 }
@@ -347,8 +377,14 @@ pub(crate) async fn run<S, D>(
             ctrl = rx_ctrl.recv() => {
                 let Some(ctrl) = ctrl else { break };
                 let (func, since) = match ctrl {
-                    Ctrl::StartDt => (UFunction::StartDtActive, &mut start_dt_since),
-                    Ctrl::StopDt => (UFunction::StopDtActive, &mut stop_dt_since),
+                    Ctrl::StartDt => {
+                        stopping = false;
+                        (UFunction::StartDtActive, &mut start_dt_since)
+                    }
+                    Ctrl::StopDt => {
+                        stopping = true;
+                        (UFunction::StopDtActive, &mut stop_dt_since)
+                    }
                 };
                 *since = Some(Instant::now());
                 tracing::debug!(%func, "TX U-frame");
@@ -390,8 +426,24 @@ pub(crate) async fn run<S, D>(
                     Apci::I { send_sn, recv_sn } => {
                         tracing::debug!(%apci, "RX I-frame");
                         if !conn.is_active() {
-                            tracing::warn!("station not active, discarding I-frame");
-                            continue;
+                            // Discarding the frame is not an option: its send
+                            // sequence number has been used, so the next one
+                            // would be out of sequence and close the link
+                            // anyway, with the cause long gone from the log.
+                            match opts.role {
+                                // A master must not send I-frames to a station
+                                // in the stopped state.
+                                Role::Controlled => {
+                                    tracing::error!("I-frame received while stopped, closing");
+                                    break;
+                                }
+                                // A controlled station must not either, but a
+                                // master can take the frame without harm, and
+                                // numbering it keeps the link consistent.
+                                Role::Master => {
+                                    tracing::warn!("I-frame received while stopped, accepted");
+                                }
+                            }
                         }
                         if !update_ack_no_out(recv_sn, &mut ack_no_send, seq_no_send, &mut pending)
                             || send_sn != seq_no_rcv
@@ -431,6 +483,7 @@ pub(crate) async fn run<S, D>(
                         tracing::debug!(%apci, "RX U-frame");
                         match (function, opts.role) {
                             (UFunction::StartDtActive, Role::Controlled) => {
+                                stop_con_pending = false;
                                 if tx_raw
                                     .send(new_u_frame(UFunction::StartDtConfirm).to_vec())
                                     .await
@@ -444,15 +497,23 @@ pub(crate) async fn run<S, D>(
                                 }
                             }
                             (UFunction::StopDtActive, Role::Controlled) => {
-                                if tx_raw
-                                    .send(new_u_frame(UFunction::StopDtConfirm).to_vec())
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
+                                // Stop transmitting, and acknowledge everything
+                                // received so far, so the master is not left
+                                // waiting for confirmations it will never get.
+                                let was_active = conn.is_active();
                                 conn.set_active(false);
-                                if let Some(cb) = opts.callbacks.on_deactivated.as_ref() {
+                                if ack_no_rcv != seq_no_rcv {
+                                    if tx_raw.send(new_s_frame(seq_no_rcv).to_vec()).await.is_err() {
+                                        break;
+                                    }
+                                    ack_no_rcv = seq_no_rcv;
+                                }
+                                // STOPDT con waits until every I-frame this
+                                // station sent has been acknowledged.
+                                stop_con_pending = true;
+                                if was_active
+                                    && let Some(cb) = opts.callbacks.on_deactivated.as_ref()
+                                {
                                     cb(Arc::clone(&conn));
                                 }
                             }
@@ -465,6 +526,7 @@ pub(crate) async fn run<S, D>(
                             }
                             (UFunction::StopDtConfirm, Role::Master) => {
                                 conn.set_active(false);
+                                stopping = false;
                                 stop_dt_since = None;
                                 if let Some(cb) = opts.callbacks.on_deactivated.as_ref() {
                                     cb(Arc::clone(&conn));
@@ -484,6 +546,18 @@ pub(crate) async fn run<S, D>(
                                 tracing::warn!(%f, ?role, "U-frame function not valid for this role");
                             }
                         }
+                    }
+                }
+
+                if stop_con_pending && ack_no_send == seq_no_send {
+                    stop_con_pending = false;
+                    tracing::debug!("TX U-frame StopDtConfirm");
+                    if tx_raw
+                        .send(new_u_frame(UFunction::StopDtConfirm).to_vec())
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
                 }
             }
@@ -629,4 +703,273 @@ mod tests {
         assert_eq!(ack, 1);
         assert!(p.is_empty());
     }
+}
+
+/// The APCI state machine driven by a scripted peer over an in-memory stream,
+/// so each test controls exactly which frame arrives when.
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use crate::asdu::{Cause, CauseOfTransmission, Identifier, PARAMS_WIDE, TypeId, VariableStruct};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, DuplexStream};
+
+    struct Discard;
+
+    #[async_trait::async_trait]
+    impl Dispatcher for Discard {
+        async fn dispatch(&self, _: &Arc<Connection>, _: Asdu) {}
+    }
+
+    fn asdu() -> Asdu {
+        let mut a = Asdu::new(
+            PARAMS_WIDE,
+            Identifier::new(
+                TypeId::M_SP_NA_1,
+                VariableStruct::single(),
+                CauseOfTransmission::new(Cause::SPONTANEOUS),
+                1,
+            ),
+        );
+        a.encoder().info_obj_addr(1).unwrap().byte(1);
+        a
+    }
+
+    /// Start one connection in `role`, returning the peer's end of the stream,
+    /// the connection handle and the task running it.
+    async fn start(role: Role) -> (DuplexStream, Arc<Connection>, tokio::task::JoinHandle<()>) {
+        start_with(role, Config::default()).await
+    }
+
+    async fn start_with(
+        role: Role,
+        config: Config,
+    ) -> (DuplexStream, Arc<Connection>, tokio::task::JoinHandle<()>) {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let opts = RunOptions {
+            config,
+            params: PARAMS_WIDE,
+            role,
+            peer: None,
+            auto_start_dt: false,
+            callbacks: Callbacks::default(),
+        };
+        let (keep, shutdown) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _keep = keep;
+            run(ours, opts, Arc::new(Discard), shutdown, move |c| {
+                let _ = tx.send(c);
+            })
+            .await
+        });
+        let conn = rx.recv().await.expect("the connection is published");
+        (theirs, conn, task)
+    }
+
+    /// Read the next APDU the station sent, or `None` if nothing arrives soon.
+    async fn next_frame(peer: &mut DuplexStream, wait: Duration) -> Option<Vec<u8>> {
+        let mut head = [0u8; 2];
+        tokio::time::timeout(wait, peer.read_exact(&mut head))
+            .await
+            .ok()?
+            .ok()?;
+        let mut rest = vec![0u8; head[1] as usize];
+        peer.read_exact(&mut rest).await.ok()?;
+        let mut f = head.to_vec();
+        f.extend(rest);
+        Some(f)
+    }
+
+    async fn write(peer: &mut DuplexStream, frame: &[u8]) {
+        peer.write_all(frame).await.unwrap();
+    }
+
+    const STARTDT_ACT: [u8; 6] = [0x68, 4, 0x07, 0, 0, 0];
+    const STARTDT_CON: [u8; 6] = [0x68, 4, 0x0b, 0, 0, 0];
+    const STOPDT_ACT: [u8; 6] = [0x68, 4, 0x13, 0, 0, 0];
+    const STOPDT_CON: [u8; 6] = [0x68, 4, 0x23, 0, 0, 0];
+
+    fn is_i(f: &[u8]) -> bool {
+        f[2] & 0x01 == 0
+    }
+
+    async fn started_controlled() -> (DuplexStream, Arc<Connection>, tokio::task::JoinHandle<()>) {
+        let (mut peer, conn, task) = start(Role::Controlled).await;
+        write(&mut peer, &STARTDT_ACT).await;
+        assert_eq!(
+            next_frame(&mut peer, Duration::from_secs(2)).await.unwrap(),
+            STARTDT_CON
+        );
+        conn.wait_active().await;
+        (peer, conn, task)
+    }
+
+    // IEC 60870-5-104 subclause 5.3: on STOPDT act the controlled station
+    // stops sending data, acknowledges what it has received, and returns
+    // STOPDT con only once everything it sent has been acknowledged.
+
+    #[tokio::test]
+    async fn stopdt_is_confirmed_only_once_the_stations_data_is_acknowledged() {
+        let (mut peer, conn, _task) = started_controlled().await;
+
+        // The station sends data; the master asks to stop before acknowledging.
+        conn.send(asdu()).await.unwrap();
+        let data = next_frame(&mut peer, Duration::from_secs(2)).await.unwrap();
+        assert!(is_i(&data));
+        write(&mut peer, &STOPDT_ACT).await;
+
+        // No STOPDT con while that I-frame is unacknowledged.
+        let early = next_frame(&mut peer, Duration::from_millis(300)).await;
+        assert_ne!(early.as_deref(), Some(&STOPDT_CON[..]), "confirmed too early");
+
+        // Acknowledge it: now the confirmation follows.
+        write(&mut peer, &new_s_frame(1)).await;
+        let mut got_con = false;
+        for _ in 0..4 {
+            match next_frame(&mut peer, Duration::from_secs(2)).await {
+                Some(f) if f == STOPDT_CON => {
+                    got_con = true;
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
+        assert!(got_con, "STOPDT con never came");
+        assert!(!conn.is_active());
+    }
+
+    #[tokio::test]
+    async fn stopdt_with_nothing_outstanding_is_confirmed_at_once() {
+        let (mut peer, _conn, _task) = started_controlled().await;
+        write(&mut peer, &STOPDT_ACT).await;
+        assert_eq!(
+            next_frame(&mut peer, Duration::from_secs(2)).await.unwrap(),
+            STOPDT_CON
+        );
+    }
+
+    #[tokio::test]
+    async fn stopdt_acknowledges_what_the_station_received_before_confirming() {
+        let (mut peer, _conn, _task) = started_controlled().await;
+
+        // The master sends an I-frame and asks to stop straight after.
+        let raw = asdu().marshal_binary().unwrap();
+        write(&mut peer, &new_i_frame(0, 0, &raw).unwrap()).await;
+        write(&mut peer, &STOPDT_ACT).await;
+
+        let first = next_frame(&mut peer, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(
+            first,
+            new_s_frame(1),
+            "the received I-frame must be acknowledged first"
+        );
+        assert_eq!(
+            next_frame(&mut peer, Duration::from_secs(2)).await.unwrap(),
+            STOPDT_CON
+        );
+    }
+
+    #[tokio::test]
+    async fn no_data_is_sent_while_a_stop_is_pending() {
+        let (mut peer, conn, _task) = started_controlled().await;
+        conn.send(asdu()).await.unwrap();
+        next_frame(&mut peer, Duration::from_secs(2)).await.unwrap();
+        write(&mut peer, &STOPDT_ACT).await;
+
+        // Once the station has seen the stop request, more data queued must
+        // stay queued.
+        while conn.is_active() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        conn.send(asdu()).await.unwrap();
+        while let Some(f) = next_frame(&mut peer, Duration::from_millis(300)).await {
+            assert!(!is_i(&f), "an I-frame was sent after STOPDT act");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_controlled_station_closes_on_an_i_frame_while_stopped() {
+        let (mut peer, _conn, task) = start(Role::Controlled).await;
+        // Never started: an I-frame here is a protocol violation.
+        let raw = asdu().marshal_binary().unwrap();
+        write(&mut peer, &new_i_frame(0, 0, &raw).unwrap()).await;
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the connection must close")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_master_sends_no_data_after_stopdt_act() {
+        let (mut peer, conn, _task) = start(Role::Master).await;
+        conn.send_start_dt();
+        assert_eq!(
+            next_frame(&mut peer, Duration::from_secs(2)).await.unwrap(),
+            STARTDT_ACT
+        );
+        write(&mut peer, &STARTDT_CON).await;
+        conn.wait_active().await;
+
+        conn.send_stop_dt();
+        assert_eq!(
+            next_frame(&mut peer, Duration::from_secs(2)).await.unwrap(),
+            STOPDT_ACT
+        );
+        // Still active until the peer confirms, so the send is accepted — but
+        // it must not reach the wire.
+        conn.send(asdu()).await.unwrap();
+        while let Some(f) = next_frame(&mut peer, Duration::from_millis(300)).await {
+            assert!(!is_i(&f), "an I-frame followed STOPDT act");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_master_numbers_i_frames_that_arrive_while_stopped() {
+        let (mut peer, _conn, task) = start(Role::Master).await;
+        let raw = asdu().marshal_binary().unwrap();
+        // Two I-frames before any STARTDT: both must be counted, so the second
+        // is in sequence and the link stays up.
+        write(&mut peer, &new_i_frame(0, 0, &raw).unwrap()).await;
+        write(&mut peer, &new_i_frame(1, 0, &raw).unwrap()).await;
+        let ack = next_frame(&mut peer, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(ack, new_s_frame(2), "both frames acknowledged");
+        assert!(!task.is_finished(), "the link must stay up");
+    }
+    #[tokio::test]
+    async fn t3_runs_on_the_peers_silence_not_on_our_own_traffic() {
+        // A station that keeps transmitting to a peer that has gone quiet must
+        // still test the link after t3 (IEC 60870-5-104, subclause 5.2).
+        let config = Config {
+            idle_timeout3: Duration::from_secs(1),
+            // A window wide enough that transmission never pauses for lack of
+            // acknowledgements during the test.
+            send_unack_limit_k: 1000,
+            ..Config::default()
+        };
+        let (mut peer, conn, _task) = start_with(Role::Controlled, config).await;
+        write(&mut peer, &STARTDT_ACT).await;
+        assert_eq!(
+            next_frame(&mut peer, Duration::from_secs(2)).await.unwrap(),
+            STARTDT_CON
+        );
+        conn.wait_active().await;
+
+        // t3 plus a margin for the timer resolution; the station transmits
+        // throughout.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1800);
+        let mut saw_test = false;
+        while tokio::time::Instant::now() < deadline && !saw_test {
+            // Keep the station busy transmitting; never answer.
+            conn.send(asdu()).await.unwrap();
+            while let Some(f) = next_frame(&mut peer, Duration::from_millis(150)).await {
+                if f == [0x68, 4, 0x43, 0, 0, 0] {
+                    saw_test = true;
+                }
+            }
+        }
+        assert!(saw_test, "no TESTFR act while the peer was silent for over t3");
+    }
+
 }

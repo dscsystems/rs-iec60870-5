@@ -226,6 +226,7 @@ async fn rust_master_interoperates_with_the_go_controlled_station() {
                 in_select: false,
             },
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         },
     )
     .await
@@ -282,6 +283,7 @@ async fn rust_master_interoperates_with_the_go_controlled_station() {
             ioa: 6003,
             value: 0x0f0f_0f0f,
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         },
     )
     .await
@@ -410,6 +412,7 @@ impl ServerHandler for RustOutstation {
                     value: false,
                     qds: QualityDescriptor::INVALID,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             ],
         )
@@ -487,6 +490,7 @@ impl ServerHandler for RustOutstation {
                     value: -1.25,
                     qds: QualityDescriptor::OVERFLOW,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             ],
         )
@@ -528,6 +532,7 @@ impl ServerHandler for RustOutstation {
                     ..Default::default()
                 },
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -541,6 +546,7 @@ impl ServerHandler for RustOutstation {
                 time: chrono::DateTime::parse_from_rfc3339("2026-08-17T12:34:56.789Z")
                     .ok()
                     .map(|t| t.to_utc()),
+                    time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -566,6 +572,7 @@ impl ServerHandler for RustOutstation {
                     ..Default::default()
                 },
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;

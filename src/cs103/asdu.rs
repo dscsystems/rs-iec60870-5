@@ -17,7 +17,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 
 use crate::asdu::time::{cp56time2a, parse_cp56time2a};
-use crate::asdu::{TimeZone, VariableStruct};
+use crate::asdu::{TimeTagFlags, TimeZone, VariableStruct};
 use crate::cs103::elements::*;
 use crate::error::{Error, Result};
 
@@ -342,7 +342,7 @@ impl Asdu {
         } else {
             rest
         };
-        info.time = parse_cp32time2a(rest, self.time_zone);
+        (info.time, info.time_flags) = parse_cp32time2a_tag(rest, self.time_zone);
         info.sin = rest[4];
         Ok(info)
     }
@@ -370,13 +370,15 @@ impl Asdu {
         }
         // FUN INF SCL(4) RET(2) FAN(2) CP32(4)
         let b = self.need(14)?;
+        let (time, time_flags) = parse_cp32time2a_tag(&b[10..], self.time_zone);
         Ok(TimeTaggedMeasurandsInfo {
             fun: b[0],
             inf: b[1],
             value: f32::from_bits(u32::from_le_bytes([b[2], b[3], b[4], b[5]])),
             relative_time: u16::from_le_bytes([b[6], b[7]]),
             fault_number: u16::from_le_bytes([b[8], b[9]]),
-            time: parse_cp32time2a(&b[10..], self.time_zone),
+            time,
+            time_flags,
         })
     }
 
@@ -562,8 +564,12 @@ pub struct TimeTaggedInfo {
     pub relative_time: u16,
     /// Fault number (FAN); ASDU 2 only.
     pub fault_number: u16,
-    /// Time of the event.
+    /// Time of the event, as read even when it is marked invalid.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag. A relay whose clock
+    /// has not been synchronized yet sets IV; check
+    /// [`TimeTagFlags::is_valid`] before taking `time` as the event time.
+    pub time_flags: TimeTagFlags,
     /// Supplementary information. For a command acknowledgement (cause 20 or
     /// 21) this carries the RII of the original command.
     pub sin: u8,
@@ -593,8 +599,10 @@ pub struct TimeTaggedMeasurandsInfo {
     pub relative_time: u16,
     /// Fault number (FAN).
     pub fault_number: u16,
-    /// Time of the event.
+    /// Time of the event, as read even when it is marked invalid.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    pub time_flags: TimeTagFlags,
 }
 
 /// Content of ASDU 5 (identification message).
@@ -843,5 +851,27 @@ mod tests {
         let mut short = Asdu::new(TypeId::TIME_TAGGED, vsq_one(), Cause::SPONTANEOUS, 3);
         short.append(&[1, 2]);
         assert!(!short.to_string().is_empty());
+    }
+
+    #[test]
+    fn a_relay_with_an_unsynchronized_clock_is_reported_as_such() {
+        // A relay sets IV until its clock is synchronized; the reading is kept,
+        // flagged, so a disturbance log can still order the events.
+        let flags = TimeTagFlags {
+            invalid: true,
+            substituted: false,
+        };
+        let mut a = Asdu::new(TypeId::TIME_TAGGED, vsq_one(), Cause::SPONTANEOUS, 3);
+        a.append(&[fun::OVERCURRENT_PROTECTION, inf::GENERAL_TRIP, Dpi::On.value()]);
+        a.append(&crate::cs103::cp32time2a_tag(Some(Utc::now()), flags, TimeZone::Utc));
+        a.append(&[0]);
+
+        let got = a.get_time_tagged().unwrap();
+        assert!(got.time.is_some(), "the reading is kept");
+        assert_eq!(got.time_flags, flags);
+
+        // A good tag reports good flags.
+        let good = time_tagged_frame(Dpi::On, 0).get_time_tagged().unwrap();
+        assert_eq!(good.time_flags, TimeTagFlags::GOOD);
     }
 }

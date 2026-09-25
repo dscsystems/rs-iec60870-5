@@ -26,7 +26,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::asdu::{Asdu, Cause, Connect, PARAMS_STANDARD_101, Params};
 use crate::cs101::config::Config;
-use crate::cs101::frame::{ControlField, Frame, prim_fc, read_frame, sec_fc};
+use crate::cs101::frame::{ControlField, Frame, fcv_required, prim_fc, read_frame, sec_fc};
 use crate::cs101::handler::{ServerHandler, dispatch_server};
 use crate::cs101::transport::{LinkStream, Transporter};
 use crate::error::{Error, Result};
@@ -441,6 +441,8 @@ struct Outcome {
 struct SecondaryState {
     link_addr: u16,
     addr_size: u8,
+    /// Acknowledge with `E5` where the standard allows it.
+    single_char_ack: bool,
     /// The FCB expected on the primary's next FCV frame.
     fcb_expected: bool,
     /// The last response sent, retransmitted when a request is repeated.
@@ -462,6 +464,7 @@ impl SecondaryState {
         SecondaryState {
             link_addr: cfg.link_address,
             addr_size: cfg.link_addr_size,
+            single_char_ack: cfg.use_single_char_ack,
             fcb_expected: true,
             last_resp: None,
             out,
@@ -500,8 +503,22 @@ impl SecondaryState {
         }
     }
 
+    /// A fixed-length response, or the single character `E5` in its place
+    /// when that is configured and nothing is lost by it.
+    ///
+    /// `E5` has no control field, so it cannot carry the access demand bit:
+    /// with class 1 data waiting the fixed-length frame is sent regardless,
+    /// or the primary would never learn that it should ask for it.
+    fn ack_frame(&self, fun: u8, acd: bool) -> Frame {
+        if self.single_char_ack && !acd {
+            Frame::SingleCharAck
+        } else {
+            self.sec_frame(fun, acd)
+        }
+    }
+
     async fn send_link_ack(&mut self, shared: &Shared) -> bool {
-        let f = self.sec_frame(sec_fc::CONF_ACK, shared.class1_pending());
+        let f = self.ack_frame(sec_fc::CONF_ACK, shared.class1_pending());
         self.send_resp(f).await
     }
 
@@ -515,7 +532,7 @@ impl SecondaryState {
     async fn respond_class_data(&mut self, class: u8, shared: &Shared) -> bool {
         let Some(a) = shared.pop_class(class) else {
             tracing::debug!(class, "no data buffered, answering FC 9");
-            let f = self.sec_frame(sec_fc::USER_DATA_NO_REP, false);
+            let f = self.ack_frame(sec_fc::USER_DATA_NO_REP, false);
             return self.send_resp(f).await;
         };
 
@@ -603,6 +620,15 @@ impl SecondaryState {
             return out;
         }
 
+        // A frame whose FCV contradicts its function code was not produced by a
+        // conforming primary. It is not answered, and above all it must not
+        // move the frame count bit, or the next genuine frame would look like
+        // a repeat and be answered from the cache instead of acted on.
+        if fcv_required(ctrl.fun).is_some_and(|fcv| fcv != ctrl.fcv) {
+            tracing::warn!(%ctrl, "FCV does not match the function code, frame ignored");
+            return out;
+        }
+
         // Duplicate detection: the FCB alternates on every FCV frame,
         // whatever the function code. A mismatch means the primary repeated
         // itself, so repeat the previous response without acting on it again.
@@ -639,10 +665,6 @@ impl SecondaryState {
                 self.send_link_ack(shared).await;
             }
             prim_fc::USER_DATA_CONF => {
-                if !ctrl.fcv {
-                    tracing::warn!("confirmed user data with FCV=0, ignored");
-                    return out;
-                }
                 out.asdu = frame.asdu().map(|a| a.to_vec());
                 self.send_link_ack(shared).await;
             }
@@ -721,13 +743,14 @@ impl SecondaryState {
     }
 
     /// Supervise the balanced-mode primary role: initialization, response
-    /// timeouts with one repetition, and transmission of queued data.
+    /// timeouts with the configured repetitions, and transmission of queued
+    /// data.
     async fn prim_tick(&mut self, shared: &Shared, cfg: &Config) {
         let now = Instant::now();
 
         if self.prim_out.is_some() {
             if self.prim_deadline.is_some_and(|d| now >= d) {
-                if self.prim_retry < 1 {
+                if self.prim_retry < u32::from(cfg.max_repetitions) {
                     self.prim_retry += 1;
                     tracing::warn!("primary role: response timeout, repeating the frame");
                     if let Some(f) = self.prim_out.clone() {
@@ -735,7 +758,7 @@ impl SecondaryState {
                     }
                     self.prim_deadline = Some(now + cfg.timeout_repeat_t2);
                 } else {
-                    tracing::error!("primary role: response timeout after the repetition");
+                    tracing::error!("primary role: response timeout after the repetitions");
                     self.prim_out = None;
                     self.prim_retry = 0;
                     self.prim_deadline = None;
@@ -783,6 +806,7 @@ impl SecondaryState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cs101::frame::{SINGLE_CHAR_ACK, START_FIXED};
     use crate::asdu::PARAMS_STANDARD_101;
 
     fn shared() -> Shared {
@@ -877,5 +901,80 @@ mod tests {
         let out = sec.handle_frame(&f, &sh, &cfg).await;
         assert!(out.link_became_active);
         assert!(rx.try_recv().is_ok(), "a directed reset is confirmed");
+    }
+
+    #[tokio::test]
+    async fn a_frame_whose_fcv_contradicts_its_function_is_ignored() {
+        // IEC 60870-5-2, table 1. Each of these would otherwise move the frame
+        // count bit and make the next genuine frame look like a repeat.
+        for (fun, fcv) in [
+            (prim_fc::RESET_LINK, true),
+            (prim_fc::REQ_STATUS, true),
+            (prim_fc::REQ_DATA2, false),
+            (prim_fc::REQ_DATA1, false),
+            (prim_fc::USER_DATA_CONF, false),
+        ] {
+            let (mut sec, cfg, mut rx) = secondary();
+            let sh = shared();
+            let before = sec.fcb_expected;
+            let f = primary_frame(fun, fcv, !before, 1, Vec::new());
+
+            let out = sec.handle_frame(&f, &sh, &cfg).await;
+            assert!(!out.link_became_active, "fc {fun}");
+            assert!(rx.try_recv().is_err(), "fc {fun} with FCV={fcv} was answered");
+            assert_eq!(sec.fcb_expected, before, "fc {fun} moved the FCB");
+        }
+    }
+
+    fn e5_secondary() -> (SecondaryState, Config, mpsc::Receiver<Vec<u8>>) {
+        let cfg = Config {
+            link_address: 1,
+            link_addr_size: 1,
+            use_single_char_ack: true,
+            ..Config::default()
+        };
+        let (tx, rx) = mpsc::channel(16);
+        (SecondaryState::new(&cfg, tx), cfg, rx)
+    }
+
+    #[tokio::test]
+    async fn a_positive_acknowledgement_may_be_the_single_character() {
+        let (mut sec, cfg, mut rx) = e5_secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
+        sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(rx.try_recv().unwrap(), vec![SINGLE_CHAR_ACK]);
+    }
+
+    #[tokio::test]
+    async fn no_data_may_be_answered_with_the_single_character() {
+        let (mut sec, cfg, mut rx) = e5_secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::REQ_DATA2, true, true, 1, Vec::new());
+        sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(rx.try_recv().unwrap(), vec![SINGLE_CHAR_ACK]);
+    }
+
+    #[tokio::test]
+    async fn the_single_character_is_not_used_when_class_1_data_waits() {
+        // E5 has no control field to carry ACD; answering with it would hide
+        // the waiting events from the primary.
+        let (mut sec, cfg, mut rx) = e5_secondary();
+        let sh = shared();
+        sh.class1.lock().unwrap().push_back(crate::asdu::Asdu::new_empty(PARAMS_STANDARD_101));
+        let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
+        sec.handle_frame(&f, &sh, &cfg).await;
+        let raw = rx.try_recv().unwrap();
+        assert_eq!(raw[0], START_FIXED, "a fixed frame, so ACD can be carried");
+        assert!(ControlField::parse(raw[1]).acd);
+    }
+
+    #[tokio::test]
+    async fn without_the_option_acknowledgements_are_fixed_frames() {
+        let (mut sec, cfg, mut rx) = secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
+        sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(rx.try_recv().unwrap()[0], START_FIXED);
     }
 }

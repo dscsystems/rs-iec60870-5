@@ -176,7 +176,7 @@ srv.listen_and_serve("0.0.0.0:2404").await
 
 Inside a handler the `&dyn Connect` argument is the **single session** the
 request came from. Calling `send` on the `Server` itself instead broadcasts to
-every connected master, which is how spontaneous data is published:
+every master in data transfer, which is how spontaneous data is published:
 
 ```rust,no_run
 # use std::sync::Arc;
@@ -197,7 +197,8 @@ tokio::spawn(async move {
             1,
             &[MeasuredValueFloatInfo {
                 ioa: 400, value: 22.5,
-                qds: QualityDescriptor::GOOD, time: Some(chrono::Utc::now()),
+                time: Some(chrono::Utc::now()),
+                ..Default::default()
             }],
         ).await;
     }
@@ -244,7 +245,7 @@ c.send_single_cmd(TypeId::C_SC_NA_1, coa, ca, SingleCommandInfo {
     ioa: 6000,
     value: true,
     qoc: QualifierOfCommand { qual: QocQual::SHORT_PULSE_DURATION, in_select: false },
-    time: None,
+    ..Default::default()
 }).await
 # }
 ```
@@ -419,7 +420,7 @@ rather than stdout — `examples/cs104_explorer` does exactly that.
   makes `listen_addr()` observable before the first connection.
 * **103 devices**: the module is a master only, so drive it against a simulated
   relay. `tests/common/relay.rs` is a working one.
-* **Third-party interop**: `lib60870` (C), OpenMUC j60870, QTester104, or any
+* **Third-party interop**: OpenMUC j60870, QTester104, or any
   104 test set at the default parameters.
 
 The repository's own tests are worth reading as recipes:

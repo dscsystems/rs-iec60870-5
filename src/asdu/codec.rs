@@ -26,8 +26,9 @@ use crate::asdu::info::{
 };
 use crate::asdu::params::Params;
 use crate::asdu::time::{
-    CP16TIME2A_SIZE, CP24TIME2A_SIZE, CP56TIME2A_SIZE, cp16time2a, cp24time2a, cp56time2a,
-    parse_cp16time2a, parse_cp24time2a, parse_cp56time2a,
+    CP16TIME2A_SIZE, CP24TIME2A_SIZE, CP56TIME2A_SIZE, TimeTagFlags, cp16time2a, cp24time2a,
+    cp24time2a_tag, cp56time2a, cp56time2a_tag, parse_cp16time2a, parse_cp24time2a,
+    parse_cp24time2a_tag, parse_cp56time2a, parse_cp56time2a_tag,
 };
 use crate::error::{Error, Result};
 
@@ -304,6 +305,7 @@ impl Asdu {
             params: self.params,
             buf: &self.info_obj,
             pos: 0,
+            last_flags: TimeTagFlags::GOOD,
         }
     }
 
@@ -437,6 +439,20 @@ impl Encoder<'_> {
         self
     }
 
+    /// Append a CP56Time2a time tag carrying the given IV and SB flags.
+    pub fn cp56time2a_tag(&mut self, t: Option<DateTime<Utc>>, flags: TimeTagFlags) -> &mut Self {
+        self.buf
+            .extend_from_slice(&cp56time2a_tag(t, flags, self.params.info_obj_time_zone));
+        self
+    }
+
+    /// Append a CP24Time2a time tag carrying the given IV and SB flags.
+    pub fn cp24time2a_tag(&mut self, t: Option<DateTime<Utc>>, flags: TimeTagFlags) -> &mut Self {
+        self.buf
+            .extend_from_slice(&cp24time2a_tag(t, flags, self.params.info_obj_time_zone));
+        self
+    }
+
     /// Append a CP16Time2a elapsed-millisecond tag.
     pub fn cp16time2a(&mut self, msec: u16) -> &mut Self {
         self.buf.extend_from_slice(&cp16time2a(msec));
@@ -459,6 +475,8 @@ pub struct InfoObjReader<'a> {
     params: Params,
     buf: &'a [u8],
     pos: usize,
+    /// The validity flags of the time tag read last by a `*_tag` method.
+    last_flags: TimeTagFlags,
 }
 
 impl<'a> InfoObjReader<'a> {
@@ -563,6 +581,31 @@ impl<'a> InfoObjReader<'a> {
     pub fn cp24time2a(&mut self) -> Result<Option<DateTime<Utc>>> {
         let b = self.take(CP24TIME2A_SIZE)?;
         Ok(parse_cp24time2a(b, self.params.info_obj_time_zone))
+    }
+
+    /// Read a CP56Time2a time tag's reading whatever its validity, keeping
+    /// its flags for [`InfoObjReader::time_flags`].
+    pub fn cp56time2a_tag(&mut self) -> Result<Option<DateTime<Utc>>> {
+        let b = self.take(CP56TIME2A_SIZE)?;
+        let (t, flags) = parse_cp56time2a_tag(b, self.params.info_obj_time_zone);
+        self.last_flags = flags;
+        Ok(t)
+    }
+
+    /// Read a CP24Time2a time tag's reading whatever its validity, keeping
+    /// its flags for [`InfoObjReader::time_flags`].
+    pub fn cp24time2a_tag(&mut self) -> Result<Option<DateTime<Utc>>> {
+        let b = self.take(CP24TIME2A_SIZE)?;
+        let (t, flags) = parse_cp24time2a_tag(b, self.params.info_obj_time_zone);
+        self.last_flags = flags;
+        Ok(t)
+    }
+
+    /// The IV and SB flags of the time tag read last with
+    /// [`InfoObjReader::cp56time2a_tag`] or [`InfoObjReader::cp24time2a_tag`],
+    /// and [`TimeTagFlags::GOOD`] before any has been read.
+    pub fn time_flags(&self) -> TimeTagFlags {
+        self.last_flags
     }
 
     /// Read a CP16Time2a elapsed-millisecond tag.

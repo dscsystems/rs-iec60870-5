@@ -55,6 +55,7 @@ impl ServerHandler for TestOutstation {
                 value: 21.5,
                 qds: QualityDescriptor::GOOD,
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;

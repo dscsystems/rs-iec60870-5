@@ -76,6 +76,7 @@ impl ServerHandler for Outstation {
                     value: false,
                     qds: QualityDescriptor::INVALID,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             ],
         )
@@ -103,6 +104,7 @@ impl ServerHandler for Outstation {
                     ..Default::default()
                 },
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -340,6 +342,7 @@ async fn control_commands_are_confirmed_and_terminated() {
                 in_select: false,
             },
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         },
     )
     .await
@@ -475,6 +478,7 @@ async fn the_server_broadcasts_spontaneous_data_to_every_master() {
             value: true,
             qds: QualityDescriptor::GOOD,
             time: Some(chrono::Utc::now()),
+            time_flags: TimeTagFlags::GOOD,
         }],
     )
     .await
@@ -695,4 +699,86 @@ async fn the_client_reconnects_after_the_server_restarts() {
 
     cli.close();
     srv2.close();
+}
+
+/// Two masters on one outstation, as a redundancy group: one started, one on
+/// standby. Spontaneous data goes to the started one only (IEC 60870-5-104,
+/// clause 10), and the standby neither receives it nor makes the broadcast
+/// fail once its own queue would have filled.
+#[tokio::test]
+async fn a_standby_master_receives_no_spontaneous_data() {
+    let srv = Server::new(Outstation {
+        log: Arc::new(Log::default()),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let srv = Arc::clone(&srv);
+        tokio::spawn(async move { srv.serve(listener).await });
+    }
+
+    let connect = |auto_start: bool, log: Arc<Log>| {
+        let option = ClientOption::new()
+            .with_server(&addr.to_string())
+            .unwrap()
+            .with_auto_start_dt(auto_start);
+        let cli = Client::new(Master { log }, option);
+        cli.start().unwrap();
+        cli
+    };
+
+    let active_log = Arc::new(Log::default());
+    let standby_log = Arc::new(Log::default());
+    let active = connect(true, Arc::clone(&active_log));
+    let standby = connect(false, Arc::clone(&standby_log));
+
+    tokio::time::timeout(Duration::from_secs(5), active.wait_active())
+        .await
+        .expect("the active master did not start");
+    eventually("both masters connected", async || srv.session_count() == 2).await;
+
+    // Far more than one session queue holds: were the standby buffering
+    // copies, its queue would overflow and the broadcast would report it.
+    let coa = CauseOfTransmission::new(Cause::SPONTANEOUS);
+    for i in 0..400u32 {
+        let info = SinglePointInfo::new(1000 + i, i % 2 == 0);
+        srv.send_single(false, coa, 1, &[info])
+            .await
+            .unwrap_or_else(|e| panic!("broadcast {i} failed: {e}"));
+        if i % 50 == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    eventually("the active master received everything", async || {
+        active_log
+            .types()
+            .await
+            .iter()
+            .filter(|t| **t == TypeId::M_SP_NA_1)
+            .count()
+            == 400
+    })
+    .await;
+    assert!(
+        standby_log.types().await.is_empty(),
+        "the standby master was sent data"
+    );
+
+    active.close();
+    standby.close();
+}
+
+#[tokio::test]
+async fn a_broadcast_with_no_started_master_reports_it() {
+    let srv = Server::new(Outstation {
+        log: Arc::new(Log::default()),
+    });
+    let coa = CauseOfTransmission::new(Cause::SPONTANEOUS);
+    assert_eq!(
+        srv.send_single(false, coa, 1, &[SinglePointInfo::new(1, true)])
+            .await,
+        Err(rs_iec60870_5::Error::NotActive),
+        "the data went nowhere, and the caller must be able to tell"
+    );
 }

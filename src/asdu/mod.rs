@@ -89,6 +89,7 @@ pub use mproc::{
     PackedOutputCircuitInfoInfo, PackedSinglePointWithScdInfo,
     PackedStartEventsOfProtectionEquipmentInfo, SinglePointInfo, StepPositionInfo,
 };
+pub use time::TimeTagFlags;
 pub use params::{
     PARAMS_NARROW, PARAMS_STANDARD_101, PARAMS_STANDARD_104, PARAMS_WIDE, Params, TimeZone,
 };
