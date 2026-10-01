@@ -6,9 +6,9 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, Utc};
 
-use crate::asdu::TimeZone;
+use crate::asdu::{TimeTagFlags, TimeZone};
 
 /// Standardized function types (FUN).
 ///
@@ -323,8 +323,20 @@ pub fn cp32time2a(t: Option<DateTime<Utc>>, zone: TimeZone) -> [u8; CP32TIME2A_S
         msec as u8,
         (msec >> 8) as u8,
         min as u8,
-        hour as u8 | if zone.summer_time(t) { 0x80 } else { 0 },
+        // D7 of the hour octet is SU: the reading is expressed in summer time.
+        hour as u8 | if zone.is_dst(t) { 0x80 } else { 0 },
     ]
+}
+
+/// Encode an instant as a CP32Time2a tag carrying the given IV and SB flags.
+pub fn cp32time2a_tag(
+    t: Option<DateTime<Utc>>,
+    flags: TimeTagFlags,
+    zone: TimeZone,
+) -> [u8; CP32TIME2A_SIZE] {
+    let mut b = cp32time2a(t, zone);
+    b[2] |= flags.minutes_bits();
+    b
 }
 
 /// Decode a 4-octet CP32Time2a tag.
@@ -332,34 +344,34 @@ pub fn cp32time2a(t: Option<DateTime<Utc>>, zone: TimeZone) -> [u8; CP32TIME2A_S
 /// The tag carries only the time of day, so the date comes from the host clock.
 /// A time of day more than five minutes *ahead* of now is taken to belong to
 /// the previous day, which keeps events that cross midnight in order. An
-/// invalid (IV) or short tag decodes to `None`.
+/// invalid (IV) or short tag decodes to `None`; see [`parse_cp32time2a_tag`]
+/// for the reading regardless of validity.
 pub fn parse_cp32time2a(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     if b.len() < CP32TIME2A_SIZE || b[2] & 0x80 != 0 {
         return None;
     }
+    decode_cp32(b, zone)
+}
+
+/// Decode a CP32Time2a tag into its reading and its IV and SB flags.
+pub fn parse_cp32time2a_tag(b: &[u8], zone: TimeZone) -> (Option<DateTime<Utc>>, TimeTagFlags) {
+    if b.len() < CP32TIME2A_SIZE {
+        return (None, TimeTagFlags::default());
+    }
+    (decode_cp32(b, zone), TimeTagFlags::from_minutes_octet(b[2]))
+}
+
+fn decode_cp32(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     let x = u16::from_le_bytes([b[0], b[1]]) as u32;
     let msec = x % 1000;
     let sec = x / 1000;
     let min = (b[2] & 0x3f) as u32;
     let hour = (b[3] & 0x1f) as u32;
 
-    if x >= 60_000 || min > 59 || hour > 23 {
-        return None;
-    }
     let (year, month, day, _, _) = zone.now_parts();
     let val = zone.instant_from(year, month, day, hour, min, sec, msec)?;
     let val = if val > Utc::now() + Duration::minutes(5) {
-        // Move by a calendar day rather than 24 hours across DST changes.
-        let previous = NaiveDate::from_ymd_opt(year, month, day)?.pred_opt()?;
-        zone.instant_from(
-            previous.year(),
-            previous.month(),
-            previous.day(),
-            hour,
-            min,
-            sec,
-            msec,
-        )?
+        val - Duration::days(1)
     } else {
         val
     };
@@ -392,22 +404,8 @@ mod tests {
 
     #[test]
     fn measurand_scales_to_full_scale_fraction() {
-        assert_eq!(
-            Measurand {
-                val: 4096 / 2,
-                ..Default::default()
-            }
-            .f64(),
-            0.5
-        );
-        assert_eq!(
-            Measurand {
-                val: -4096,
-                ..Default::default()
-            }
-            .f64(),
-            -1.0
-        );
+        assert_eq!(Measurand { val: 4096 / 2, ..Default::default() }.f64(), 0.5);
+        assert_eq!(Measurand { val: -4096, ..Default::default() }.f64(), -1.0);
         assert_eq!(Measurand::default().f64(), 0.0);
     }
 
@@ -424,8 +422,8 @@ mod tests {
 
     #[test]
     fn cp32_encodes_the_time_of_day() {
-        let t =
-            Utc.with_ymd_and_hms(2026, 8, 17, 21, 17, 45).unwrap() + Duration::milliseconds(678);
+        let t = Utc.with_ymd_and_hms(2026, 8, 17, 21, 17, 45).unwrap()
+            + Duration::milliseconds(678);
         let b = cp32time2a(Some(t), TimeZone::Utc);
         let msec = 45 * 1000 + 678u32;
         assert_eq!(b, [msec as u8, (msec >> 8) as u8, 17, 21]);

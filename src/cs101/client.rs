@@ -23,7 +23,7 @@ use crate::asdu::{
     QualifierCountCall, QualifierOfInterrogation, QualifierOfResetProcessCmd,
 };
 use crate::cs101::config::Config;
-use crate::cs101::frame::{ControlField, Frame, is_broadcast_addr, prim_fc, read_frame, sec_fc};
+use crate::cs101::frame::{ControlField, Frame, fcv_required, prim_fc, read_frame, sec_fc};
 use crate::cs101::handler::{ClientHandler, dispatch_client};
 use crate::cs101::transport::Transporter;
 use crate::error::{Error, Result};
@@ -55,7 +55,31 @@ struct Secondary {
     fcb: bool,
     /// A response set ACD: a class 1 request is due.
     want_class1: bool,
-    dfc: bool,
+    /// The last response set DFC: the station's buffers are full, so it must
+    /// not be sent more user data until it clears the bit.
+    ///
+    /// See IEC 60870-5-2, subclass 5.1.3. Class polls and link management stay
+    /// allowed — they are what lets the station report that it has drained.
+    busy: bool,
+}
+
+/// What a positive confirmation completed.
+struct Confirmed {
+    /// Function code of the primary frame that was confirmed.
+    fun: u8,
+    /// The station whose link it activated, when it was a link reset.
+    became_active: Option<u16>,
+}
+
+/// What handling one received frame produced.
+#[derive(Default)]
+struct FrameOutcome {
+    /// Stations whose link just became active.
+    newly_active: Vec<u16>,
+    /// The frame carries user data that is new and belongs to the
+    /// application. False for a repeat, an unsolicited response, and anything
+    /// from a station this client does not serve.
+    deliver: bool,
 }
 
 /// A confirmed frame awaiting an acknowledgement.
@@ -352,27 +376,24 @@ impl<H: ClientHandler> Client<H> {
         let (tx_frame, mut rx_frame) = mpsc::channel::<Frame>(20);
         let (tx_out, mut rx_out) = mpsc::channel::<Vec<u8>>(20);
         let (stop_tx, stop_rx) = watch::channel(false);
-        // Application handlers may wait for outbound queue room. Run them
-        // separately so FT1.2 acknowledgements and polling continue meanwhile.
-        let (tx_pack, mut rx_pack) = mpsc::channel::<Asdu>(20);
-        let dispatch_task = {
-            let endpoint = Arc::clone(self);
-            let mut stop = stop_rx.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = stop.changed() => return,
-                        pack = rx_pack.recv() => {
-                            let Some(pack) = pack else { return };
-                            tokio::select! {
-                                _ = stop.changed() => return,
-                                _ = dispatch_client(&*endpoint.handler, endpoint.as_connect(), &pack, endpoint.option.client_number) => {},
-                            }
-                        }
-                    }
+
+        // Application handlers may wait for outgoing queue room. Run them in
+        // order outside the link driver so acknowledgements and polls continue.
+        let (asdu_tx, mut asdu_rx) = mpsc::unbounded_channel::<Asdu>();
+        let endpoint = Arc::clone(self);
+        let mut stop = stop_rx.clone();
+        let dispatcher_task = tokio::spawn(async move {
+            loop {
+                let pack = tokio::select! {
+                    _ = stop.changed() => break,
+                    pack = asdu_rx.recv() => match pack { Some(pack) => pack, None => break },
+                };
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = dispatch_client(&*endpoint.handler, endpoint.as_connect(), &pack, endpoint.option.client_number) => {},
                 }
-            })
-        };
+            }
+        });
 
         let reader_task = {
             let mut stop = stop_rx.clone();
@@ -451,16 +472,16 @@ impl<H: ClientHandler> Client<H> {
                         self.handler.on_connect(self.as_connect()).await;
                     }
 
-                    let newly_active = link.handle_frame(&frame, balanced).await;
-                    for addr in newly_active {
+                    let outcome = link.handle_frame(&frame, balanced).await;
+                    for addr in outcome.newly_active {
                         self.handler.on_link_active(self.as_connect(), addr).await;
                     }
                     self.publish_link_active(&link);
 
-                    if let Some(asdu) = frame.asdu() {
+                    if let Some(asdu) = frame.asdu().filter(|_| outcome.deliver) {
                         match Asdu::unmarshal_binary(self.option.params, asdu) {
                             Ok(pack) => {
-                                if tx_pack.send(pack).await.is_err() { break; }
+                                let _ = asdu_tx.send(pack);
                             }
                             Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
                         }
@@ -498,7 +519,7 @@ impl<H: ClientHandler> Client<H> {
 
         let _ = stop_tx.send(true);
         drop(tx_out);
-        let _ = tokio::join!(reader_task, writer_task, dispatch_task);
+        let _ = tokio::join!(reader_task, writer_task, dispatcher_task);
         fatal
     }
 
@@ -512,15 +533,12 @@ impl<H: ClientHandler> Client<H> {
 
     /// Queue an ASDU for the secondary station at `link_addr`.
     ///
-    /// Broadcast addresses (255/65535 for 1/2 octet addresses) use
-    /// unconfirmed user data: no secondary may answer a broadcast.
     /// Use this on a multi-drop line; [`Connect::send`] targets the first
     /// configured address.
     pub async fn send_to(&self, a: Asdu, link_addr: u16) -> Result<()> {
         if !self.is_connected() {
             return Err(Error::UseClosedConnection);
         }
-        a.marshal_binary()?;
         let mut q = self.shared.queue.lock().unwrap();
         if q.len() >= self.shared.max_queue {
             return Err(Error::SendQueueFull);
@@ -661,6 +679,8 @@ struct LinkState {
     retry_count: u32,
     /// Balanced mode: the FCB expected on the peer's next FCV frame.
     fcb_expected: bool,
+    /// Acknowledge the peer's frames with `E5` in balanced mode.
+    single_char_ack: bool,
     t1_at: Option<Instant>,
     addr_size: u8,
     dir: bool,
@@ -673,11 +693,7 @@ struct LinkState {
 
 impl LinkState {
     fn new(option: &ClientOption, out: mpsc::Sender<Vec<u8>>) -> LinkState {
-        let order: Vec<_> = option
-            .addresses()
-            .into_iter()
-            .filter(|addr| !is_broadcast_addr(*addr, option.config.link_addr_size))
-            .collect();
+        let order = option.addresses();
         let secs = order
             .iter()
             .map(|a| {
@@ -687,7 +703,7 @@ impl LinkState {
                         phase: Phase::Status,
                         fcb: false,
                         want_class1: false,
-                        dfc: false,
+                        busy: false,
                     },
                 )
             })
@@ -703,6 +719,7 @@ impl LinkState {
             addr_size: option.config.link_addr_size,
             // In balanced mode this station is station A and sets DIR.
             dir: option.config.is_balanced(),
+            single_char_ack: option.config.use_single_char_ack,
             t1_duration: option.config.timeout_response_t1,
             default_addr: option.default_addr(),
             out,
@@ -752,19 +769,25 @@ impl LinkState {
     /// Send a secondary (PRM = 0) response; used by the balanced-mode
     /// secondary role of this station.
     async fn send_sec_fixed(&self, fun: u8, addr: u16) -> bool {
-        self.write(&Frame::Fixed {
-            control: ControlField::secondary(fun, false, self.dir),
-            link_addr: addr,
-        })
-        .await
+        // A positive acknowledgement may be the single character E5 when that
+        // is configured; balanced mode has no access demand to lose by it.
+        let frame = if fun == sec_fc::CONF_ACK && self.single_char_ack {
+            Frame::SingleCharAck
+        } else {
+            Frame::Fixed {
+                control: ControlField::secondary(fun, false, self.dir),
+                link_addr: addr,
+            }
+        };
+        self.write(&frame).await
     }
 
     /// Complete the outstanding transaction positively.
     ///
     /// `addr_valid` is false for a single-character acknowledgement, which
-    /// carries no link address. Returns the station whose link just became
-    /// active, if any.
-    fn confirm_positive(&mut self, addr: u16, addr_valid: bool) -> Option<u16> {
+    /// carries no link address. Returns `None` when there was no transaction
+    /// from that station to complete.
+    fn confirm_positive(&mut self, addr: u16, addr_valid: bool) -> Option<Confirmed> {
         let Some(p) = self.last_sent.take() else {
             tracing::warn!("received a confirmation with no frame outstanding");
             return None;
@@ -805,7 +828,10 @@ impl LinkState {
         }
         self.retry_count = 0;
         self.t1_at = None;
-        became_active
+        Some(Confirmed {
+            fun: p.ctrl.fun,
+            became_active,
+        })
     }
 
     /// Abort the outstanding transaction without toggling the FCB and send the
@@ -821,26 +847,29 @@ impl LinkState {
         if let Some(sec) = self.secs.get_mut(&p.addr) {
             sec.phase = Phase::Status;
             sec.want_class1 = false;
+            sec.busy = false;
         }
         self.retry_count = 0;
         self.t1_at = None;
     }
 
-    /// Process one received frame; returns the stations that became active.
-    async fn handle_frame(&mut self, frame: &Frame, balanced: bool) -> Vec<u16> {
-        let mut active = Vec::new();
+    /// Process one received frame.
+    async fn handle_frame(&mut self, frame: &Frame, balanced: bool) -> FrameOutcome {
+        let mut out = FrameOutcome::default();
 
         // A single-character acknowledgement carries neither address nor
         // control field.
         if matches!(frame, Frame::SingleCharAck) {
-            active.extend(self.confirm_positive(0, false));
-            return active;
+            if let Some(c) = self.confirm_positive(0, false) {
+                out.newly_active.extend(c.became_active);
+            }
+            return out;
         }
 
         let addr = frame.link_addr().unwrap_or(0);
         if self.addr_size > 0 && !self.secs.contains_key(&addr) {
             tracing::warn!(addr, "ignoring a frame from an unexpected link address");
-            return active;
+            return out;
         }
         let ctrl = frame.control().expect("not a single character ack");
 
@@ -849,28 +878,46 @@ impl LinkState {
             // primary station.
             if !balanced {
                 tracing::warn!(%ctrl, "unexpected PRM=1 frame in unbalanced mode");
-                return active;
+                return out;
             }
-            self.handle_peer_primary_frame(frame, ctrl, addr).await;
-            return active;
+            out.deliver = self.handle_peer_primary_frame(ctrl, addr).await;
+            return out;
         }
 
+        // DFC is carried by every secondary frame, so each one is also the
+        // station's latest word on whether it can take more user data.
         if let Some(sec) = self.secs.get_mut(&addr) {
-            sec.dfc = ctrl.dfc;
+            if ctrl.dfc && !sec.busy {
+                tracing::warn!(addr, "station signals data flow control, holding user data");
+            } else if !ctrl.dfc && sec.busy {
+                tracing::debug!(addr, "station cleared data flow control");
+            }
+            sec.busy = ctrl.dfc;
         }
+
+        let mut confirm = |link: &mut LinkState| {
+            if let Some(c) = link.confirm_positive(addr, true) {
+                out.newly_active.extend(c.became_active);
+                Some(c.fun)
+            } else {
+                None
+            }
+        };
 
         match frame {
             Frame::Fixed { .. } => match ctrl.fun {
-                sec_fc::CONF_ACK => active.extend(self.confirm_positive(addr, true)),
+                sec_fc::CONF_ACK => {
+                    confirm(self);
+                }
                 // Link busy: keep the frame outstanding, t1 will repeat it.
                 sec_fc::CONF_NACK => tracing::warn!(addr, "station reports the link busy"),
                 sec_fc::USER_DATA_NO_REP => {
                     tracing::debug!(addr, "requested data not available");
-                    active.extend(self.confirm_positive(addr, true));
+                    confirm(self);
                 }
                 sec_fc::RESP_STATUS => {
                     tracing::debug!(addr, dfc = ctrl.dfc, "received link status");
-                    active.extend(self.confirm_positive(addr, true));
+                    confirm(self);
                 }
                 sec_fc::RESP_LINK_NF | sec_fc::RESP_LINK_NI => {
                     tracing::warn!(addr, fc = ctrl.fun, "link service not available");
@@ -880,13 +927,24 @@ impl LinkState {
             },
 
             Frame::Variable { .. } => match ctrl.fun {
-                sec_fc::USER_DATA_CONF | sec_fc::RESP_STATUS => {
-                    tracing::debug!(addr, "received user data");
-                    active.extend(self.confirm_positive(addr, true));
+                sec_fc::USER_DATA_CONF => {
+                    // User data is only ever the answer to a class 1 or class 2
+                    // request. Anything else is a response that arrives after
+                    // its request was repeated — the second copy of the same
+                    // ASDU — or one from a station that was never asked, and
+                    // delivering it would hand the application the same event
+                    // or command confirmation twice.
+                    match confirm(self) {
+                        Some(prim_fc::REQ_DATA1 | prim_fc::REQ_DATA2) => {
+                            tracing::debug!(addr, "received user data");
+                            out.deliver = true;
+                        }
+                        _ => tracing::warn!(addr, "unsolicited user data discarded"),
+                    }
                 }
-                sec_fc::USER_DATA_NO_REP => {
-                    tracing::debug!(addr, "no user data available");
-                    active.extend(self.confirm_positive(addr, true));
+                sec_fc::RESP_STATUS | sec_fc::USER_DATA_NO_REP => {
+                    tracing::debug!(addr, fc = ctrl.fun, "response without user data");
+                    confirm(self);
                 }
                 _ => tracing::warn!(addr, %ctrl, "unhandled variable-length frame"),
             },
@@ -900,7 +958,7 @@ impl LinkState {
             let due = {
                 let sec = self.secs.get_mut(&addr).expect("checked");
                 sec.want_class1 = true;
-                sec.phase == Phase::Active && !sec.dfc
+                sec.phase == Phase::Active
             };
             if due && self.last_sent.is_none() {
                 let t1 = self.t1_duration;
@@ -908,18 +966,29 @@ impl LinkState {
                     .await;
             }
         }
-        active
+        out
     }
 
     /// Service the secondary role of this station in balanced mode: the peer
     /// acts as a primary and sends link commands and user data to acknowledge.
-    async fn handle_peer_primary_frame(&mut self, frame: &Frame, ctrl: ControlField, addr: u16) {
-        // Duplicate detection over the peer's FCV frames.
+    ///
+    /// Returns whether the frame's user data is new and should be delivered.
+    async fn handle_peer_primary_frame(&mut self, ctrl: ControlField, addr: u16) -> bool {
+        // A frame whose FCV contradicts its function code was not produced by a
+        // conforming peer, and acting on it would move the FCB.
+        if fcv_required(ctrl.fun).is_some_and(|fcv| fcv != ctrl.fcv) {
+            tracing::warn!(%ctrl, "FCV does not match the function code, frame ignored");
+            return false;
+        }
+
+        // Duplicate detection over the peer's FCV frames. A repeat means the
+        // acknowledgement was lost: acknowledge again, but the data was
+        // already delivered the first time.
         if ctrl.fcv {
             if ctrl.fcb != self.fcb_expected {
                 tracing::warn!("repeated peer frame, re-sending the acknowledgement");
                 self.send_sec_fixed(sec_fc::CONF_ACK, addr).await;
-                return;
+                return false;
             }
             self.fcb_expected = !self.fcb_expected;
         }
@@ -937,9 +1006,11 @@ impl LinkState {
             prim_fc::USER_DATA_CONF => {
                 tracing::debug!("the peer sent confirmed user data");
                 self.send_sec_fixed(sec_fc::CONF_ACK, addr).await;
+                return true;
             }
             prim_fc::USER_DATA_NO_CONF => {
                 tracing::debug!("the peer sent unconfirmed user data");
+                return true;
             }
             prim_fc::REQ_STATUS => {
                 self.send_sec_fixed(sec_fc::RESP_STATUS, addr).await;
@@ -949,7 +1020,7 @@ impl LinkState {
                 self.send_sec_fixed(sec_fc::RESP_LINK_NI, addr).await;
             }
         }
-        let _ = frame;
+        false
     }
 
     /// Drive the link when it is free: queued user data first, then link
@@ -984,11 +1055,6 @@ impl LinkState {
                     if balanced {
                         continue;
                     }
-                    if self.secs[&addr].dfc {
-                        self.send_prim_confirmed(addr, prim_fc::REQ_STATUS, false, t1)
-                            .await;
-                        return;
-                    }
                     let fun = if self.secs[&addr].want_class1 {
                         prim_fc::REQ_DATA1
                     } else {
@@ -1009,20 +1075,17 @@ impl LinkState {
             let mut i = 0;
             while i < q.len() {
                 let addr = q[i].addr;
-                if is_broadcast_addr(addr, self.addr_size) {
-                    found = q.remove(i);
-                    break;
-                }
                 match self.secs.get(&addr) {
                     None => {
                         tracing::error!(addr, "dropping a queued ASDU for an unknown station");
                         q.remove(i);
                     }
-                    Some(sec) if sec.phase == Phase::Active && !sec.dfc => {
+                    Some(sec) if sec.phase == Phase::Active && !sec.busy => {
                         found = q.remove(i);
                         break;
                     }
-                    // Not active yet: leave it queued and look further on.
+                    // Not active, or holding off under DFC: leave it queued
+                    // and look further on.
                     Some(_) => i += 1,
                 }
             }
@@ -1038,14 +1101,6 @@ impl LinkState {
             }
         };
 
-        if is_broadcast_addr(out.addr, self.addr_size) {
-            let frame = Frame::Variable {
-                control: ControlField::primary(prim_fc::USER_DATA_NO_CONF, false, false, self.dir),
-                link_addr: out.addr,
-                asdu: raw,
-            };
-            return self.write(&frame).await;
-        }
         let fcb = self.secs[&out.addr].fcb;
         let ctrl = ControlField::primary(prim_fc::USER_DATA_CONF, true, fcb, self.dir);
         let frame = Frame::Variable {
@@ -1067,15 +1122,15 @@ impl LinkState {
         true
     }
 
-    /// A confirmed frame went unanswered. Repeat it once with the same FCB,
-    /// then give up on the station.
+    /// A confirmed frame went unanswered. Repeat it with the same FCB up to
+    /// the configured number of times, then give up on the station.
     async fn on_t1_timeout(&mut self, cfg: &Config) -> Result<()> {
         let Some(p) = self.last_sent.as_ref() else {
             self.t1_at = None;
             return Ok(());
         };
 
-        if self.retry_count < 1 {
+        if self.retry_count < u32::from(cfg.max_repetitions) {
             self.retry_count += 1;
             tracing::warn!(retry = self.retry_count, "t1 expired, repeating the frame");
             let frame = p.frame.clone();
@@ -1087,13 +1142,14 @@ impl LinkState {
         }
 
         let addr = p.addr;
-        tracing::error!(station = addr, "t1 expired after the repetition");
+        tracing::error!(station = addr, "t1 expired after the repetitions");
         self.last_sent = None;
         self.retry_count = 0;
         self.t1_at = None;
         if let Some(sec) = self.secs.get_mut(&addr) {
             sec.phase = Phase::Status;
             sec.want_class1 = false;
+            sec.busy = false;
         }
         // Point to point: losing the only peer means losing the connection, so
         // the manager can reopen it. On a multi-drop line keep serving the rest.
@@ -1148,88 +1204,262 @@ impl LinkState {
 }
 
 #[cfg(test)]
-mod parity_tests {
+mod tests {
     use super::*;
-    use crate::asdu::{Cause, PARAMS_WIDE, SinglePointInfo};
-    struct Handler;
-    #[async_trait::async_trait]
-    impl ClientHandler for Handler {}
-    fn data() -> Asdu {
-        Asdu::single(
-            PARAMS_WIDE,
-            false,
-            CauseOfTransmission::new(Cause::SPONTANEOUS),
+    use crate::asdu::{Cause, CauseOfTransmission};
+
+    fn shared() -> Shared {
+        Shared {
+            params: PARAMS_STANDARD_101,
+            max_queue: 16,
+            default_addr: 1,
+            connected: AtomicBool::new(true),
+            link_active: AtomicBool::new(true),
+            queue: Mutex::new(VecDeque::new()),
+            link_req: mpsc::unbounded_channel().0,
+            active_notify: Notify::new(),
+        }
+    }
+
+    fn asdu() -> Asdu {
+        Asdu::interrogation_cmd(
+            PARAMS_STANDARD_101,
+            CauseOfTransmission::new(Cause::ACTIVATION),
             1,
-            &[SinglePointInfo::new(100, true)],
+            crate::asdu::QualifierOfInterrogation::STATION,
         )
         .unwrap()
     }
-    #[tokio::test]
-    async fn dfc_holds_user_data_until_status_clears_it() {
-        let (tx, mut rx) = mpsc::channel(20);
+
+    /// A primary with one active secondary at address 1, plus the receiver its
+    /// outbound frames land in.
+    fn primary() -> (LinkState, mpsc::Receiver<Vec<u8>>) {
         let option = ClientOption::new();
-        let client = Client::new(Handler, option.clone());
+        let (tx, rx) = mpsc::channel(16);
         let mut link = LinkState::new(&option, tx);
         link.secs.get_mut(&1).unwrap().phase = Phase::Active;
-        link.handle_frame(
-            &Frame::Fixed {
-                control: ControlField {
-                    dfc: true,
-                    ..ControlField::secondary(sec_fc::RESP_STATUS, false, false)
-                },
-                link_addr: 1,
-            },
-            false,
-        )
-        .await;
-        client.shared.queue.lock().unwrap().push_back(Outgoing {
-            asdu: data(),
+        (link, rx)
+    }
+
+    fn secondary_frame(fun: u8, acd: bool, dfc: bool) -> Frame {
+        let mut control = ControlField::secondary(fun, acd, false);
+        control.dfc = dfc;
+        Frame::Fixed {
+            control,
+            link_addr: 1,
+        }
+    }
+
+    // DFC is the secondary saying its buffers are full. IEC 60870-5-2 subclass
+    // 5.1.3 requires the primary to stop sending user data until it clears —
+    // sending anyway is how a station's buffer overruns and drops data.
+
+    #[tokio::test]
+    async fn user_data_is_held_while_the_station_signals_dfc() {
+        let (mut link, mut rx) = primary();
+        let sh = shared();
+        sh.queue.lock().unwrap().push_back(Outgoing {
+            asdu: asdu(),
             addr: 1,
         });
-        link.tick(&client.shared, false).await;
-        let raw = rx.recv().await.unwrap();
-        assert_eq!(ControlField::parse(raw[1]).fun, prim_fc::REQ_STATUS);
-        assert_eq!(client.shared.queue.lock().unwrap().len(), 1);
-        link.handle_frame(
-            &Frame::Fixed {
-                control: ControlField::secondary(sec_fc::RESP_STATUS, false, false),
-                link_addr: 1,
-            },
-            false,
-        )
-        .await;
-        link.tick(&client.shared, false).await;
-        let raw = rx.recv().await.unwrap();
-        assert_eq!(ControlField::parse(raw[4]).fun, prim_fc::USER_DATA_CONF);
-        assert!(client.shared.queue.lock().unwrap().is_empty());
+
+        link.handle_frame(&secondary_frame(sec_fc::CONF_ACK, false, true), false)
+            .await;
+        assert!(link.secs[&1].busy, "the station reported DFC");
+
+        let sent = link.try_send_queued(&sh, Duration::from_secs(1)).await;
+        assert!(!sent, "no user data may go out while DFC is set");
+        assert_eq!(sh.queue.lock().unwrap().len(), 1, "and it stays queued");
+        assert!(rx.try_recv().is_err());
     }
+
     #[tokio::test]
-    async fn broadcasts_are_unconfirmed_and_never_enter_the_station_list() {
-        for (width, addr) in [(1, 255), (2, 65535)] {
-            let option = ClientOption::new()
-                .with_secondary_address(addr)
-                .with_config(Config {
-                    link_addr_size: width,
-                    serial: crate::cs101::SerialConfig::new("unused", 9600),
-                    ..Config::default()
-                })
-                .unwrap();
-            let (tx, mut rx) = mpsc::channel(20);
-            let client = Client::new(Handler, option.clone());
-            let mut link = LinkState::new(&option, tx);
-            assert!(link.order.is_empty());
-            client
-                .shared
-                .queue
-                .lock()
-                .unwrap()
-                .push_back(Outgoing { asdu: data(), addr });
-            link.tick(&client.shared, false).await;
-            let raw = rx.recv().await.unwrap();
-            let ctrl = ControlField::parse(raw[4]);
-            assert_eq!(ctrl.fun, prim_fc::USER_DATA_NO_CONF);
-            assert!(!ctrl.fcv);
-            assert!(link.last_sent.is_none());
+    async fn queued_data_goes_out_once_the_station_clears_dfc() {
+        let (mut link, _rx) = primary();
+        let sh = shared();
+        sh.queue.lock().unwrap().push_back(Outgoing {
+            asdu: asdu(),
+            addr: 1,
+        });
+
+        link.handle_frame(&secondary_frame(sec_fc::CONF_ACK, false, true), false)
+            .await;
+        assert!(!link.try_send_queued(&sh, Duration::from_secs(1)).await);
+
+        // The next response clears DFC: the station has drained.
+        link.last_sent = None;
+        link.handle_frame(&secondary_frame(sec_fc::CONF_ACK, false, false), false)
+            .await;
+        assert!(!link.secs[&1].busy);
+
+        assert!(link.try_send_queued(&sh, Duration::from_secs(1)).await);
+        assert!(sh.queue.lock().unwrap().is_empty(), "the ASDU went out");
+    }
+
+    #[tokio::test]
+    async fn a_busy_station_is_still_polled() {
+        // Class polls and link management stay allowed under DFC — they are
+        // what lets the station report that it has drained. Only user data is
+        // held back.
+        let (mut link, mut rx) = primary();
+        let sh = shared();
+        link.secs.get_mut(&1).unwrap().busy = true;
+
+        link.tick(&sh, false).await;
+        assert!(rx.try_recv().is_ok(), "the poll still goes out");
+    }
+
+    fn user_data(addr: u16) -> Frame {
+        Frame::Variable {
+            control: ControlField::secondary(sec_fc::USER_DATA_CONF, false, false),
+            link_addr: addr,
+            asdu: asdu().marshal_binary().unwrap(),
         }
+    }
+
+    /// Put a class 2 request to station 1 on the wire, as the poll would.
+    async fn poll(link: &mut LinkState) {
+        link.send_prim_confirmed(1, prim_fc::REQ_DATA2, true, Duration::from_secs(1))
+            .await;
+    }
+
+    // User data from a secondary is only ever the answer to a class 1 or
+    // class 2 request. A second copy — a late answer to a request that was
+    // then repeated — must not reach the application again.
+
+    #[tokio::test]
+    async fn the_answer_to_a_poll_is_delivered_once() {
+        let (mut link, _rx) = primary();
+        poll(&mut link).await;
+        assert!(link.handle_frame(&user_data(1), false).await.deliver);
+
+        // The same response again, with no request outstanding.
+        assert!(
+            !link.handle_frame(&user_data(1), false).await.deliver,
+            "a repeated response was delivered twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_data_nobody_asked_for_is_not_delivered() {
+        let (mut link, _rx) = primary();
+        assert!(!link.handle_frame(&user_data(1), false).await.deliver);
+    }
+
+    #[tokio::test]
+    async fn user_data_from_an_unknown_station_is_not_delivered() {
+        // The client logs that it ignores such a frame; it must not then hand
+        // the ASDU to the application anyway.
+        let (mut link, _rx) = primary();
+        poll(&mut link).await;
+        assert!(!link.handle_frame(&user_data(42), false).await.deliver);
+        assert!(link.last_sent.is_some(), "the real answer is still awaited");
+    }
+
+    #[tokio::test]
+    async fn user_data_answering_a_non_request_is_not_delivered() {
+        // A station that answers confirmed user data with user data is not
+        // following the standard; the frame completes the transaction but its
+        // payload is not an answer to anything.
+        let (mut link, _rx) = primary();
+        link.send_prim_confirmed(1, prim_fc::TEST_LINK, true, Duration::from_secs(1))
+            .await;
+        assert!(!link.handle_frame(&user_data(1), false).await.deliver);
+    }
+
+    fn peer_user_data(fcb: bool, fcv: bool) -> Frame {
+        Frame::Variable {
+            control: ControlField::primary(prim_fc::USER_DATA_CONF, fcv, fcb, false),
+            link_addr: 1,
+            asdu: asdu().marshal_binary().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_balanced_frame_is_acknowledged_but_not_delivered_again() {
+        let (mut link, mut rx) = primary();
+        // The peer's first FCV frame after a reset carries FCB = 1.
+        assert!(
+            link.handle_frame(&peer_user_data(true, true), true)
+                .await
+                .deliver
+        );
+        assert!(rx.try_recv().is_ok(), "acknowledged");
+
+        // Our acknowledgement was lost; the peer repeats with the same FCB.
+        assert!(
+            !link
+                .handle_frame(&peer_user_data(true, true), true)
+                .await
+                .deliver,
+            "the repeat was delivered as new data"
+        );
+        assert!(rx.try_recv().is_ok(), "the repeat is acknowledged again");
+
+        // The next genuine frame toggles the FCB and is delivered.
+        assert!(
+            link.handle_frame(&peer_user_data(false, true), true)
+                .await
+                .deliver
+        );
+    }
+
+    #[tokio::test]
+    async fn a_balanced_frame_whose_fcv_contradicts_its_function_is_ignored() {
+        let (mut link, mut rx) = primary();
+        let before = link.fcb_expected;
+        // Confirmed user data always counts frames; FCV = 0 is malformed.
+        assert!(
+            !link
+                .handle_frame(&peer_user_data(true, false), true)
+                .await
+                .deliver
+        );
+        assert!(rx.try_recv().is_err(), "not answered");
+        assert_eq!(link.fcb_expected, before, "the FCB did not move");
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_frame_is_repeated_the_configured_number_of_times() {
+        for repetitions in [0u8, 1, 3] {
+            let cfg = Config {
+                max_repetitions: repetitions,
+                ..Config::default()
+            };
+            let (mut link, mut rx) = primary();
+            poll_station(&mut link).await;
+            let first = rx.try_recv().unwrap();
+
+            for n in 0..repetitions {
+                link.on_t1_timeout(&cfg).await.unwrap();
+                assert_eq!(
+                    rx.try_recv().unwrap(),
+                    first,
+                    "repetition {n} must be the same frame, FCB included"
+                );
+            }
+            // One more timeout gives the only station up, which ends the line.
+            assert_eq!(link.on_t1_timeout(&cfg).await, Err(Error::TimeoutT1));
+            assert!(rx.try_recv().is_err(), "no repetition beyond {repetitions}");
+        }
+    }
+
+    async fn poll_station(link: &mut LinkState) {
+        link.send_prim_confirmed(1, prim_fc::REQ_DATA2, true, Duration::from_secs(1))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_balanced_secondary_role_may_acknowledge_with_the_single_character() {
+        let mut option = ClientOption::new();
+        option.config.use_single_char_ack = true;
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut link = LinkState::new(&option, tx);
+        let f = Frame::Fixed {
+            control: ControlField::primary(prim_fc::RESET_LINK, false, false, false),
+            link_addr: 1,
+        };
+        link.handle_frame(&f, true).await;
+        assert_eq!(rx.try_recv().unwrap(), vec![crate::cs101::SINGLE_CHAR_ACK]);
     }
 }

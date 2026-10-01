@@ -21,6 +21,16 @@ pub enum TimeZone {
     Local,
     /// Encode and decode time tags at a fixed offset from UTC.
     Fixed(FixedOffset),
+    /// Encode and decode time tags in a named IANA time zone.
+    ///
+    /// Unlike [`TimeZone::Local`] this does not depend on how the host is
+    /// configured, and unlike [`TimeZone::Fixed`] it observes summer time, so
+    /// the SU bit of a CP56Time2a tag is set and honoured. Use it for a device
+    /// whose profile fixes a zone the host does not share.
+    ///
+    /// Requires the `tz` feature.
+    #[cfg(feature = "tz")]
+    Named(chrono_tz::Tz),
 }
 
 impl TimeZone {
@@ -49,14 +59,15 @@ impl TimeZone {
             TimeZone::Utc => split!(t),
             TimeZone::Local => split!(t.with_timezone(&Local)),
             TimeZone::Fixed(off) => split!(t.with_timezone(off)),
+            #[cfg(feature = "tz")]
+            TimeZone::Named(tz) => split!(t.with_timezone(tz)),
         }
     }
 
     /// Rebuild an instant from broken-down calendar fields interpreted in this zone.
     ///
-    /// Ambiguous local times initially choose the earliest instant; CP56/CP32
-    /// decoders then select the occurrence matching the SU bit. Non-existent
-    /// local times are rejected.
+    /// Ambiguous or non-existent local times (DST transitions) resolve to the
+    /// earliest valid instant, mirroring Go's `time.Date` normalisation.
     // Broken-down calendar fields; grouping them into a struct would only move
     // the same seven values behind a name used in exactly three places.
     #[allow(clippy::too_many_arguments)]
@@ -71,63 +82,104 @@ impl TimeZone {
         milli: u32,
     ) -> Option<DateTime<Utc>> {
         let nano = milli.checked_mul(1_000_000)?;
+        // Build the whole reading first and resolve it against the zone once.
+        // Setting the nanoseconds afterwards would re-resolve the local time,
+        // and `with_nanosecond` answers `None` for a reading the zone sees
+        // twice — which is exactly the hour the SU bit exists to disambiguate,
+        // so every tag inside it would decode as "not a time".
+        //
+        // `and_hms_nano_opt` is also what bounds the fields: the octets are
+        // wider than the ranges the standard defines, and an hour of 31 or a
+        // minute of 60 is a fault in the sender, not a time.
+        let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)?
+            .and_hms_nano_opt(hour, min, sec, nano)?;
         match self {
-            TimeZone::Utc => Utc
-                .with_ymd_and_hms(year, month, day, hour, min, sec)
-                .single()
-                .map(|t| t + chrono::Duration::nanoseconds(nano as i64)),
+            TimeZone::Utc => Some(Utc.from_utc_datetime(&naive)),
             TimeZone::Local => Local
-                .with_ymd_and_hms(year, month, day, hour, min, sec)
+                .from_local_datetime(&naive)
                 .earliest()
-                .map(|t| t + chrono::Duration::nanoseconds(nano as i64))
                 .map(|t| t.with_timezone(&Utc)),
             TimeZone::Fixed(off) => off
-                .with_ymd_and_hms(year, month, day, hour, min, sec)
+                .from_local_datetime(&naive)
                 .earliest()
-                .map(|t| t + chrono::Duration::nanoseconds(nano as i64))
+                .map(|t| t.with_timezone(&Utc)),
+            #[cfg(feature = "tz")]
+            TimeZone::Named(tz) => tz
+                .from_local_datetime(&naive)
+                .earliest()
                 .map(|t| t.with_timezone(&Utc)),
         }
     }
 
-    /// Summer-time flag of a local instant. UTC/fixed-offset zones have none.
-    pub(crate) fn summer_time(&self, t: DateTime<Utc>) -> bool {
-        if !matches!(self, TimeZone::Local) {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            let timestamp = t.timestamp() as libc::time_t;
-            let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
-            // SAFETY: both pointers are valid and localtime_r initializes tm
-            // on success. No process-global time-zone state is modified here.
-            let result = unsafe { libc::localtime_r(&timestamp, broken_down.as_mut_ptr()) };
-            !result.is_null() && unsafe { broken_down.assume_init() }.tm_isdst > 0
-        }
-        #[cfg(windows)]
-        {
-            let timestamp = t.timestamp() as libc::time_t;
-            let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
-            // SAFETY: localtime_s initializes the destination on success.
-            let result = unsafe { libc::localtime_s(broken_down.as_mut_ptr(), &timestamp) };
-            result == 0 && unsafe { broken_down.assume_init() }.tm_isdst > 0
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            false
+    /// The offset from UTC this zone is at during `t`, in seconds.
+    fn offset_secs(&self, t: DateTime<Utc>) -> i32 {
+        match self {
+            TimeZone::Utc => 0,
+            TimeZone::Local => t.with_timezone(&Local).offset().local_minus_utc(),
+            TimeZone::Fixed(off) => off.local_minus_utc(),
+            #[cfg(feature = "tz")]
+            TimeZone::Named(tz) => {
+                use chrono::Offset;
+                t.with_timezone(tz).offset().fix().local_minus_utc()
+            }
         }
     }
 
-    /// Resolve the repeated autumn hour according to the wire SU flag.
-    pub(crate) fn resolve_summer_time(&self, t: DateTime<Utc>, summer: bool) -> DateTime<Utc> {
-        if !matches!(self, TimeZone::Local) || self.summer_time(t) == summer {
+    /// Whether this zone is on summer time during `t`.
+    ///
+    /// This is the SU bit of a CP56Time2a or CP32Time2a tag: the reading is
+    /// expressed in summer time, which is what lets a receiver resolve the
+    /// hour that occurs twice when the clocks go back. It is always false for
+    /// UTC and for any fixed offset, because neither observes summer time.
+    ///
+    /// A zone is taken to be on summer time when its offset differs from the
+    /// smallest offset it uses that year. That is the standard offset in both
+    /// hemispheres — January is summer time in Sydney and standard time in
+    /// Berlin, and taking the minimum gets both right.
+    pub(crate) fn is_dst(&self, t: DateTime<Utc>) -> bool {
+        match self {
+            TimeZone::Utc | TimeZone::Fixed(_) => return false,
+            #[cfg(feature = "tz")]
+            TimeZone::Named(_) => {}
+            TimeZone::Local => {}
+        }
+        let (year, ..) = self.parts(t);
+        let at = |month| {
+            Utc.with_ymd_and_hms(year, month, 1, 0, 0, 0)
+                .single()
+                .map(|r| self.offset_secs(r))
+        };
+        let (Some(jan), Some(jul)) = (at(1), at(7)) else {
+            return false;
+        };
+        self.offset_secs(t) != jan.min(jul)
+    }
+
+    /// Pick the instant matching a CP56Time2a or CP32Time2a SU flag.
+    ///
+    /// A wall clock reading is ambiguous for one hour a year: when the clocks
+    /// go back the same local time occurs twice, once in summer time and once
+    /// in standard time. [`instant_from`](Self::instant_from) resolves that to
+    /// the earlier of the two — the standard provides the SU bit to settle it.
+    ///
+    /// Returns `t` unchanged when it already agrees with `su`, and when no
+    /// instant with the same wall clock reading agrees. The latter happens
+    /// when the sender's summer time rules differ from this zone's, and there
+    /// the wall clock is the only thing the two ends agree on.
+    pub(crate) fn resolve_summer_time(&self, t: DateTime<Utc>, su: bool) -> DateTime<Utc> {
+        if self.is_dst(t) == su {
             return t;
         }
-        let wall = t.with_timezone(&Local).naive_local();
-        if let chrono::LocalResult::Ambiguous(first, second) = Local.from_local_datetime(&wall) {
-            for candidate in [first.with_timezone(&Utc), second.with_timezone(&Utc)] {
-                if self.summer_time(candidate) == summer {
-                    return candidate;
-                }
+        let wall = self.parts(t);
+        // A summer time offset is an hour almost everywhere and half an hour
+        // in a few places; the shifted instant is only the right one if it
+        // still reads as the same wall clock.
+        for minutes in [-60, 60, -30, 30, -120, 120] {
+            let Some(alt) = t.checked_add_signed(chrono::Duration::minutes(minutes)) else {
+                continue;
+            };
+            if self.is_dst(alt) == su && self.parts(alt) == wall {
+                return alt;
             }
         }
         t
@@ -147,6 +199,8 @@ impl TimeZone {
             TimeZone::Utc => split!(now),
             TimeZone::Local => split!(now.with_timezone(&Local)),
             TimeZone::Fixed(off) => split!(now.with_timezone(off)),
+            #[cfg(feature = "tz")]
+            TimeZone::Named(tz) => split!(now.with_timezone(tz)),
         }
     }
 }
@@ -169,8 +223,18 @@ pub struct Params {
     pub info_obj_addr_size: u8,
     /// Time zone used to interpret CP24/CP56 time tags.
     pub info_obj_time_zone: TimeZone,
-    /// Accept and discard trailing payload octets from legacy peers.
-    /// Strict validation is the default; enable only for a known counterpart.
+    /// Accept an ASDU whose information objects are longer than its variable
+    /// structure qualifier accounts for, silently discarding the surplus.
+    ///
+    /// The default — reject, with [`Error::TrailingOctets`] — is what the
+    /// standard implies: an ASDU's length is fixed by the frame that carries
+    /// it, its object count by the qualifier and its object size by the type
+    /// identification, so a conforming sender cannot produce a surplus octet.
+    /// Discarding one means executing a command that arrived in a frame nobody
+    /// can account for.
+    ///
+    /// Set this only for a device that is known to pad, and knowing that a
+    /// truncated interrogation reply then looks the same as a complete one.
     pub allow_trailing_octets: bool,
 }
 

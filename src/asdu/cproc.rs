@@ -19,6 +19,7 @@ use crate::asdu::identifier::{
 };
 use crate::asdu::info::*;
 use crate::asdu::params::Params;
+use crate::asdu::time::TimeTagFlags;
 use crate::error::{Error, Result};
 
 /// A single command.
@@ -33,6 +34,12 @@ pub struct SingleCommandInfo {
     pub qoc: QualifierOfCommand,
     /// Time tag; encoded only by `C_SC_TA_1`.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A double command.
@@ -47,6 +54,12 @@ pub struct DoubleCommandInfo {
     pub qoc: QualifierOfCommand,
     /// Time tag; encoded only by `C_DC_TA_1`.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A regulating step command.
@@ -61,6 +74,12 @@ pub struct StepCommandInfo {
     pub qoc: QualifierOfCommand,
     /// Time tag; encoded only by `C_RC_TA_1`.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A set-point command with a normalized value.
@@ -75,6 +94,12 @@ pub struct SetpointCommandNormalInfo {
     pub qos: QualifierOfSetpointCmd,
     /// Time tag; encoded only by `C_SE_TA_1`.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A set-point command with a scaled value.
@@ -89,6 +114,12 @@ pub struct SetpointCommandScaledInfo {
     pub qos: QualifierOfSetpointCmd,
     /// Time tag; encoded only by `C_SE_TB_1`.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A set-point command with a short floating point value.
@@ -103,6 +134,12 @@ pub struct SetpointCommandFloatInfo {
     pub qos: QualifierOfSetpointCmd,
     /// Time tag; encoded only by `C_SE_TC_1`.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A 32 bit string command.
@@ -115,6 +152,12 @@ pub struct BitsString32CommandInfo {
     pub value: u32,
     /// Time tag; encoded only by `C_BO_TA_1`.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// Commands may only be sent with `Activation` or `Deactivation`.
@@ -160,7 +203,7 @@ impl Asdu {
         match type_id {
             TypeId::C_SC_NA_1 => {}
             TypeId::C_SC_TA_1 => {
-                e.cp56time2a(cmd.time);
+                e.cp56time2a_tag(cmd.time, cmd.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -174,7 +217,7 @@ impl Asdu {
         let value = r.byte()?;
         let time = match self.type_id() {
             TypeId::C_SC_NA_1 => None,
-            TypeId::C_SC_TA_1 => r.cp56time2a()?,
+            TypeId::C_SC_TA_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
         Ok(SingleCommandInfo {
@@ -182,6 +225,7 @@ impl Asdu {
             value: value & 0x01 == 0x01,
             qoc: QualifierOfCommand::parse(value),
             time,
+            time_flags: r.time_flags(),
         })
     }
 
@@ -203,7 +247,7 @@ impl Asdu {
         match type_id {
             TypeId::C_DC_NA_1 => {}
             TypeId::C_DC_TA_1 => {
-                e.cp56time2a(cmd.time);
+                e.cp56time2a_tag(cmd.time, cmd.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -217,7 +261,7 @@ impl Asdu {
         let value = r.byte()?;
         let time = match self.type_id() {
             TypeId::C_DC_NA_1 => None,
-            TypeId::C_DC_TA_1 => r.cp56time2a()?,
+            TypeId::C_DC_TA_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
         Ok(DoubleCommandInfo {
@@ -225,6 +269,7 @@ impl Asdu {
             value: DoubleCommand::parse(value),
             qoc: QualifierOfCommand::parse(value),
             time,
+            time_flags: r.time_flags(),
         })
     }
 
@@ -246,7 +291,7 @@ impl Asdu {
         match type_id {
             TypeId::C_RC_NA_1 => {}
             TypeId::C_RC_TA_1 => {
-                e.cp56time2a(cmd.time);
+                e.cp56time2a_tag(cmd.time, cmd.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -260,7 +305,7 @@ impl Asdu {
         let value = r.byte()?;
         let time = match self.type_id() {
             TypeId::C_RC_NA_1 => None,
-            TypeId::C_RC_TA_1 => r.cp56time2a()?,
+            TypeId::C_RC_TA_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
         Ok(StepCommandInfo {
@@ -268,6 +313,7 @@ impl Asdu {
             value: StepCommand::parse(value),
             qoc: QualifierOfCommand::parse(value),
             time,
+            time_flags: r.time_flags(),
         })
     }
 
@@ -289,7 +335,7 @@ impl Asdu {
         match type_id {
             TypeId::C_SE_NA_1 => {}
             TypeId::C_SE_TA_1 => {
-                e.cp56time2a(cmd.time);
+                e.cp56time2a_tag(cmd.time, cmd.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -304,7 +350,7 @@ impl Asdu {
         let qos = QualifierOfSetpointCmd::parse(r.byte()?);
         let time = match self.type_id() {
             TypeId::C_SE_NA_1 => None,
-            TypeId::C_SE_TA_1 => r.cp56time2a()?,
+            TypeId::C_SE_TA_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
         Ok(SetpointCommandNormalInfo {
@@ -312,6 +358,7 @@ impl Asdu {
             value,
             qos,
             time,
+            time_flags: r.time_flags(),
         })
     }
 
@@ -333,7 +380,7 @@ impl Asdu {
         match type_id {
             TypeId::C_SE_NB_1 => {}
             TypeId::C_SE_TB_1 => {
-                e.cp56time2a(cmd.time);
+                e.cp56time2a_tag(cmd.time, cmd.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -348,7 +395,7 @@ impl Asdu {
         let qos = QualifierOfSetpointCmd::parse(r.byte()?);
         let time = match self.type_id() {
             TypeId::C_SE_NB_1 => None,
-            TypeId::C_SE_TB_1 => r.cp56time2a()?,
+            TypeId::C_SE_TB_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
         Ok(SetpointCommandScaledInfo {
@@ -356,6 +403,7 @@ impl Asdu {
             value,
             qos,
             time,
+            time_flags: r.time_flags(),
         })
     }
 
@@ -377,7 +425,7 @@ impl Asdu {
         match type_id {
             TypeId::C_SE_NC_1 => {}
             TypeId::C_SE_TC_1 => {
-                e.cp56time2a(cmd.time);
+                e.cp56time2a_tag(cmd.time, cmd.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -392,7 +440,7 @@ impl Asdu {
         let qos = QualifierOfSetpointCmd::parse(r.byte()?);
         let time = match self.type_id() {
             TypeId::C_SE_NC_1 => None,
-            TypeId::C_SE_TC_1 => r.cp56time2a()?,
+            TypeId::C_SE_TC_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
         Ok(SetpointCommandFloatInfo {
@@ -400,6 +448,7 @@ impl Asdu {
             value,
             qos,
             time,
+            time_flags: r.time_flags(),
         })
     }
 
@@ -421,7 +470,7 @@ impl Asdu {
         match type_id {
             TypeId::C_BO_NA_1 => {}
             TypeId::C_BO_TA_1 => {
-                e.cp56time2a(cmd.time);
+                e.cp56time2a_tag(cmd.time, cmd.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -435,10 +484,15 @@ impl Asdu {
         let value = r.bits_string32()?;
         let time = match self.type_id() {
             TypeId::C_BO_NA_1 => None,
-            TypeId::C_BO_TA_1 => r.cp56time2a()?,
+            TypeId::C_BO_TA_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
-        Ok(BitsString32CommandInfo { ioa, value, time })
+        Ok(BitsString32CommandInfo {
+            ioa,
+            value,
+            time,
+            time_flags: r.time_flags(),
+        })
     }
 }
 
@@ -466,6 +520,7 @@ mod tests {
                 in_select: true,
             },
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         };
         let a = Asdu::single_cmd(PARAMS_WIDE, TypeId::C_SC_NA_1, act(), 1, cmd).unwrap();
         // 0x80 select | (1 << 2) short pulse | 0x01 on
@@ -529,6 +584,7 @@ mod tests {
             value: true,
             qoc,
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         };
         assert_eq!(
             Asdu::single_cmd(p, TypeId::C_SC_NA_1, act(), 1, sc)
@@ -551,6 +607,7 @@ mod tests {
             value: DoubleCommand::On,
             qoc,
             time: t(),
+            time_flags: TimeTagFlags::GOOD,
         };
         assert_eq!(
             Asdu::double_cmd(p, TypeId::C_DC_TA_1, act(), 1, dc)
@@ -565,6 +622,7 @@ mod tests {
             value: StepCommand::StepUp,
             qoc,
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         };
         assert_eq!(
             Asdu::step_cmd(p, TypeId::C_RC_NA_1, act(), 1, rc)
@@ -579,6 +637,7 @@ mod tests {
             value: Normalize(-16384),
             qos,
             time: t(),
+            time_flags: TimeTagFlags::GOOD,
         };
         assert_eq!(
             Asdu::setpoint_cmd_normal(p, TypeId::C_SE_TA_1, act(), 1, na)
@@ -593,6 +652,7 @@ mod tests {
             value: -30000,
             qos,
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         };
         assert_eq!(
             Asdu::setpoint_cmd_scaled(p, TypeId::C_SE_NB_1, act(), 1, nb)
@@ -607,6 +667,7 @@ mod tests {
             value: -1.75,
             qos,
             time: t(),
+            time_flags: TimeTagFlags::GOOD,
         };
         assert_eq!(
             Asdu::setpoint_cmd_float(p, TypeId::C_SE_TC_1, act(), 1, nc)
@@ -620,6 +681,7 @@ mod tests {
             ioa: 7,
             value: 0xcafe_babe,
             time: t(),
+            time_flags: TimeTagFlags::GOOD,
         };
         assert_eq!(
             Asdu::bits_string32_cmd(p, TypeId::C_BO_TA_1, act(), 1, bo)
@@ -639,10 +701,36 @@ mod tests {
             value: true,
             qoc: QualifierOfCommand::default(),
             time: t(),
+            time_flags: TimeTagFlags::GOOD,
         };
         let a = Asdu::single_cmd(PARAMS_WIDE, TypeId::C_SC_TA_1, act(), 1, cmd).unwrap();
         let raw = a.marshal_binary().unwrap();
         let b = Asdu::unmarshal_binary(PARAMS_WIDE, &raw).unwrap();
         assert_eq!(b.get_single_cmd().unwrap(), cmd);
+    }
+
+    #[test]
+    fn a_command_time_tag_carries_its_flags() {
+        let t = Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap();
+        let flags = TimeTagFlags {
+            invalid: true,
+            substituted: false,
+        };
+        let a = Asdu::single_cmd(
+            PARAMS_WIDE,
+            TypeId::C_SC_TA_1,
+            CauseOfTransmission::new(Cause::ACTIVATION),
+            1,
+            SingleCommandInfo {
+                ioa: 1,
+                value: true,
+                time: Some(t),
+                time_flags: flags,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let got = a.get_single_cmd().unwrap();
+        assert_eq!((got.time, got.time_flags), (Some(t), flags));
     }
 }

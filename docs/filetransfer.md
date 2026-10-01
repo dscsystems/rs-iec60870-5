@@ -1,59 +1,198 @@
-# File transfer
+# `filetransfer` reference
 
-The `filetransfer` module implements IEC 60870-5-101 §7.4.11 in the monitor
-direction: the outstation serves files to a master. It works through `Connect`
-on IEC 101 and IEC 104. Types 120–126 have `Asdu` constructors, non-consuming
-getters, and `ConnectExt` send helpers.
+File transfer moves a file from a controlled station to a master — most often a
+disturbance record off a protection relay. It is a multi-ASDU procedure with its
+own handshake, so it lives in its own module rather than in an endpoint.
 
-Use one `Sender` or `Receiver` per connection. Store it in a Tokio mutex in
-an application handler, and pass file ASDUs to its `handle` method. `Ok(false)`
-means the ASDU belongs to another service. Call `abort` after connection loss.
-Sends await queue space for at most 30 seconds; the application dispatcher is
-separate from the protocol loop, so link acknowledgements continue meanwhile.
+Two layers:
+
+* **The ASDUs**, in [`asdu`](asdu.md): the `F_*` types and their qualifiers.
+  Use these directly to speak to a device with a non-standard procedure.
+* **The procedures**, in `filetransfer`: a [`Sender`] for the outstation side
+  and a [`Receiver`] for the master side, which run the handshake for you.
+
+Both procedures are transport agnostic. They act on an
+[`asdu::Connect`](asdu.md), so the same code works with a `cs104` or a `cs101`
+endpoint.
+
+Enabled by the `filetransfer` feature, on by default.
+
+## The ASDUs
+
+| Type | Id | Direction | Purpose |
+|------|----|-----------|---------|
+| `F_FR_NA_1` | 120 | monitor | file ready |
+| `F_SR_NA_1` | 121 | monitor | section ready |
+| `F_SC_NA_1` | 122 | control | call directory, select file, call file, call section |
+| `F_LS_NA_1` | 123 | monitor | last section, last segment |
+| `F_AF_NA_1` | 124 | control | acknowledge file, acknowledge section |
+| `F_SG_NA_1` | 125 | monitor | segment |
+| `F_DR_TA_1` | 126 | monitor | directory |
+
+`F_SC_NB_1` (127, query log) is not implemented.
+
+Every type but the directory carries exactly one information object (SQ = 0).
+
+### Structure of a transfer
+
+A file is cut into **sections**, and each section into **segments**:
+
+```text
+file ─┬─ section 1 ─┬─ segment ─┬─ …            NOS is one octet: 255 sections
+      │             │           └─ segment      LOS is one octet: 255 octets
+      │             └─ checksum (CHS)           per segment, and the ASDU size
+      ├─ section 2 …                            bounds it further
+      └─ section n
+```
+
+The **segment** is the transport unit, bounded by
+`Params::max_segment_size()` — the ASDU maximum minus the identifier, the IOA
+and the four octets of NOF, NOS and LOS, and never more than 255 because LOS is
+a single octet. With the IEC 104 parameters that is 232 octets.
+
+The **section** is the unit that carries a checksum (CHS), the arithmetic sum
+of its segment octets modulo 256. Smaller sections detect corruption earlier at
+the cost of more round trips. A section may be up to 16 MB (its length is a
+3-octet element), but a file may have at most **255 sections**, because the
+name of section (NOS) is a single octet.
+
+### Qualifiers
+
+| Element | Type | Layout |
+|---------|------|--------|
+| FRQ | `FileReadyQualifier` | 7-bit qualifier + P/N in bit 7 |
+| SRQ | `SectionReadyQualifier` | 7-bit qualifier + "not ready" in bit 7 |
+| SCQ | `SelectAndCallQualifier` | `ScqAction` in bits 0–3, `FileError` in bits 4–7 |
+| AFQ | `AckFileOrSectionQualifier` | `AfqAction` in bits 0–3, `FileError` in bits 4–7 |
+| LSQ | `LastSectionQualifier` | one octet; `is_end_of_file()` separates file from section |
+| SOF | `StatusOfFile` | 5-bit status + LFD, FOR and FA |
+
+`file_checksum(&[u8]) -> u8` computes CHS.
+
+## The procedures
+
+### Outstation: serving files
 
 ```rust,no_run
 use std::sync::Arc;
-use rs_iec60870_5::{asdu::*, filetransfer::*};
+use rs_iec60870_5::asdu::{Asdu, Connect, NameOfFile};
+use rs_iec60870_5::cs104::{Server, ServerHandler};
+use rs_iec60870_5::filetransfer::{MemStore, Sender};
 
-async fn serve(c: &dyn Connect, request: &Asdu) -> rs_iec60870_5::Result<()> {
-    let store = Arc::new(MemStore::new());
-    store.write(100, 2, b"disturbance record")?;
-    let mut sender = Sender::new(store);
-    sender.handle(c, request).await?;
-    // Keep sender in the handler for subsequent requests.
-    Ok(())
+struct Outstation {
+    files: Arc<Sender>,
 }
 
-async fn fetch(c: &dyn Connect) -> rs_iec60870_5::Result<()> {
-    let mut receiver = Receiver::new(None);
-    receiver.request_directory(c, 1).await?;
-    receiver.request_file(c, 1, 100, 2).await?;
-    // Keep receiver in the handler and call handle(c, pack) for each file ASDU.
-    // take_directory() drains directory entries; take_completed() drains files.
-    Ok(())
+#[async_trait::async_trait]
+impl ServerHandler for Outstation {
+    async fn asdu(&self, c: &dyn Connect, pack: &Asdu) -> rs_iec60870_5::Result<()> {
+        // The transfer runs itself; anything else is the application's.
+        if self.files.handle(c, pack).await? {
+            return Ok(());
+        }
+        Ok(())
+    }
+}
+
+# fn main() -> std::io::Result<()> {
+let store = Arc::new(MemStore::new());
+store.insert(100, NameOfFile::DISTURBANCE_DATA, std::fs::read("record.bin")?);
+
+let files = Arc::new(Sender::new(store));
+files.set_section_size(4096);
+let srv = Server::new(Outstation { files });
+# let _ = srv;
+# Ok(())
+# }
+```
+
+`Sender::offer(conn, ca, ioa, nof)` announces a file with `F_FR_NA_1`, which a
+master usually answers by selecting it. Everything after that — the directory
+reply, the section announcements, the segments, the retransmission of a section
+the master rejected — is driven by `handle`.
+
+### Master: fetching files
+
+```rust,no_run
+# use std::sync::Arc;
+# use rs_iec60870_5::asdu::{Connect, NameOfFile};
+# use rs_iec60870_5::filetransfer::{MemStore, Receiver};
+# async fn f(c: &dyn Connect) -> rs_iec60870_5::Result<()> {
+let files = Arc::new(Receiver::new(Arc::new(MemStore::new())));
+files.set_file_handler(Box::new(|entry, data| {
+    println!("IOA {}: {} octets", entry.ioa, data.len());
+}));
+files.set_directory_handler(Box::new(|ca, dir| {
+    for e in dir {
+        println!("{ca}: file {} is {} octets", e.nof, e.length_of_file);
+    }
+}));
+
+files.request_directory(c, 1).await?;
+files.request_file(c, 1, 100, NameOfFile::DISTURBANCE_DATA).await?;
+# Ok(()) }
+```
+
+Feed every received ASDU to `handle`, exactly as on the outstation side. The
+section requests, the checksum verification and the acknowledgements are then
+handled for you, and the file handler fires when the file is complete.
+
+By default a file the outstation *announces* is selected automatically. Call
+`set_auto_accept(false)` to decide per file and call `request_file` yourself.
+
+One transfer runs at a time on each side; a second `request_file` while one is
+running returns `Error::TransferBusy`.
+
+## Stores
+
+Files are held by a `Store`:
+
+```rust,ignore
+#[async_trait::async_trait]
+pub trait Store: Send + Sync + 'static {
+    async fn list(&self) -> Result<Vec<Entry>>;
+    async fn read(&self, ioa: InfoObjAddr, nof: NameOfFile) -> Result<Vec<u8>>;
+    async fn write(&self, ioa: InfoObjAddr, nof: NameOfFile, data: Vec<u8>) -> Result<()>;
+    async fn delete(&self, ioa: InfoObjAddr, nof: NameOfFile) -> Result<()>;
 }
 ```
 
-`Sender::offer` announces a stored file. The receiver accepts offers automatically;
-`set_auto_accept(false)` leaves selection to the application. `Store` supports
-list/read/write/delete and must be safe for concurrent use. `MemStore` copies
-bytes and sorts directory entries by IOA and file name. A receiver's store is
-optional; completed bytes are also available through `take_completed`.
+`MemStore` is the in-memory implementation. Implement the trait for any other
+backing — a directory on disk, a database. `read` and `delete` return
+`Error::FileNotFound` for an unknown file, which the sender turns into a
+negative acknowledgement carrying `FileError::UNEXPECTED_NAME_OF_FILE`.
 
-The sender splits files into sections (4096 octets by default) and segments
-(236 octets for standard IEC 104). Each section has an arithmetic checksum
-modulo 256. A checksum or section-length mismatch triggers a negative section
-acknowledgement and retransmission. Directory replies are split across ASDUs
-without losing the last-entry flag. Empty files contain one empty section.
+A `Receiver` built with `Receiver::without_store()` reports completed files
+only through the file handler.
 
-Limits: one transfer per service instance, at most 255 sections, file lengths
-up to 0xffffff octets, monitor direction only. Adjust `set_section_size` for
-large files. The announced file length is descriptive; the receiver validates
-section lengths and checksums. Query-log type 127 and IEC 103 disturbance
-transfer are separate services and remain unsupported.
+## Errors
 
-Verification covers multi-section, empty, offered and corrupted files, small
-queues on an IEC 101 connection, downloads in both directions against the Go
-reference, and downloads plus all seven codec layouts against lib60870-C.
-See [the interoperability harness](../tests/interop/README.md) for pinned
-reference revisions and commands.
+| Error | Meaning |
+|-------|---------|
+| `FileNotFound` | the store has no such file, or the outstation refused it with a negative FRQ |
+| `NoTransfer` | an ASDU arrived for a transfer that is not running, or naming a section that does not exist |
+| `TransferBusy` | a second transfer was requested while one is running |
+| `FileChecksum` | a section's checksum did not match; it is negatively acknowledged and served again |
+| `FileServiceUnsupported` | an ASDU of the other direction, or `F_SC_NB_1` |
+
+An error from `handle` is a report, not a reason to tear down the link: the
+component has already told the peer whatever the procedure requires.
+
+## Things to know
+
+* **255 sections is the hard limit.** `set_section_size` is a preference: when
+  a file would need more sections than NOS can name, the sections are grown to
+  fit. Numbering more than 255 would wrap and make the receiver re-request a
+  section it has already had — a transfer that never finishes.
+* **Segments are sized from the connection's parameters**, so a transfer over a
+  narrow 101 link automatically uses smaller segments than one over 104.
+* **A checksum mismatch costs one section, not the file.** The receiver
+  discards the section, negatively acknowledges it, and the sender serves it
+  again.
+* **An empty file is still a transfer**: one empty section, no segments, and
+  the closing markers. It completes rather than hanging.
+* **Bulk data fills the send queue.** The transfer components retry queue-full
+  errors through `Connect::send_until`, with a 30-second deadline per ASDU.
+  IEC 101 dispatches application handlers outside its link driver, so polling
+  continues while a handler waits for class-buffer room. IEC 104 server
+  broadcasts retry only the sessions that refused a copy.

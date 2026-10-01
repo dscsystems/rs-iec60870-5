@@ -22,11 +22,20 @@ pub trait Link: Send + Sync {
     /// Whether at least one device's link layer is active.
     fn is_link_active(&self) -> bool;
 
+    /// The time zone this link's CP32/CP56 time tags are expressed in.
+    ///
+    /// Set with
+    /// [`ClientOption::with_time_zone`](crate::cs103::ClientOption::with_time_zone);
+    /// UTC unless the device profile says otherwise.
+    fn time_zone(&self) -> crate::asdu::TimeZone {
+        crate::asdu::TimeZone::Utc
+    }
+
     /// Send a time synchronization (ASDU 6) carrying the current time.
     ///
     /// The device confirms with a monitor-direction ASDU 6.
     fn time_sync(&self, addr: u8) -> Result<()> {
-        self.send_to(Asdu::time_sync(addr, Utc::now()), addr)
+        self.send_to(Asdu::time_sync(addr, Utc::now(), self.time_zone()), addr)
     }
 
     /// Initiate a general interrogation (ASDU 7) with the given scan number.
@@ -275,7 +284,7 @@ mod tests {
         let mut gi = Asdu::new(TypeId::GI_TERMINATION, vsq(), Cause::GI_TERMINATION, 3);
         gi.append(&[fun::GLOBAL, 0, 1]);
 
-        let other = Asdu::time_sync(3, Utc::now());
+        let other = Asdu::time_sync(3, Utc::now(), crate::asdu::TimeZone::Utc);
 
         for a in [tt, me, id, gi, other] {
             dispatch(&handler, &link, &a).await;

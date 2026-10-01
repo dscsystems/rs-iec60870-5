@@ -58,7 +58,31 @@ struct Device {
     fcb: bool,
     /// A response set ACD: a class 1 request is due.
     want_class1: bool,
-    dfc: bool,
+    /// The last response set DFC: the device's buffers are full, so it must
+    /// not be sent more user data until it clears the bit.
+    ///
+    /// See IEC 60870-5-2, subclass 5.1.3. Class polls and link management stay
+    /// allowed — they are what lets the device report that it has drained.
+    busy: bool,
+}
+
+/// What a positive confirmation completed.
+struct Confirmed {
+    /// Function code of the primary frame that was confirmed.
+    fun: u8,
+    /// The device whose link it activated, when it was a reset.
+    became_active: Option<u8>,
+}
+
+/// What handling one received frame produced.
+#[derive(Default)]
+struct FrameOutcome {
+    /// Devices whose link just became active.
+    newly_active: Vec<u8>,
+    /// The frame carries user data that answers a class 1 or class 2 request
+    /// and belongs to the application. False for a late second copy of a
+    /// response, an unsolicited one, and anything from an unknown device.
+    deliver: bool,
 }
 
 /// A confirmed frame awaiting an acknowledgement.
@@ -106,6 +130,21 @@ impl ClientOption {
     /// still be set through [`ClientOption::with_config`].
     pub fn new() -> Self {
         ClientOption::default()
+    }
+
+    /// Set the time zone the device's CP32/CP56 time tags are expressed in.
+    ///
+    /// Applied to every ASDU this client decodes and to the time
+    /// synchronization it sends. UTC is the standard's recommendation and the
+    /// default.
+    pub fn with_time_zone(mut self, zone: crate::asdu::TimeZone) -> Self {
+        self.config.time_zone = zone;
+        self
+    }
+
+    /// The time zone time tags are interpreted in.
+    pub fn time_zone(&self) -> crate::asdu::TimeZone {
+        self.config.time_zone
     }
 
     /// Set the configuration. Rejected if invalid.
@@ -442,15 +481,17 @@ impl<H: ClientHandler> Client<H> {
                         self.handler.on_connect(self.as_link()).await;
                     }
 
-                    let activated = link.handle_frame(&frame).await;
+                    let outcome = link.handle_frame(&frame).await;
                     self.publish_link_active(&link);
 
-                    for addr in activated {
+                    for addr in outcome.newly_active {
                         if cfg.auto_init {
                             // The standard 103 start-up: set the clock, then
                             // read the whole process image.
                             tracing::debug!(device = addr, "auto-init: time sync + interrogation");
-                            let _ = self.shared.enqueue(Asdu::time_sync(addr, Utc::now()), addr);
+                            let _ = self
+                                .shared
+                                .enqueue(Asdu::time_sync(addr, Utc::now(), cfg.time_zone), addr);
                             let _ = self
                                 .shared
                                 .enqueue(Asdu::general_interrogation(addr, 0), addr);
@@ -458,8 +499,8 @@ impl<H: ClientHandler> Client<H> {
                         self.handler.on_device_active(self.as_link(), addr).await;
                     }
 
-                    if let Some(raw) = frame.asdu() {
-                        match Asdu::unmarshal_binary(raw) {
+                    if let Some(raw) = frame.asdu().filter(|_| outcome.deliver) {
+                        match Asdu::unmarshal_binary(raw).map(|a| a.with_time_zone(cfg.time_zone)) {
                             Ok(pack) => dispatch(&*self.handler, self.as_link(), &pack).await,
                             Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
                         }
@@ -562,6 +603,10 @@ impl<H: ClientHandler> Link for Client<H> {
     fn is_link_active(&self) -> bool {
         self.is_connected() && self.shared.link_active.load(Ordering::Acquire)
     }
+
+    fn time_zone(&self) -> crate::asdu::TimeZone {
+        self.option.time_zone()
+    }
 }
 
 /// The link state machine, owned by the protocol task.
@@ -588,7 +633,7 @@ impl LinkState {
                         phase: Phase::Status,
                         fcb: false,
                         want_class1: false,
-                        dfc: false,
+                        busy: false,
                     },
                 )
             })
@@ -646,9 +691,9 @@ impl LinkState {
         true
     }
 
-    /// Complete the outstanding transaction positively, returning the device
-    /// whose link just became active.
-    fn confirm_positive(&mut self, addr: u8, addr_valid: bool) -> Option<u8> {
+    /// Complete the outstanding transaction positively. Returns `None` when
+    /// there was no transaction from that device to complete.
+    fn confirm_positive(&mut self, addr: u8, addr_valid: bool) -> Option<Confirmed> {
         let Some(p) = self.last_sent.take() else {
             tracing::warn!("received a confirmation with no frame outstanding");
             return None;
@@ -688,15 +733,16 @@ impl LinkState {
         }
         self.retry_count = 0;
         self.t1_at = None;
-        became_active
+        Some(Confirmed {
+            fun: p.ctrl.fun,
+            became_active,
+        })
     }
 
     /// Abort the outstanding transaction without toggling the FCB, sending the
     /// device back to the start of the initialization procedure.
     fn fail_transaction(&mut self, addr: u8) {
-        let Some(p) = self.last_sent.take() else {
-            return;
-        };
+        let Some(p) = self.last_sent.take() else { return };
         if p.addr != addr {
             self.last_sent = Some(p);
             return;
@@ -704,50 +750,72 @@ impl LinkState {
         if let Some(dev) = self.devices.get_mut(&p.addr) {
             dev.phase = Phase::Status;
             dev.want_class1 = false;
+            dev.busy = false;
         }
         self.retry_count = 0;
         self.t1_at = None;
     }
 
-    /// Process one received frame; returns the devices that became active.
-    async fn handle_frame(&mut self, frame: &Frame) -> Vec<u8> {
-        let mut active = Vec::new();
+    /// Process one received frame.
+    async fn handle_frame(&mut self, frame: &Frame) -> FrameOutcome {
+        let mut out = FrameOutcome::default();
 
         // A single-character acknowledgement carries neither address nor
         // control field.
         if matches!(frame, Frame::SingleCharAck) {
-            active.extend(self.confirm_positive(0, false));
-            return active;
+            if let Some(c) = self.confirm_positive(0, false) {
+                out.newly_active.extend(c.became_active);
+            }
+            return out;
         }
 
         let addr = frame.link_addr().unwrap_or(0) as u8;
         if !self.devices.contains_key(&addr) {
             tracing::warn!(addr, "ignoring a frame from an unexpected link address");
-            return active;
+            return out;
         }
         let ctrl = frame.control().expect("not a single character ack");
 
         if ctrl.prm {
             // 103 defines no balanced procedure, so a device never sends PRM=1.
             tracing::warn!(%ctrl, "unexpected PRM=1 frame; 103 is unbalanced only");
-            return active;
+            return out;
         }
-        if let Some(device) = self.devices.get_mut(&addr) {
-            device.dfc = ctrl.dfc;
+
+        // DFC is carried by every secondary frame, so each one is also the
+        // device's latest word on whether it can take more user data.
+        if let Some(dev) = self.devices.get_mut(&addr) {
+            if ctrl.dfc && !dev.busy {
+                tracing::warn!(addr, "device signals data flow control, holding user data");
+            } else if !ctrl.dfc && dev.busy {
+                tracing::debug!(addr, "device cleared data flow control");
+            }
+            dev.busy = ctrl.dfc;
         }
+
+        let mut confirm = |link: &mut LinkState| {
+            if let Some(c) = link.confirm_positive(addr, true) {
+                out.newly_active.extend(c.became_active);
+                Some(c.fun)
+            } else {
+                None
+            }
+        };
 
         match frame {
             Frame::Fixed { .. } => match ctrl.fun {
-                sec_fc::CONF_ACK => active.extend(self.confirm_positive(addr, true)),
+                sec_fc::CONF_ACK => {
+                    confirm(self);
+                }
                 // Link busy: keep the frame outstanding, t1 will repeat it.
                 sec_fc::CONF_NACK => tracing::warn!(addr, "device reports the link busy"),
                 sec_fc::USER_DATA_NO_REP => {
                     tracing::debug!(addr, "requested data not available");
-                    active.extend(self.confirm_positive(addr, true));
+                    confirm(self);
                 }
                 sec_fc::RESP_STATUS => {
                     tracing::debug!(addr, dfc = ctrl.dfc, "received link status");
-                    active.extend(self.confirm_positive(addr, true));
+                    confirm(self);
                 }
                 sec_fc::RESP_LINK_NF | sec_fc::RESP_LINK_NI => {
                     tracing::warn!(addr, fc = ctrl.fun, "link service not available");
@@ -757,13 +825,22 @@ impl LinkState {
             },
 
             Frame::Variable { .. } => match ctrl.fun {
-                sec_fc::USER_DATA_CONF | sec_fc::RESP_STATUS => {
-                    tracing::debug!(addr, "received user data");
-                    active.extend(self.confirm_positive(addr, true));
+                sec_fc::USER_DATA_CONF => {
+                    // User data is only ever the answer to a class 1 or class 2
+                    // request. Anything else is a late second copy of a
+                    // response whose request was repeated, or one nobody asked
+                    // for, and delivering it would report the same event twice.
+                    match confirm(self) {
+                        Some(prim_fc::REQ_DATA1 | prim_fc::REQ_DATA2) => {
+                            tracing::debug!(addr, "received user data");
+                            out.deliver = true;
+                        }
+                        _ => tracing::warn!(addr, "unsolicited user data discarded"),
+                    }
                 }
-                sec_fc::USER_DATA_NO_REP => {
-                    tracing::debug!(addr, "no user data available");
-                    active.extend(self.confirm_positive(addr, true));
+                sec_fc::RESP_STATUS | sec_fc::USER_DATA_NO_REP => {
+                    tracing::debug!(addr, fc = ctrl.fun, "response without user data");
+                    confirm(self);
                 }
                 _ => tracing::warn!(addr, %ctrl, "unhandled variable-length frame"),
             },
@@ -777,14 +854,14 @@ impl LinkState {
             let due = {
                 let dev = self.devices.get_mut(&addr).expect("checked");
                 dev.want_class1 = true;
-                dev.phase == Phase::Active && !dev.dfc
+                dev.phase == Phase::Active
             };
             if due && self.last_sent.is_none() {
                 self.send_prim_confirmed(addr, prim_fc::REQ_DATA1, true)
                     .await;
             }
         }
-        active
+        out
     }
 
     /// Drive the link when it is free: queued user data first, then link
@@ -811,7 +888,6 @@ impl LinkState {
                 tracing::debug!(device = addr, "resetting the communication unit");
                 (prim_fc::RESET_LINK, false)
             }
-            Phase::Active if self.devices[&addr].dfc => (prim_fc::REQ_STATUS, false),
             Phase::Active if self.devices[&addr].want_class1 => (prim_fc::REQ_DATA1, true),
             Phase::Active => (prim_fc::REQ_DATA2, true),
         };
@@ -831,7 +907,7 @@ impl LinkState {
                         tracing::error!(addr, "dropping a queued ASDU for an unknown device");
                         q.remove(i);
                     }
-                    Some(dev) if dev.phase == Phase::Active && !dev.dfc => {
+                    Some(dev) if dev.phase == Phase::Active && !dev.busy => {
                         found = q.remove(i);
                         break;
                     }
@@ -872,15 +948,15 @@ impl LinkState {
         true
     }
 
-    /// A confirmed frame went unanswered. Repeat it once with the same FCB,
-    /// then give up on the device.
+    /// A confirmed frame went unanswered. Repeat it with the same FCB up to
+    /// the configured number of times, then give up on the device.
     async fn on_t1_timeout(&mut self, cfg: &Config) -> Result<()> {
         let Some(p) = self.last_sent.as_ref() else {
             self.t1_at = None;
             return Ok(());
         };
 
-        if self.retry_count < 1 {
+        if self.retry_count < u32::from(cfg.max_repetitions) {
             self.retry_count += 1;
             tracing::warn!(retry = self.retry_count, "t1 expired, repeating the frame");
             let frame = p.frame.clone();
@@ -892,13 +968,14 @@ impl LinkState {
         }
 
         let addr = p.addr;
-        tracing::error!(device = addr, "t1 expired after the repetition");
+        tracing::error!(device = addr, "t1 expired after the repetitions");
         self.last_sent = None;
         self.retry_count = 0;
         self.t1_at = None;
         if let Some(dev) = self.devices.get_mut(&addr) {
             dev.phase = Phase::Status;
             dev.want_class1 = false;
+            dev.busy = false;
         }
         // Point to point: losing the only device means losing the connection,
         // so the manager can reopen it. On a multi-drop line keep serving the
@@ -925,10 +1002,7 @@ impl LinkState {
     /// Execute a manual link-layer request from the application API.
     async fn handle_link_request(&mut self, req: LinkRequest) {
         if self.last_sent.is_some() {
-            tracing::debug!(
-                fun = req.fun,
-                "manual link request dropped: the link is busy"
-            );
+            tracing::debug!(fun = req.fun, "manual link request dropped: the link is busy");
             return;
         }
         if !self.devices.contains_key(&req.addr) {
@@ -978,7 +1052,11 @@ mod tests {
     #[test]
     fn an_invalid_configuration_is_rejected_up_front() {
         // A serial transport with no port name cannot be opened.
-        assert!(ClientOption::new().with_config(Config::default()).is_err());
+        assert!(
+            ClientOption::new()
+                .with_config(Config::default())
+                .is_err()
+        );
         assert!(
             ClientOption::new()
                 .with_config(Config {
@@ -1077,7 +1155,7 @@ mod tests {
             control: ControlField::secondary(sec_fc::RESP_STATUS, false, false),
             link_addr: 1,
         };
-        assert!(link.handle_frame(&status).await.is_empty());
+        assert!(link.handle_frame(&status).await.newly_active.is_empty());
         assert!(!link.any_active(), "still waiting for the reset");
 
         // Second tick: reset of the communication unit.
@@ -1086,7 +1164,7 @@ mod tests {
         assert_eq!(sent_fun(&f).fun, prim_fc::RESET_LINK);
 
         // The device acknowledges; the link becomes active.
-        assert_eq!(link.handle_frame(&ack(1, false)).await, vec![1]);
+        assert_eq!(link.handle_frame(&ack(1, false)).await.newly_active, vec![1]);
         assert!(link.any_active());
 
         // Third tick: class 2 poll, now with FCV=1 and FCB=1.
@@ -1192,38 +1270,76 @@ mod tests {
         assert_eq!(link.on_t1_timeout(&cfg).await, Err(Error::TimeoutT1));
         assert!(!link.any_active());
     }
-    #[tokio::test]
-    async fn dfc_pauses_class_polls_and_resumes_when_status_clears() {
-        let (mut link, mut out) = state().await;
-        let shared = Shared {
+
+    fn empty_shared() -> Shared {
+        Shared {
             max_queue: 10,
             default_addr: 1,
             connected: AtomicBool::new(true),
-            link_active: AtomicBool::new(false),
+            link_active: AtomicBool::new(true),
             queue: Mutex::new(VecDeque::new()),
             link_req: mpsc::unbounded_channel().0,
             active_notify: Notify::new(),
-        };
+        }
+    }
+
+    /// A state machine whose device 1 has completed the link procedure.
+    async fn active_state() -> (LinkState, mpsc::Receiver<Vec<u8>>) {
+        let (mut link, rx) = state().await;
         link.devices.get_mut(&1).unwrap().phase = Phase::Active;
-        link.handle_frame(&Frame::Fixed {
-            control: ControlField {
-                dfc: true,
-                ..ControlField::secondary(sec_fc::RESP_STATUS, false, false)
-            },
-            link_addr: 1,
-        })
-        .await;
-        link.tick(&shared).await;
-        assert_eq!(
-            sent_fun(&out.recv().await.unwrap()).fun,
-            prim_fc::REQ_STATUS
+        (link, rx)
+    }
+
+    fn user_data(addr: u8) -> Frame {
+        Frame::Variable {
+            control: ControlField::secondary(sec_fc::USER_DATA_CONF, false, false),
+            link_addr: addr as u16,
+            asdu: Asdu::general_interrogation(1, 0).marshal_binary().unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn event_data_is_delivered_once_per_request() {
+        let (mut link, _out) = active_state().await;
+        link.send_prim_confirmed(1, prim_fc::REQ_DATA1, true).await;
+        assert!(link.handle_frame(&user_data(1)).await.deliver);
+
+        // A late second copy of the same response, after the request was
+        // repeated: the event must not be reported twice.
+        assert!(
+            !link.handle_frame(&user_data(1)).await.deliver,
+            "a repeated response was delivered twice"
         );
-        link.handle_frame(&Frame::Fixed {
-            control: ControlField::secondary(sec_fc::RESP_STATUS, false, false),
-            link_addr: 1,
-        })
-        .await;
+    }
+
+    #[tokio::test]
+    async fn data_from_an_unknown_device_is_not_delivered() {
+        let (mut link, _out) = active_state().await;
+        link.send_prim_confirmed(1, prim_fc::REQ_DATA2, true).await;
+        assert!(!link.handle_frame(&user_data(9)).await.deliver);
+        assert!(link.last_sent.is_some(), "the real answer is still awaited");
+    }
+
+    #[tokio::test]
+    async fn commands_are_held_while_the_device_signals_dfc() {
+        let (mut link, mut out) = active_state().await;
+        let shared = empty_shared();
+        shared
+            .enqueue(Asdu::general_interrogation(1, 0), 1)
+            .unwrap();
+
+        let mut busy = ack(1, false);
+        if let Frame::Fixed { control, .. } = &mut busy {
+            control.dfc = true;
+        }
+        link.handle_frame(&busy).await;
+        assert!(link.devices[&1].busy);
+
+        // The poll still goes out — it is how the device reports it drained —
+        // but the queued command does not.
         link.tick(&shared).await;
-        assert_eq!(sent_fun(&out.recv().await.unwrap()).fun, prim_fc::REQ_DATA2);
+        let f = out.recv().await.unwrap();
+        assert_ne!(sent_fun(&f).fun, prim_fc::USER_DATA_CONF);
+        assert_eq!(shared.queue.lock().unwrap().len(), 1, "the command stays queued");
     }
 }

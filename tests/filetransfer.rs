@@ -2,6 +2,10 @@
 // Source-available under the DSC Systems Source-Available License; see LICENSE.
 
 //! Complete procedure including checksum rejection, retry and directory batching.
+#![cfg(feature = "filetransfer")]
+#[path = "support/file_receiver.rs"]
+mod file_receiver;
+use file_receiver::Receiver;
 use rs_iec60870_5::{Error, Result, asdu::*, filetransfer::*};
 use std::sync::{Arc, Mutex};
 struct Wire {
@@ -37,14 +41,14 @@ async fn transfer(params: Params, size: usize, corrupt: bool, offer: bool) {
     let source = Arc::new(MemStore::new());
     let target = Arc::new(MemStore::new());
     let data: Vec<u8> = (0..size).map(|i| (i * 17 + 3) as u8).collect();
-    source.write(100, 2, &data).unwrap();
-    let mut sender = Sender::new(source);
-    sender.set_section_size(256).unwrap();
-    let mut receiver = Receiver::new(Some(target.clone()));
+    source.insert(100, NameOfFile(2), data.clone());
+    let sender = Sender::new(source);
+    sender.set_section_size(256);
+    let receiver = Receiver::new(Some(target.clone()));
     let sw = Wire::new(params);
     let rw = Wire::new(params);
     if offer {
-        sender.offer(&sw, 1, 100, 2).await.unwrap();
+        sender.offer(&sw, 1, 100, NameOfFile(2)).await.unwrap();
     } else {
         receiver.request_file(&rw, 1, 100, 2).await.unwrap();
     }
@@ -56,10 +60,12 @@ async fn transfer(params: Params, size: usize, corrupt: bool, offer: bool) {
                 *a.info_obj.last_mut().unwrap() ^= 1;
                 corrupted = true;
             }
-            receiver.handle(&rw, &a).await.unwrap();
+            let result = receiver.handle(&rw, &a).await;
+            assert!(result.is_ok() || (corrupt && result == Err(Error::FileChecksum)));
         }
         for a in rw.take() {
-            if a.type_id() == TypeId::F_AF_NA_1 && a.get_ack_file_or_section().unwrap().afq == 0x24
+            if a.type_id() == TypeId::F_AF_NA_1
+                && a.get_ack_file_or_section().unwrap().afq.value() == 0x24
             {
                 retry = true;
             }
@@ -69,7 +75,7 @@ async fn transfer(params: Params, size: usize, corrupt: bool, offer: bool) {
             let files = receiver.take_completed();
             assert_eq!(files.len(), 1);
             assert_eq!(files[0].data, data);
-            assert_eq!(target.read(100, 2).unwrap(), data);
+            assert_eq!(target.read(100, NameOfFile(2)).await.unwrap(), data);
             assert_eq!(retry, corrupt);
             return;
         }
@@ -89,10 +95,10 @@ async fn empty_multi_section_offered_and_corrupted_files() {
 async fn directory_batches_preserve_the_final_entry_flag() {
     let store = Arc::new(MemStore::new());
     for ioa in 1..=40 {
-        store.write(ioa, 2, &[1, 2, 3]).unwrap();
+        store.insert(ioa, NameOfFile(2), vec![1, 2, 3]);
     }
-    let mut sender = Sender::new(store);
-    let mut receiver = Receiver::new(None);
+    let sender = Sender::new(store);
+    let receiver = Receiver::new(None);
     let sw = Wire::new(PARAMS_WIDE);
     let rw = Wire::new(PARAMS_WIDE);
     receiver.request_directory(&rw, 1).await.unwrap();
@@ -104,22 +110,24 @@ async fn directory_batches_preserve_the_final_entry_flag() {
     }
     let entries = receiver.take_directory();
     assert_eq!(entries.len(), 40);
-    assert_eq!(entries[39].sof & 32, 32);
-    assert!(entries[..39].iter().all(|e| e.sof & 32 == 0));
+    assert_eq!(entries[39].sof.value() & 32, 32);
+    assert!(entries[..39].iter().all(|e| e.sof.value() & 32 == 0));
 }
 #[tokio::test]
 async fn busy_missing_file_and_foreign_file_are_detected() {
     let sw = Wire::new(PARAMS_WIDE);
     let rw = Wire::new(PARAMS_WIDE);
-    let mut receiver = Receiver::new(None);
-    let mut sender = Sender::new(Arc::new(MemStore::new()));
+    let receiver = Receiver::new(None);
+    let sender = Sender::new(Arc::new(MemStore::new()));
     receiver.request_file(&rw, 1, 100, 2).await.unwrap();
     assert!(matches!(
         receiver.request_file(&rw, 1, 101, 2).await,
-        Err(Error::FileTransfer(_))
+        Err(Error::TransferBusy)
     ));
-    sender.handle(&sw, &rw.take()[0]).await.unwrap();
+    assert_eq!(sender.handle(&sw, &rw.take()[0]).await, Err(Error::FileNotFound));
     assert!(receiver.handle(&rw, &sw.take()[0]).await.is_err());
+    // The service reports the rejected request; the application cancels it.
+    receiver.abort();
     assert!(!receiver.in_progress());
     receiver.request_file(&rw, 1, 100, 2).await.unwrap();
     let foreign = Asdu::section_ready(
@@ -128,10 +136,10 @@ async fn busy_missing_file_and_foreign_file_are_detected() {
         2,
         SectionReadyInfo {
             ioa: 100,
-            nof: 2,
+            nof: NameOfFile(2),
             nos: 1,
             length_of_section: 10,
-            srq: 0,
+            srq: SectionReadyQualifier::parse(0),
         },
     )
     .unwrap();
@@ -144,9 +152,9 @@ fn segment_length_count_and_trailing_data_are_checked() {
         PARAMS_WIDE,
         CauseOfTransmission::new(Cause::FILE_TRANSFER),
         1,
-        SegmentInfo {
+        &SegmentInfo {
             ioa: 100,
-            nof: 2,
+            nof: NameOfFile(2),
             nos: 1,
             segment: vec![7; 236],
         },
@@ -166,7 +174,7 @@ fn segment_length_count_and_trailing_data_are_checked() {
     malformed[12] = 235;
     assert_eq!(
         Asdu::unmarshal_binary(PARAMS_WIDE, &malformed),
-        Err(Error::InfoObjSizeMismatch)
+        Err(Error::TrailingOctets)
     );
     let mut malformed = wire.clone();
     malformed[1] = 2;
@@ -195,7 +203,7 @@ fn malformed_outbound_asdus_are_refused_and_legacy_trailing_is_opt_in() {
     trailing.push(99);
     assert_eq!(
         Asdu::unmarshal_binary(PARAMS_WIDE, &trailing),
-        Err(Error::InfoObjSizeMismatch)
+        Err(Error::TrailingOctets)
     );
     let legacy = Params {
         allow_trailing_octets: true,
@@ -215,7 +223,7 @@ fn malformed_outbound_asdus_are_refused_and_legacy_trailing_is_opt_in() {
     assert_eq!(bad.marshal_binary(), Err(Error::UnexpectedEof));
     let mut bad = a.clone();
     bad.info_obj.push(99);
-    assert_eq!(bad.marshal_binary(), Err(Error::InfoObjSizeMismatch));
+    assert_eq!(bad.marshal_binary(), Err(Error::TrailingOctets));
     let mut private = a;
     private.identifier.type_id = TypeId(200);
     assert!(private.marshal_binary().is_ok());

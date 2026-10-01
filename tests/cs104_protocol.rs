@@ -129,10 +129,13 @@ async fn malformed_u_frames_cannot_activate_a_station() {
     ] {
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream.write_all(&invalid).await.unwrap();
-        let closed = tokio::time::timeout(Duration::from_secs(2), stream.read_u8())
-            .await
-            .unwrap();
-        assert!(closed.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.read_u8())
+                .await
+                .is_err()
+        );
+        stream.write_all(&[0x68, 4, 7, 0, 0, 0]).await.unwrap();
+        assert_eq!(frame(&mut stream).await, [0x68, 4, 11, 0, 0, 0]);
     }
     server.close();
     task.await.unwrap();
@@ -170,7 +173,7 @@ async fn waiting_retries_full_queues_and_obeys_its_deadline() {
         accepted: AtomicUsize::new(0),
         failures: 3,
     });
-    let w = Waiting::new(&q, tokio::time::Instant::now() + Duration::from_secs(1));
+    let w = waiting(q.as_ref(), Duration::from_secs(1));
     w.send(a.clone()).await.unwrap();
     assert_eq!(q.accepted.load(Ordering::SeqCst), 1);
     let full = Queue {
@@ -179,7 +182,7 @@ async fn waiting_retries_full_queues_and_obeys_its_deadline() {
         failures: usize::MAX,
     };
     assert_eq!(
-        full.send_wait(a, tokio::time::Instant::now() + Duration::from_millis(20))
+        full.send_until(a, tokio::time::Instant::now() + Duration::from_millis(20))
             .await,
         Err(Error::SendTimeout)
     );

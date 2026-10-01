@@ -26,7 +26,7 @@ use tokio::sync::{Notify, mpsc, watch};
 
 use crate::asdu::{Asdu, Cause, Connect, PARAMS_STANDARD_101, Params};
 use crate::cs101::config::Config;
-use crate::cs101::frame::{ControlField, Frame, prim_fc, read_frame, sec_fc};
+use crate::cs101::frame::{ControlField, Frame, fcv_required, prim_fc, read_frame, sec_fc};
 use crate::cs101::handler::{ServerHandler, dispatch_server};
 use crate::cs101::transport::{LinkStream, Transporter};
 use crate::error::{Error, Result};
@@ -303,27 +303,24 @@ impl<H: ServerHandler> Server<H> {
         let (tx_frame, mut rx_frame) = mpsc::channel::<Frame>(20);
         let (tx_out, mut rx_out) = mpsc::channel::<Vec<u8>>(20);
         let (stop_tx, stop_rx) = watch::channel(false);
-        // Application handlers may wait for outbound queue room. Run them
-        // separately so FT1.2 acknowledgements and polling continue meanwhile.
-        let (tx_pack, mut rx_pack) = mpsc::channel::<Asdu>(20);
-        let dispatch_task = {
-            let endpoint = Arc::clone(self);
-            let mut stop = stop_rx.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = stop.changed() => return,
-                        pack = rx_pack.recv() => {
-                            let Some(pack) = pack else { return };
-                            tokio::select! {
-                                _ = stop.changed() => return,
-                                _ = dispatch_server(&*endpoint.handler, endpoint.as_connect(), &pack, endpoint.server_number) => {},
-                            }
-                        }
-                    }
+
+        // Application handlers may wait for outgoing queue room. Run them in
+        // order outside the link driver so acknowledgements and polls continue.
+        let (asdu_tx, mut asdu_rx) = mpsc::unbounded_channel::<Asdu>();
+        let endpoint = Arc::clone(self);
+        let mut stop = stop_rx.clone();
+        let dispatcher_task = tokio::spawn(async move {
+            loop {
+                let pack = tokio::select! {
+                    _ = stop.changed() => break,
+                    pack = asdu_rx.recv() => match pack { Some(pack) => pack, None => break },
+                };
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = dispatch_server(&*endpoint.handler, endpoint.as_connect(), &pack, endpoint.server_number) => {},
                 }
-            })
-        };
+            }
+        });
 
         let reader_task = {
             let mut stop = stop_rx.clone();
@@ -392,7 +389,7 @@ impl<H: ServerHandler> Server<H> {
                     if let Some(raw) = outcome.asdu {
                         match Asdu::unmarshal_binary(self.shared.params, &raw) {
                             Ok(pack) => {
-                                if tx_pack.send(pack).await.is_err() { break; }
+                                let _ = asdu_tx.send(pack);
                             }
                             Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
                         }
@@ -410,7 +407,7 @@ impl<H: ServerHandler> Server<H> {
 
         let _ = stop_tx.send(true);
         drop(tx_out);
-        let _ = tokio::join!(reader_task, writer_task, dispatch_task);
+        let _ = tokio::join!(reader_task, writer_task, dispatcher_task);
     }
 }
 
@@ -428,7 +425,6 @@ impl<H: ServerHandler> Connect for Server<H> {
         if !self.is_connected() {
             return Err(Error::UseClosedConnection);
         }
-        a.marshal_binary()?;
         let queue = if self.shared.balanced {
             &self.shared.prim_queue
         } else if a.coa().cause == Cause::PERIODIC || a.coa().cause == Cause::BACKGROUND {
@@ -458,6 +454,8 @@ struct Outcome {
 struct SecondaryState {
     link_addr: u16,
     addr_size: u8,
+    /// Acknowledge with `E5` where the standard allows it.
+    single_char_ack: bool,
     /// The FCB expected on the primary's next FCV frame.
     fcb_expected: bool,
     /// The last response sent, retransmitted when a request is repeated.
@@ -479,6 +477,7 @@ impl SecondaryState {
         SecondaryState {
             link_addr: cfg.link_address,
             addr_size: cfg.link_addr_size,
+            single_char_ack: cfg.use_single_char_ack,
             fcb_expected: true,
             last_resp: None,
             out,
@@ -517,8 +516,22 @@ impl SecondaryState {
         }
     }
 
+    /// A fixed-length response, or the single character `E5` in its place
+    /// when that is configured and nothing is lost by it.
+    ///
+    /// `E5` has no control field, so it cannot carry the access demand bit:
+    /// with class 1 data waiting the fixed-length frame is sent regardless,
+    /// or the primary would never learn that it should ask for it.
+    fn ack_frame(&self, fun: u8, acd: bool) -> Frame {
+        if self.single_char_ack && !acd {
+            Frame::SingleCharAck
+        } else {
+            self.sec_frame(fun, acd)
+        }
+    }
+
     async fn send_link_ack(&mut self, shared: &Shared) -> bool {
-        let f = self.sec_frame(sec_fc::CONF_ACK, shared.class1_pending());
+        let f = self.ack_frame(sec_fc::CONF_ACK, shared.class1_pending());
         self.send_resp(f).await
     }
 
@@ -532,7 +545,7 @@ impl SecondaryState {
     async fn respond_class_data(&mut self, class: u8, shared: &Shared) -> bool {
         let Some(a) = shared.pop_class(class) else {
             tracing::debug!(class, "no data buffered, answering FC 9");
-            let f = self.sec_frame(sec_fc::USER_DATA_NO_REP, false);
+            let f = self.ack_frame(sec_fc::USER_DATA_NO_REP, false);
             return self.send_resp(f).await;
         };
 
@@ -557,12 +570,20 @@ impl SecondaryState {
         self.send_resp(f).await
     }
 
+    /// The broadcast link address for the configured address width, or `None`
+    /// when the frames carry no link address at all.
+    fn broadcast_addr(&self) -> Option<u16> {
+        match self.addr_size {
+            1 => Some(0x00ff),
+            2 => Some(0xffff),
+            _ => None,
+        }
+    }
+
     /// True when `addr` addresses this station, including the broadcast address.
     fn addressed_to_us(&self, addr: u16) -> bool {
-        let broadcast = match self.addr_size {
-            1 => 0x00ff,
-            2 => 0xffff,
-            _ => return true,
+        let Some(broadcast) = self.broadcast_addr() else {
+            return true;
         };
         addr == self.link_addr || addr == broadcast
     }
@@ -587,6 +608,7 @@ impl SecondaryState {
             return out;
         }
         let ctrl = frame.control().expect("not a single character ack");
+        let broadcast = self.broadcast_addr() == Some(addr);
 
         if !ctrl.prm {
             if cfg.is_balanced() {
@@ -597,11 +619,26 @@ impl SecondaryState {
             return out;
         }
 
-        if crate::cs101::frame::is_broadcast_addr(addr, self.addr_size) {
-            // A broadcast must never trigger replies from multiple stations.
-            if ctrl.fun == prim_fc::USER_DATA_NO_CONF && !ctrl.fcv {
+        // The broadcast address is only used with SEND/NO REPLY, because every
+        // station on the line would answer at once and the replies would
+        // collide. See IEC 60870-5-2, subclass 5.1.1. Unconfirmed user data is
+        // still acted on; anything else addressed to all stations is not a
+        // service the standard defines, and is dropped rather than answered.
+        if broadcast {
+            if ctrl.fun == prim_fc::USER_DATA_NO_CONF {
                 out.asdu = frame.asdu().map(|a| a.to_vec());
+            } else {
+                tracing::warn!(%ctrl, "broadcast frame is not SEND/NO REPLY, ignored");
             }
+            return out;
+        }
+
+        // A frame whose FCV contradicts its function code was not produced by a
+        // conforming primary. It is not answered, and above all it must not
+        // move the frame count bit, or the next genuine frame would look like
+        // a repeat and be answered from the cache instead of acted on.
+        if fcv_required(ctrl.fun).is_some_and(|fcv| fcv != ctrl.fcv) {
+            tracing::warn!(%ctrl, "FCV does not match the function code, frame ignored");
             return out;
         }
 
@@ -641,10 +678,6 @@ impl SecondaryState {
                 self.send_link_ack(shared).await;
             }
             prim_fc::USER_DATA_CONF => {
-                if !ctrl.fcv {
-                    tracing::warn!("confirmed user data with FCV=0, ignored");
-                    return out;
-                }
                 out.asdu = frame.asdu().map(|a| a.to_vec());
                 self.send_link_ack(shared).await;
             }
@@ -723,13 +756,14 @@ impl SecondaryState {
     }
 
     /// Supervise the balanced-mode primary role: initialization, response
-    /// timeouts with one repetition, and transmission of queued data.
+    /// timeouts with the configured repetitions, and transmission of queued
+    /// data.
     async fn prim_tick(&mut self, shared: &Shared, cfg: &Config) {
         let now = Instant::now();
 
         if self.prim_out.is_some() {
             if self.prim_deadline.is_some_and(|d| now >= d) {
-                if self.prim_retry < 1 {
+                if self.prim_retry < u32::from(cfg.max_repetitions) {
                     self.prim_retry += 1;
                     tracing::warn!("primary role: response timeout, repeating the frame");
                     if let Some(f) = self.prim_out.clone() {
@@ -737,7 +771,7 @@ impl SecondaryState {
                     }
                     self.prim_deadline = Some(now + cfg.timeout_repeat_t2);
                 } else {
-                    tracing::error!("primary role: response timeout after the repetition");
+                    tracing::error!("primary role: response timeout after the repetitions");
                     self.prim_out = None;
                     self.prim_retry = 0;
                     self.prim_deadline = None;
@@ -783,41 +817,199 @@ impl SecondaryState {
 }
 
 #[cfg(test)]
-mod broadcast_tests {
+mod tests {
     use super::*;
-    struct Handler;
-    #[async_trait::async_trait]
-    impl ServerHandler for Handler {}
+    use crate::asdu::PARAMS_STANDARD_101;
+    use crate::cs101::frame::{SINGLE_CHAR_ACK, START_FIXED};
+
+    fn shared() -> Shared {
+        Shared {
+            params: PARAMS_STANDARD_101,
+            max_queue: 16,
+            balanced: false,
+            connected: AtomicBool::new(true),
+            link_active: AtomicBool::new(false),
+            class1: Mutex::new(VecDeque::new()),
+            class2: Mutex::new(VecDeque::new()),
+            prim_queue: Mutex::new(VecDeque::new()),
+            active_notify: Notify::new(),
+        }
+    }
+
+    /// A secondary at link address 1 with a one octet address, plus the
+    /// receiver its outbound frames land in.
+    fn secondary() -> (SecondaryState, Config, mpsc::Receiver<Vec<u8>>) {
+        let cfg = Config {
+            link_address: 1,
+            link_addr_size: 1,
+            ..Config::default()
+        };
+        let (tx, rx) = mpsc::channel(16);
+        (SecondaryState::new(&cfg, tx), cfg, rx)
+    }
+
+    fn primary_frame(fun: u8, fcv: bool, fcb: bool, addr: u16, asdu: Vec<u8>) -> Frame {
+        let control = ControlField::primary(fun, fcv, fcb, false);
+        if asdu.is_empty() {
+            Frame::Fixed {
+                control,
+                link_addr: addr,
+            }
+        } else {
+            Frame::Variable {
+                control,
+                link_addr: addr,
+                asdu,
+            }
+        }
+    }
+
+    // A frame sent to the broadcast address reaches every station on the line.
+    // If they all answered, the replies would collide, so IEC 60870-5-2
+    // subclass 5.1.1 only defines SEND/NO REPLY there.
+
     #[tokio::test]
-    async fn no_link_service_answers_a_broadcast() {
-        let cfg = Config::default();
-        let server = Server::new(Handler);
-        let (tx, mut rx) = mpsc::channel(20);
-        let mut state = SecondaryState::new(&cfg, tx);
+    async fn a_broadcast_of_unconfirmed_user_data_is_delivered_but_not_answered() {
+        let (mut sec, cfg, mut rx) = secondary();
+        let sh = shared();
+        let f = primary_frame(
+            prim_fc::USER_DATA_NO_CONF,
+            false,
+            false,
+            0xff,
+            vec![1, 2, 3],
+        );
+
+        let out = sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(out.asdu, Some(vec![1, 2, 3]), "the ASDU is still delivered");
+        assert!(
+            rx.try_recv().is_err(),
+            "but nothing may go back on the line"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_broadcast_is_dropped_rather_than_answered() {
         for fun in [
             prim_fc::RESET_LINK,
-            prim_fc::TEST_LINK,
             prim_fc::REQ_STATUS,
             prim_fc::REQ_DATA1,
             prim_fc::REQ_DATA2,
             prim_fc::USER_DATA_CONF,
         ] {
-            let frame = Frame::Fixed {
-                control: ControlField::primary(fun, false, false, false),
-                link_addr: 255,
-            };
-            let outcome = state.handle_frame(&frame, &server.shared, &cfg).await;
-            assert!(rx.try_recv().is_err());
-            assert!(outcome.asdu.is_none());
-            assert!(!outcome.link_became_active);
+            let (mut sec, cfg, mut rx) = secondary();
+            let sh = shared();
+            let f = primary_frame(fun, false, false, 0xff, Vec::new());
+
+            let out = sec.handle_frame(&f, &sh, &cfg).await;
+            assert!(!out.link_became_active, "fc {fun}");
+            assert!(rx.try_recv().is_err(), "fc {fun} must not be answered");
         }
-        let frame = Frame::Variable {
-            control: ControlField::primary(prim_fc::USER_DATA_NO_CONF, false, false, false),
-            link_addr: 255,
-            asdu: vec![1, 2, 3],
+    }
+
+    #[tokio::test]
+    async fn a_broadcast_does_not_disturb_the_expected_frame_count_bit() {
+        let (mut sec, cfg, _rx) = secondary();
+        let sh = shared();
+        let before = sec.fcb_expected;
+        // A broadcast that wrongly sets FCV must not move the station's FCB
+        // tracking, or the next real frame from the primary looks like a
+        // repeat and gets answered from the cache instead of acted on.
+        let f = primary_frame(prim_fc::USER_DATA_CONF, true, !before, 0xff, vec![9]);
+        sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(sec.fcb_expected, before);
+    }
+
+    #[tokio::test]
+    async fn a_frame_addressed_to_this_station_is_still_answered() {
+        // The guard above must not swallow ordinary traffic.
+        let (mut sec, cfg, mut rx) = secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
+
+        let out = sec.handle_frame(&f, &sh, &cfg).await;
+        assert!(out.link_became_active);
+        assert!(rx.try_recv().is_ok(), "a directed reset is confirmed");
+    }
+
+    #[tokio::test]
+    async fn a_frame_whose_fcv_contradicts_its_function_is_ignored() {
+        // IEC 60870-5-2, table 1. Each of these would otherwise move the frame
+        // count bit and make the next genuine frame look like a repeat.
+        for (fun, fcv) in [
+            (prim_fc::RESET_LINK, true),
+            (prim_fc::REQ_STATUS, true),
+            (prim_fc::REQ_DATA2, false),
+            (prim_fc::REQ_DATA1, false),
+            (prim_fc::USER_DATA_CONF, false),
+        ] {
+            let (mut sec, cfg, mut rx) = secondary();
+            let sh = shared();
+            let before = sec.fcb_expected;
+            let f = primary_frame(fun, fcv, !before, 1, Vec::new());
+
+            let out = sec.handle_frame(&f, &sh, &cfg).await;
+            assert!(!out.link_became_active, "fc {fun}");
+            assert!(
+                rx.try_recv().is_err(),
+                "fc {fun} with FCV={fcv} was answered"
+            );
+            assert_eq!(sec.fcb_expected, before, "fc {fun} moved the FCB");
+        }
+    }
+
+    fn e5_secondary() -> (SecondaryState, Config, mpsc::Receiver<Vec<u8>>) {
+        let cfg = Config {
+            link_address: 1,
+            link_addr_size: 1,
+            use_single_char_ack: true,
+            ..Config::default()
         };
-        let outcome = state.handle_frame(&frame, &server.shared, &cfg).await;
-        assert_eq!(outcome.asdu, Some(vec![1, 2, 3]));
-        assert!(rx.try_recv().is_err());
+        let (tx, rx) = mpsc::channel(16);
+        (SecondaryState::new(&cfg, tx), cfg, rx)
+    }
+
+    #[tokio::test]
+    async fn a_positive_acknowledgement_may_be_the_single_character() {
+        let (mut sec, cfg, mut rx) = e5_secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
+        sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(rx.try_recv().unwrap(), vec![SINGLE_CHAR_ACK]);
+    }
+
+    #[tokio::test]
+    async fn no_data_may_be_answered_with_the_single_character() {
+        let (mut sec, cfg, mut rx) = e5_secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::REQ_DATA2, true, true, 1, Vec::new());
+        sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(rx.try_recv().unwrap(), vec![SINGLE_CHAR_ACK]);
+    }
+
+    #[tokio::test]
+    async fn the_single_character_is_not_used_when_class_1_data_waits() {
+        // E5 has no control field to carry ACD; answering with it would hide
+        // the waiting events from the primary.
+        let (mut sec, cfg, mut rx) = e5_secondary();
+        let sh = shared();
+        sh.class1
+            .lock()
+            .unwrap()
+            .push_back(crate::asdu::Asdu::new_empty(PARAMS_STANDARD_101));
+        let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
+        sec.handle_frame(&f, &sh, &cfg).await;
+        let raw = rx.try_recv().unwrap();
+        assert_eq!(raw[0], START_FIXED, "a fixed frame, so ACD can be carried");
+        assert!(ControlField::parse(raw[1]).acd);
+    }
+
+    #[tokio::test]
+    async fn without_the_option_acknowledgements_are_fixed_frames() {
+        let (mut sec, cfg, mut rx) = secondary();
+        let sh = shared();
+        let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
+        sec.handle_frame(&f, &sh, &cfg).await;
+        assert_eq!(rx.try_recv().unwrap()[0], START_FIXED);
     }
 }

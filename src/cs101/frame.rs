@@ -23,24 +23,34 @@ use crate::error::{Error, Result};
 
 /// The single-character acknowledgement.
 pub const SINGLE_CHAR_ACK: u8 = 0xE5;
-/// Whether a link address is the broadcast address for this width.
-/// Width zero is point-to-point and has no broadcast address.
-pub fn is_broadcast_addr(addr: u16, width: u8) -> bool {
-    match width {
-        1 => addr == 0xff,
-        2 => addr == 0xffff,
-        _ => false,
-    }
-}
-
 /// Start character of a fixed-length frame.
 pub const START_FIXED: u8 = 0x10;
 /// Start character of a variable-length frame.
 pub const START_VARIABLE: u8 = 0x68;
 /// End character of both fixed- and variable-length frames.
 pub const END_CHAR: u8 = 0x16;
-/// Maximum wire length: the 255-octet length field plus six framing octets.
-pub const MAX_FRAME_LEN: usize = 261;
+/// The largest value the FT1.2 length octet can carry.
+///
+/// In a variable-length frame — `68 L L 68 | control | link address | ASDU |
+/// checksum | 16` — the octet `L` counts the control field, the link address
+/// and the ASDU. It is one octet, so it runs to 255, and the largest ASDU is
+/// therefore `MAX_LENGTH_FIELD - 1 - link_addr_size`: 253 octets with a one
+/// octet link address, which is the figure IEC 60870-5-103 quotes as its
+/// maximum ASDU length.
+pub const MAX_LENGTH_FIELD: usize = 255;
+
+/// The largest variable-length frame on the wire.
+///
+/// `68 L L 68` (4 octets) + `L` + checksum + end (2 octets), so 261 — **not**
+/// 255. Confusing the length field with the frame length costs six octets of
+/// every frame, which is enough to refuse a maximum-size ASDU.
+pub const MAX_FRAME_LEN: usize = MAX_LENGTH_FIELD + 6;
+
+/// The largest ASDU that fits one variable-length frame for a given link
+/// address size (0, 1 or 2 octets).
+pub const fn max_asdu_len(link_addr_size: u8) -> usize {
+    MAX_LENGTH_FIELD - 1 - link_addr_size as usize
+}
 
 // -- control field bits ---------------------------------------------------
 /// DIR: direction. In balanced mode, set by station A.
@@ -78,6 +88,30 @@ pub mod prim_fc {
     pub const REQ_DATA1: u8 = 10;
     /// 11: request user data class 2
     pub const REQ_DATA2: u8 = 11;
+}
+
+/// The FCV a primary frame must carry for its function code, or `None` for a
+/// code the standard does not define.
+///
+/// IEC 60870-5-2, table 1: the SEND/CONFIRM user data and test services and
+/// the class 1/2 requests count frames (FCV = 1); the resets, SEND/NO REPLY and
+/// the status and access-demand requests do not (FCV = 0). A frame that
+/// disagrees was not produced by a conforming primary, and letting it move the
+/// frame count bit would make the next genuine frame look like a repeat.
+pub(crate) const fn fcv_required(fun: u8) -> Option<bool> {
+    match fun {
+        prim_fc::RESET_LINK
+        | prim_fc::RESET_USER
+        | prim_fc::USER_DATA_NO_CONF
+        | prim_fc::REQ_ACCESS
+        | prim_fc::REQ_STATUS => Some(false),
+        // Function code 7 is the IEC 60870-5-103 reset of the frame count bit.
+        7 => Some(false),
+        prim_fc::TEST_LINK | prim_fc::USER_DATA_CONF | prim_fc::REQ_DATA1 | prim_fc::REQ_DATA2 => {
+            Some(true)
+        }
+        _ => None,
+    }
 }
 
 /// Function codes sent by the secondary station (PRM = 0).
@@ -262,7 +296,10 @@ impl Frame {
         match self {
             Frame::SingleCharAck => Ok(vec![SINGLE_CHAR_ACK]),
 
-            Frame::Fixed { control, link_addr } => {
+            Frame::Fixed {
+                control,
+                link_addr,
+            } => {
                 let addr = encode_link_addr(*link_addr, link_addr_size);
                 let mut buf = Vec::with_capacity(4 + addr.len());
                 buf.push(START_FIXED);
@@ -279,10 +316,13 @@ impl Frame {
                 asdu,
             } => {
                 let addr = encode_link_addr(*link_addr, link_addr_size);
+                // The length field counts control + link address + ASDU. It is
+                // computed as a usize and checked before it is narrowed to an
+                // octet: narrowing first would wrap a 256 octet total to L = 0
+                // and put a frame on the wire whose length field describes
+                // none of it.
                 let len_field = 1 + addr.len() + asdu.len();
-                // Overhead is start, two length octets, the repeated start,
-                // the checksum and the end character.
-                if len_field > MAX_FRAME_LEN - 6 {
+                if len_field > MAX_LENGTH_FIELD {
                     return Err(Error::Frame("frame length exceeds the FT1.2 maximum"));
                 }
                 let mut buf = Vec::with_capacity(len_field + 6);
@@ -385,9 +425,10 @@ where
             if (l1 as usize) < 1 + addr_len {
                 return Err(Error::Frame("frame is too short for its header"));
             }
-            if l1 as usize > MAX_FRAME_LEN - 6 {
-                return Err(Error::Frame("frame length exceeds the FT1.2 maximum"));
-            }
+            // There is no upper bound left to check: `l1` is one octet, so it
+            // cannot exceed MAX_LENGTH_FIELD, and every value up to it
+            // describes a legal frame of `l1 + 6` octets. Rejecting anything
+            // above 249 here refused the largest frames the standard defines.
 
             // The length octet counts control + address + ASDU, and the
             // control octet has already been read, so what remains is
@@ -577,10 +618,7 @@ mod tests {
         let mut stream: &[u8] = &[0xaa, 0xbb, 0xe5];
         assert!(read_frame(&mut stream, 1).await.is_err());
         assert!(read_frame(&mut stream, 1).await.is_err());
-        assert_eq!(
-            read_frame(&mut stream, 1).await.unwrap(),
-            Frame::SingleCharAck
-        );
+        assert_eq!(read_frame(&mut stream, 1).await.unwrap(), Frame::SingleCharAck);
     }
 
     #[tokio::test]
@@ -594,16 +632,82 @@ mod tests {
     }
 
     #[test]
+    fn max_asdu_len_matches_the_standard() {
+        // L counts control + link address + ASDU, and runs to 255.
+        assert_eq!(max_asdu_len(0), 254);
+        assert_eq!(max_asdu_len(1), 253, "the figure IEC 60870-5-103 quotes");
+        assert_eq!(max_asdu_len(2), 252);
+        assert_eq!(MAX_FRAME_LEN, 261, "the largest frame on the wire is L+6");
+    }
+
+    /// Assemble a wire-format frame by hand, so the reader is tested against
+    /// the format rather than against `marshal`.
+    fn build_variable_frame(control: u8, link_addr: &[u8], asdu: &[u8]) -> Vec<u8> {
+        let l = (1 + link_addr.len() + asdu.len()) as u8;
+        let mut out = vec![START_VARIABLE, l, l, START_VARIABLE, control];
+        out.extend_from_slice(link_addr);
+        out.extend_from_slice(asdu);
+        out.push(checksum(control, link_addr, asdu));
+        out.push(END_CHAR);
+        out
+    }
+
+    #[tokio::test]
+    async fn the_reader_accepts_every_legal_length_field() {
+        for size in [1u8, 2] {
+            let max = max_asdu_len(size);
+            for asdu_len in [0, 1, 247, 248, max - 1, max] {
+                let addr = vec![0x01; size as usize];
+                let asdu = vec![0xab; asdu_len];
+                let wire = build_variable_frame(0x53, &addr, &asdu);
+
+                let want_l = 1 + size as usize + asdu_len;
+                assert_eq!(wire[1] as usize, want_l);
+                assert_eq!(wire.len(), want_l + 6, "the frame is L+6 octets");
+
+                let mut r = wire.as_slice();
+                let f = read_frame(&mut r, size)
+                    .await
+                    .unwrap_or_else(|e| panic!("size {size}, ASDU {asdu_len} (L={want_l}): {e}"));
+                assert_eq!(f.asdu(), Some(&asdu[..]), "size {size}, ASDU {asdu_len}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_largest_asdu_round_trips() {
+        for size in [1u8, 2] {
+            let f = Frame::Variable {
+                control: ControlField::primary(prim_fc::USER_DATA_CONF, true, true, false),
+                link_addr: 1,
+                asdu: vec![0xcd; max_asdu_len(size)],
+            };
+            let raw = f
+                .marshal(size)
+                .unwrap_or_else(|e| panic!("the largest ASDU was refused for size {size}: {e}"));
+            assert_eq!(raw[1] as usize, MAX_LENGTH_FIELD);
+            assert_eq!(raw.len(), MAX_FRAME_LEN);
+
+            let mut r = raw.as_slice();
+            assert_eq!(read_frame(&mut r, size).await.unwrap(), f, "size {size}");
+        }
+    }
+
+    #[test]
     fn marshal_rejects_an_oversized_asdu() {
-        let f = Frame::Variable {
-            control: ControlField::primary(prim_fc::USER_DATA_CONF, true, true, false),
-            link_addr: 1,
-            asdu: vec![0; 254],
-        };
-        assert_eq!(
-            f.marshal(1),
-            Err(Error::Frame("frame length exceeds the FT1.2 maximum"))
-        );
+        // One octet more than fits must be refused, not wrapped to L = 0.
+        for size in [0u8, 1, 2] {
+            let f = Frame::Variable {
+                control: ControlField::primary(prim_fc::USER_DATA_CONF, true, true, false),
+                link_addr: 1,
+                asdu: vec![0; max_asdu_len(size) + 1],
+            };
+            assert_eq!(
+                f.marshal(size),
+                Err(Error::Frame("frame length exceeds the FT1.2 maximum")),
+                "size {size}"
+            );
+        }
     }
 
     #[test]
@@ -618,24 +722,5 @@ mod tests {
         assert!(f.control().unwrap().acd);
         assert_eq!(Frame::SingleCharAck.control(), None);
         assert_eq!(Frame::SingleCharAck.asdu(), None);
-    }
-}
-
-#[cfg(test)]
-mod maximum_length_tests {
-    use super::*;
-    #[tokio::test]
-    async fn full_eight_bit_length_field_round_trips() {
-        for width in [1, 2] {
-            let frame = Frame::Variable {
-                control: ControlField::primary(prim_fc::USER_DATA_CONF, true, true, false),
-                link_addr: 1,
-                asdu: vec![42; 254 - width as usize],
-            };
-            let raw = frame.marshal(width).unwrap();
-            assert_eq!(raw[1], 255);
-            assert_eq!(raw.len(), 261);
-            assert_eq!(read_frame(&mut raw.as_slice(), width).await.unwrap(), frame);
-        }
     }
 }

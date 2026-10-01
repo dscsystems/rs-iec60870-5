@@ -2,7 +2,10 @@
 // Source-available under the DSC Systems Source-Available License; see LICENSE.
 
 //! Verify that file sends under backpressure do not block the FT1.2 driver.
-#![cfg(feature = "cs101")]
+#![cfg(all(feature = "cs101", feature = "filetransfer"))]
+#[path = "support/file_receiver.rs"]
+mod file_receiver;
+use file_receiver::Receiver;
 use rs_iec60870_5::{asdu::*, cs101::*, filetransfer::*};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
@@ -30,7 +33,7 @@ impl ClientHandler for Master {
 async fn file_transfer_with_a_one_asdu_class_buffer() {
     let data: Vec<u8> = (0..5000).map(|i| (i * 17 + 3) as u8).collect();
     let source = Arc::new(MemStore::new());
-    source.write(100, 2, &data).unwrap();
+    source.insert(100, NameOfFile(2), data.clone());
     let cfg = Config {
         transport: TransportType::TcpServer,
         tcp: TcpConfig {

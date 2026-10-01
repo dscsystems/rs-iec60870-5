@@ -24,7 +24,16 @@ use identical parameters** or every ASDU will be mis-parsed.
 | `common_addr_size` | common (station) address octets | 1, 2 |
 | `info_obj_addr_size` | information object address octets | 1, 2, 3 |
 | `info_obj_time_zone` | zone used to encode and decode CP24/CP56 tags | [`TimeZone`] |
-| `allow_trailing_octets` | discard extra inbound payload octets for a known legacy peer | `false` by default |
+| `allow_trailing_octets` | accept an ASDU longer than its qualifier accounts for, discarding the surplus | `false` by default |
+
+`allow_trailing_octets` is off by default, and should stay off. An ASDU's
+length is fixed by the frame that carries it, its object count by the variable
+structure qualifier and its object size by the type identification, so a
+conforming sender cannot produce a surplus octet; one that arrives means the
+frame is not what it claims, and accepting it means acting on a command nobody
+can account for. Decoding such an ASDU yields [`Error::TrailingOctets`]. Turn
+it on only for a device known to pad, knowing that a truncated interrogation
+reply then looks the same as a complete one.
 
 Predefined:
 
@@ -35,7 +44,16 @@ Predefined:
 | `PARAMS_NARROW` | 1 | 1 | 1 | smallest legal configuration |
 
 `TimeZone` is `Utc` (the default, and what the standard recommends), `Local`,
-or `Fixed(FixedOffset)`.
+`Fixed(FixedOffset)`, or `Named(chrono_tz::Tz)` with the `tz` feature — an IANA
+zone that does not depend on how the host is configured, for a device whose
+profile fixes one the host does not share.
+
+The zone decides the **SU (summer time) bit** of a CP56Time2a and CP32Time2a
+tag as well as the wall clock reading. `Local` and `Named` set it while the
+zone is on summer time, and honour it on decode; `Utc` and `Fixed` never do,
+because neither observes summer time. That bit is what resolves the hour that
+occurs twice when the clocks go back — without it the second reading decodes as
+the first, which puts an event an hour before its cause.
 
 ## Identifier
 
@@ -136,8 +154,10 @@ Control direction (master to device):
 identifications (`128..=255`) round-trip unchanged. `TypeId::name()` gives the
 mnemonic or `None`; `TypeId::info_obj_size()` gives the element size.
 
-File transfer types 120–126 have codecs and a monitor-direction service.
-Query-log type 127 and IEC 62351-5 security types are enumerated only.
+The file transfer types (120–126) are implemented — see the `filetransfer`
+module for the procedures that drive them, and `docs/filetransfer.md` for the
+ASDUs themselves. `F_SC_NB_1` (127, query log) and the IEC 62351-5 security
+types are enumerated but not implemented.
 
 ## Building ASDUs
 
@@ -163,7 +183,7 @@ let a = Asdu::single_cp56time2a(
     PARAMS_WIDE,
     CauseOfTransmission::new(Cause::SPONTANEOUS),
     1,
-    &[SinglePointInfo { ioa: 100, value: true, qds: QualityDescriptor::GOOD, time: Some(chrono::Utc::now()) }],
+    &[SinglePointInfo { ioa: 100, value: true, time: Some(chrono::Utc::now()), ..Default::default() }],
 )?;
 
 // Control direction. The type identification selects the time-tag variant.
@@ -172,7 +192,7 @@ let a = Asdu::single_cmd(
     TypeId::C_SC_NA_1,
     CauseOfTransmission::new(Cause::ACTIVATION),
     1,
-    SingleCommandInfo { ioa: 6000, value: true, qoc: QualifierOfCommand::default(), time: None },
+    SingleCommandInfo { ioa: 6000, value: true, ..Default::default() },
 )?;
 # let _ = a;
 # Ok(())
@@ -393,9 +413,30 @@ The `asdu::time` module encodes and decodes the three binary time formats.
   the current minute is taken to belong to the previous hour.
 * **CP16Time2a** — 2 octets, an elapsed millisecond count.
 
-An invalid (IV bit) or truncated tag decodes to `None`, which is what an
-untagged type also yields. Encoding `None` produces an all-zero tag with the IV
-bit set.
+Each tagged information object carries its tag in two fields: `time`, the
+reading, and `time_flags`, a [`TimeTagFlags`] with the two validity bits of the
+minutes octet:
+
+| Flag | Bit | Meaning |
+|------|-----|---------|
+| `invalid` | IV, bit 7 | the station's clock was not synchronized or could not be read |
+| `substituted` | SB, bit 6 | the time was substituted by an intermediate station |
+
+`time` holds the reading **even when IV is set**, as long as the octets name a
+real instant: a device whose clock has not been synchronized still tags its
+events, and their order is worth keeping even when their absolute value is
+not. So check `time_flags.is_valid()` before taking `time` as the time of the
+event. `time` is `None` only when the octets hold no time at all, and
+`time_flags` is `TimeTagFlags::GOOD` for the untagged types. On the sending
+side, set `time_flags` to mark an unsynchronized clock; `time: None` always
+encodes an all-zero tag with IV set.
+
+Two decoders are available when working with raw octets:
+`parse_cp56time2a` returns only a time that can be trusted (`None` when IV is
+set) and `parse_cp56time2a_tag` returns the reading and the flags; likewise for
+CP24Time2a and, in `cs103`, CP32Time2a. The clock synchronization command
+uses the strict one: a clock is never set from a time its sender marks
+invalid.
 
 ## Wire format
 
@@ -411,10 +452,9 @@ assert_eq!(a, back);
 # }
 ```
 
-`unmarshal_binary` requires exactly the payload length implied by the type
-identification and variable structure qualifier. Short and trailing payloads
-are rejected. `Params::allow_trailing_octets` explicitly enables legacy trimming
-on receipt; outbound supported types are always validated strictly. For hand-built ASDUs, [`Asdu::encoder`] appends information elements
+`unmarshal_binary` trims the payload to exactly the length the type
+identification and the variable structure qualifier imply; a shorter payload is
+rejected. For hand-built ASDUs, [`Asdu::encoder`] appends information elements
 and [`Asdu::reader`] reads them back.
 
 `ASDU_SIZE_MAX` is 249 octets including the identifier. Builders check it and
@@ -460,6 +500,8 @@ failing. With the `serde` feature the ASDU types also derive `Serialize` and
 [`Identifier`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Identifier.html
 [`Params`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Params.html
 [`TimeZone`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/enum.TimeZone.html
+[`TimeTagFlags`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.TimeTagFlags.html
+[`Error::TrailingOctets`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 [`Normalize`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.Normalize.html
 [`StepPosition`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.StepPosition.html
 [`BinaryCounterReading`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/asdu/struct.BinaryCounterReading.html
@@ -480,11 +522,7 @@ failing. With the `serde` feature the ASDU types also derive `Serialize` and
 [`Error::BufferFull`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 [`Error::SendQueueFull`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 
-## File ASDUs
-
-Types 120–126 expose `file_ready`, `section_ready`, `call_or_select_file`,
-`last_section_or_segment`, `ack_file_or_section`, `file_segment` and
-`file_directory` constructors, matching `get_*` decoders and `send_*` helpers.
-The segment's LOS byte determines its variable payload size. All file types
-require SQ=0; only directories allow multiple information objects.
-See [file transfer](filetransfer.md) for the procedure and service API.
+`Connect::send_until(asdu, deadline)` retries `BufferFull` and `SendQueueFull`
+until an absolute Tokio deadline. Other errors return immediately. File transfer
+uses this method automatically; the IEC 104 server override preserves per-group
+routing and retries only refused copies.

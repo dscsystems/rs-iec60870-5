@@ -111,7 +111,7 @@ impl ServerHandler for H {
 async fn main() -> rs_iec60870_5::Result<()> {
     let srv = Server::new(H);
 
-    // Server::send broadcasts to every connected master.
+    // Server::send broadcasts to every started master (NotActive if none).
     let publisher = Arc::clone(&srv);
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(10));
@@ -120,7 +120,7 @@ async fn main() -> rs_iec60870_5::Result<()> {
             let _ = publisher.send_single_cp56time2a(
                 CauseOfTransmission::new(Cause::SPONTANEOUS), 1,
                 &[SinglePointInfo { ioa: 100, value: true,
-                    qds: QualityDescriptor::GOOD, time: Some(chrono::Utc::now()) }],
+                    time: Some(chrono::Utc::now()), ..Default::default() }],
             ).await;
         }
     });
@@ -338,7 +338,7 @@ services codecs, disturbance data, the device side.
   `tests/common/relay.rs` is a working one.
 - Read `tests/cs104_loopback.rs`, `tests/cs101_loopback.rs` and
   `tests/cs103_loopback.rs` as recipes.
-- Third-party: `lib60870` (C), OpenMUC j60870, QTester104, or any 104 test set
+- Third-party: OpenMUC j60870, QTester104, or any 104 test set
   at the defaults k=12, w=8, t1=15 s, t2=10 s, t3=20 s.
 
 ## Pitfalls (read before debugging)
@@ -366,7 +366,9 @@ services codecs, disturbance data, the device side.
     Every endpoint is `Send + Sync` and shared behind an `Arc`.
 11. Select-before-execute is application-level: check `cmd.qoc.in_select` (or
     `qos.in_select`) and confirm without operating when it is a select.
-12. Monitor-direction file transfer types 120–126 and the `filetransfer` service are implemented (see `docs/filetransfer.md`). Control-direction file transfer, query-log type 127, and IEC 62351-5 (`S_*`) services are not implemented.
+12. File transfer (types 120–126) is implemented in `filetransfer`: a `Sender`
+    on the outstation and a `Receiver` on the master, both fed from your ASDU
+    handler. `F_SC_NB_1` (127) and IEC 62351-5 (`S_*`) are not implemented.
 13. go-iecp5 cannot size types 58–64 (CP56-tagged commands) and drops them on
     receipt; this crate handles them, but avoid those types against a go-iecp5
     peer.

@@ -66,6 +66,7 @@ impl ServerHandler for Outstation {
                 value: *self.level.lock().await,
                 qds: QualityDescriptor::GOOD,
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -147,6 +148,7 @@ async fn main() -> rs_iec60870_5::Result<()> {
                     value,
                     qds: QualityDescriptor::GOOD,
                     time: Some(chrono::Utc::now()),
+                    time_flags: TimeTagFlags::GOOD,
                 }],
             )
             .await

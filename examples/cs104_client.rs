@@ -262,6 +262,7 @@ async fn main() -> rs_iec60870_5::Result<()> {
                     in_select: false,
                 },
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             },
         )
         .await?;

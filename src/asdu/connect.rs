@@ -4,12 +4,12 @@
 //! The [`Connect`] abstraction shared by every endpoint, and the [`ConnectExt`]
 //! convenience methods that build and send an ASDU in one call.
 
-use crate::asdu::file::*;
 use chrono::{DateTime, Utc};
 
 use crate::asdu::codec::Asdu;
 use crate::asdu::cpara::*;
 use crate::asdu::cproc::*;
+use crate::asdu::filet::*;
 use crate::asdu::identifier::{CauseOfTransmission, CommonAddr, TypeId};
 use crate::asdu::info::*;
 use crate::asdu::mproc::*;
@@ -31,7 +31,7 @@ pub trait Connect: Send + Sync {
 
     /// Send with bounded backpressure, retrying only queue-full errors.
     /// Dropping this future cancels the wait.
-    async fn send_wait(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+    async fn send_until(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
         loop {
             match self.send(a.clone()).await {
                 Err(crate::Error::BufferFull | crate::Error::SendQueueFull) => {
@@ -65,8 +65,8 @@ impl<T: Connect + ?Sized> Connect for &T {
         (**self).send(a).await
     }
 
-    async fn send_wait(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
-        (**self).send_wait(a, deadline).await
+    async fn send_until(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        (**self).send_until(a, deadline).await
     }
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
@@ -84,8 +84,8 @@ impl<T: Connect + ?Sized> Connect for std::sync::Arc<T> {
         (**self).send(a).await
     }
 
-    async fn send_wait(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
-        (**self).send_wait(a, deadline).await
+    async fn send_until(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        (**self).send_until(a, deadline).await
     }
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
@@ -121,83 +121,6 @@ pub trait ConnectExt: Connect {
         cause: crate::asdu::identifier::Cause,
     ) -> Result<()> {
         self.send(request.reply_mirror(cause)).await
-    }
-
-    /// Send `F_FR_NA_1`.
-    async fn send_file_ready(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-        info: FileReadyInfo,
-    ) -> Result<()> {
-        self.send(Asdu::file_ready(self.params(), coa, ca, info)?)
-            .await
-    }
-
-    /// Send `F_SR_NA_1`.
-    async fn send_section_ready(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-        info: SectionReadyInfo,
-    ) -> Result<()> {
-        self.send(Asdu::section_ready(self.params(), coa, ca, info)?)
-            .await
-    }
-
-    /// Send `F_SC_NA_1`.
-    async fn send_call_or_select_file(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-        info: CallOrSelectFileInfo,
-    ) -> Result<()> {
-        self.send(Asdu::call_or_select_file(self.params(), coa, ca, info)?)
-            .await
-    }
-
-    /// Send `F_LS_NA_1`.
-    async fn send_last_section_or_segment(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-        info: LastSectionOrSegmentInfo,
-    ) -> Result<()> {
-        self.send(Asdu::last_section_or_segment(self.params(), coa, ca, info)?)
-            .await
-    }
-
-    /// Send `F_AF_NA_1`.
-    async fn send_ack_file_or_section(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-        info: AckFileOrSectionInfo,
-    ) -> Result<()> {
-        self.send(Asdu::ack_file_or_section(self.params(), coa, ca, info)?)
-            .await
-    }
-
-    /// Send `F_SG_NA_1`.
-    async fn send_file_segment(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-        info: SegmentInfo,
-    ) -> Result<()> {
-        self.send(Asdu::file_segment(self.params(), coa, ca, info)?)
-            .await
-    }
-
-    /// Send `F_DR_TA_1`.
-    async fn send_file_directory(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-        info: &[DirectoryInfo],
-    ) -> Result<()> {
-        self.send(Asdu::file_directory(self.params(), coa, ca, info)?)
-            .await
     }
 
     // -- monitor direction ------------------------------------------------
@@ -893,6 +816,85 @@ pub trait ConnectExt: Connect {
             .await
     }
 
+    // -- file transfer ------------------------------------------------------
+
+    /// Send `F_FR_NA_1`: file ready.
+    async fn send_file_ready(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: FileReadyInfo,
+    ) -> Result<()> {
+        self.send(Asdu::file_ready(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_SR_NA_1`: section ready.
+    async fn send_section_ready(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: SectionReadyInfo,
+    ) -> Result<()> {
+        self.send(Asdu::section_ready(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_SC_NA_1`: call directory, select file, call file, call section.
+    async fn send_call_or_select_file(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: CallOrSelectFileInfo,
+    ) -> Result<()> {
+        self.send(Asdu::call_or_select_file(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_LS_NA_1`: last section, last segment.
+    async fn send_last_section_or_segment(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: LastSectionOrSegmentInfo,
+    ) -> Result<()> {
+        self.send(Asdu::last_section_or_segment(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_AF_NA_1`: acknowledge file, acknowledge section.
+    async fn send_ack_file_or_section(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: AckFileOrSectionInfo,
+    ) -> Result<()> {
+        self.send(Asdu::ack_file_or_section(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_SG_NA_1`: a segment.
+    async fn send_file_segment(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: &SegmentInfo,
+    ) -> Result<()> {
+        self.send(Asdu::file_segment(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_DR_TA_1`: a directory.
+    async fn send_file_directory(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        infos: &[DirectoryInfo],
+    ) -> Result<()> {
+        self.send(Asdu::file_directory(self.params(), coa, ca, infos)?)
+            .await
+    }
+
     // -- parameters ---------------------------------------------------------
 
     /// Send `P_ME_NA_1`: a normalized measured value parameter.
@@ -941,34 +943,6 @@ pub trait ConnectExt: Connect {
 }
 
 impl<T: Connect + ?Sized> ConnectExt for T {}
-
-/// A connection wrapper for bulk replies with a shared send deadline.
-/// Server broadcasts use the server's per-session retry to avoid duplicates.
-pub struct Waiting<'a> {
-    connection: &'a dyn Connect,
-    deadline: tokio::time::Instant,
-}
-impl<'a> Waiting<'a> {
-    /// Bound all sends through this wrapper by `deadline`.
-    pub fn new(connection: &'a dyn Connect, deadline: tokio::time::Instant) -> Self {
-        Self {
-            connection,
-            deadline,
-        }
-    }
-}
-#[async_trait::async_trait]
-impl Connect for Waiting<'_> {
-    fn params(&self) -> Params {
-        self.connection.params()
-    }
-    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        self.connection.peer_addr()
-    }
-    async fn send(&self, a: Asdu) -> Result<()> {
-        self.connection.send_wait(a, self.deadline).await
-    }
-}
 
 #[cfg(test)]
 mod tests {

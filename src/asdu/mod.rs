@@ -48,8 +48,7 @@ mod cpara;
 mod cproc;
 mod csys;
 mod display;
-mod file;
-pub use file::*;
+mod filet;
 mod identifier;
 mod info;
 mod mproc;
@@ -57,7 +56,7 @@ mod params;
 pub mod time;
 
 pub use codec::{ASDU_SIZE_MAX, Asdu, Encoder, InfoObjReader};
-pub use connect::{Connect, ConnectExt, Waiting};
+pub use connect::{Connect, ConnectExt};
 pub use cpara::{
     ParameterActivationInfo, ParameterFloatInfo, ParameterNormalInfo, ParameterScaledInfo,
 };
@@ -65,18 +64,24 @@ pub use cproc::{
     BitsString32CommandInfo, DoubleCommandInfo, SetpointCommandFloatInfo,
     SetpointCommandNormalInfo, SetpointCommandScaledInfo, SingleCommandInfo, StepCommandInfo,
 };
+pub use filet::{
+    AckFileOrSectionInfo, AckFileOrSectionQualifier, AfqAction, CallOrSelectFileInfo,
+    DirectoryInfo, FileError, FileReadyInfo, FileReadyQualifier, LENGTH_OF_FILE_MAX,
+    LastSectionOrSegmentInfo, LastSectionQualifier, NameOfFile, ScqAction, SectionReadyInfo,
+    SectionReadyQualifier, SegmentInfo, SelectAndCallQualifier, StatusOfFile, file_checksum,
+};
 pub use identifier::{
     Cause, CauseOfTransmission, CommonAddr, GLOBAL_COMMON_ADDR, INVALID_COMMON_ADDR, Identifier,
     OriginAddr, TypeId, VariableStruct,
 };
 pub use info::{
-    BinaryCounterReading, CauseOfInitial, CoiCause, DoubleCommand, DoublePoint, FBP_TEST_WORD,
+    BinaryCounterReading, CauseOfInitial, CoiCause, DoubleCommand, DoublePoint,
     INFO_OBJ_ADDR_IRRELEVANT, InfoObjAddr, Normalize, OutputCircuitInfo, QccFreeze, QccRequest,
     QocQual, QosQual, QpmCategory, QualifierCountCall, QualifierOfCommand,
     QualifierOfInterrogation, QualifierOfParameterAct, QualifierOfParameterMv,
     QualifierOfResetProcessCmd, QualifierOfSetpointCmd, QualityDescriptor,
-    QualityDescriptorProtection, SingleCommand, SingleEvent, SinglePoint, StartEvent,
-    StatusAndStatusChangeDetection, StepCommand, StepPosition,
+    QualityDescriptorProtection, SingleCommand, SingleEvent, SinglePoint, StartEvent, StepCommand,
+    StepPosition, StatusAndStatusChangeDetection, FBP_TEST_WORD,
 };
 pub use mproc::{
     BinaryCounterReadingInfo, BitString32Info, DoublePointInfo, EventOfProtectionEquipmentInfo,
@@ -84,6 +89,7 @@ pub use mproc::{
     PackedOutputCircuitInfoInfo, PackedSinglePointWithScdInfo,
     PackedStartEventsOfProtectionEquipmentInfo, SinglePointInfo, StepPositionInfo,
 };
+pub use time::TimeTagFlags;
 pub use params::{
     PARAMS_NARROW, PARAMS_STANDARD_101, PARAMS_STANDARD_104, PARAMS_WIDE, Params, TimeZone,
 };

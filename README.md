@@ -5,8 +5,7 @@ Pure Rust implementation of the IEC 60870-5 telecontrol protocols: **-104**
 client and server sides for 101 and 104.
 
 Async throughout, built on Tokio. Verified for wire compatibility against
-[`go-iecp5`](https://github.com/riclolsen/go-iecp5) in every direction, and against
-[lib60870-C](https://github.com/mz-automation/lib60870) for IEC 101 and 104.
+[`go-iecp5`](https://github.com/riclolsen/go-iecp5) in every direction.
 
 ```toml
 [dependencies]
@@ -21,7 +20,7 @@ rs-iec60870-5 = "0.1"
 | [`cs104`] | IEC 60870-5-104 master and controlled station over TCP/IP, optionally TLS |
 | [`cs101`] | IEC 60870-5-101 primary and secondary station over serial FT1.2, unbalanced (multi-drop) and balanced |
 | [`cs103`] | IEC 60870-5-103 master for protection equipment |
-| [`filetransfer`](docs/filetransfer.md) | Monitor-direction file service for IEC 101/104: directories, offers, sections, segments and checksum retries |
+| [`filetransfer`] | The file transfer procedures (types 120–126) on any endpoint: fetching disturbance records and the like |
 
 Vocabulary: *master* = controlling station = client; *outstation* = RTU = slave
 = controlled station = server. *Monitor direction* is data flowing to the master
@@ -213,6 +212,7 @@ cargo run -p cs104-explorer -- 127.0.0.1:2404
 | [`cs104` reference](docs/cs104.md) | IEC 104 client, server and reverse-connection station; k/w windows and t₀–t₃ |
 | [`cs101` reference](docs/cs101.md) | IEC 101 primary and secondary; FT1.2, class buffering, balanced mode |
 | [`cs103` reference](docs/cs103.md) | IEC 103 relay master: FUN/INF addressing, measurands, CP32 |
+| [`filetransfer` reference](docs/filetransfer.md) | file transfer: the `F_*` ASDUs, the sender and receiver procedures, stores |
 | [SKILL.md](SKILL.md) | condensed build guide for AI coding agents |
 | [docs.rs](https://docs.rs/rs-iec60870-5) | generated API documentation |
 
@@ -223,9 +223,11 @@ cargo run -p cs104-explorer -- 127.0.0.1:2404
 | `cs104` | yes | IEC 60870-5-104 over TCP/IP |
 | `cs101` | yes | IEC 60870-5-101 over FT1.2 |
 | `cs103` | yes | IEC 60870-5-103 master (implies `cs101`) |
+| `filetransfer` | yes | the file transfer procedures (types 120–126) on any endpoint |
 | `serial` | no | real serial ports via `tokio-serial`; without it, 101 and 103 still work over their TCP transports |
 | `tls` | no | TLS via `tokio-rustls` (the `ring` provider), for the `tls://` endpoints and TLS listeners |
 | `serde` | no | `Serialize`/`Deserialize` on the ASDU types |
+| `tz` | no | named IANA time zones (`TimeZone::Named`) via `chrono-tz`, for a device whose profile fixes a zone the host does not share |
 
 The `asdu` application layer is always built, so a codec-only dependency can
 turn every transport off.
@@ -254,10 +256,6 @@ with correct per-station FCB tracking, class 1/2 buffering, ACD and DFC
 signalling and multi-drop round-robin polling; balanced mode with both stations
 transmitting spontaneously. Serial, TCP dial-out and TCP listen transports.
 
-**filetransfer.** Monitor-direction directories, file selection and offers,
-section/segment transfer, checksum verification with retransmission, and a
-pluggable store. See [the file transfer guide](docs/filetransfer.md).
-
 **cs103.** Master only: automatic link initialization (status, reset of the
 communication unit), identification collection, automatic time synchronization
 and general interrogation, cyclic measurand polling with event fetch on ACD,
@@ -265,8 +263,9 @@ general commands with RII-matched acknowledgements, multi-drop.
 
 ## Not implemented
 
-* Control-direction file transfer and query-log type `F_SC_NB_1` (127).
 * IEC 62351-5 security ASDUs (`S_*`) — enumerated only.
+* `F_SC_NB_1` (127, query log) — enumerated only; the rest of the file transfer
+  set (120–126) is implemented, see [`filetransfer`].
 * Select-before-execute supervision is left to the application: command ASDUs
   reach the handler, which decides how to confirm and execute them. The S/E bit
   is available as `QualifierOfCommand::in_select`.
@@ -288,32 +287,14 @@ The defaults (k = 12, w = 8, t₁ = 15 s, t₂ = 10 s, t₃ = 20 s, `PARAMS_WIDE
 104 and `PARAMS_STANDARD_101` for 101) are chosen to interoperate with
 other publicly available projects and conforming test sets.
 
-lib60870-C is tested in both 104 TCP directions (interrogation, select command,
-quality flags, directory and multi-section file transfers), and both 101
-serial directions through Unix pseudo terminals (link initialization,
-class polling, interrogation and command confirmation). PTYs test protocol
-bytes; physical serial parity and timing require hardware validation.
-
-The reference revisions and reproducible commands are listed in the
-[interop harness](tests/interop/README.md). CI requires the peers and fails
-if they are missing or cannot build.
-
 ### One deliberate difference from go-iecp5
 
-The pinned go-iecp5 revision cannot size type identifications 58–64 (the CP56Time2a-tagged command
+go-iecp5 cannot size type identifications 58–64 (the CP56Time2a-tagged command
 types), so it drops them on receipt. This crate encodes *and* decodes them per
 the standard, which is a strict superset: a go-iecp5 peer will still not accept
 them, so avoid those types when the other end is go-iecp5.
 
 ## Pitfalls
-
-* ASDUs with trailing payload octets are now refused. For a known legacy peer,
-  set `Params::allow_trailing_octets = true` to retain the previous trimming
-  behavior. Outbound standard ASDUs must always match their type/count.
-* For bulk replies use `Waiting::new(connection, deadline)` or
-  `Connect::send_wait`. A server broadcast reports refusals; retrying the whole
-  broadcast can duplicate deliveries to masters that already accepted it.
-
 
 1. **`Params` must match on both peers.** A mismatch decodes as garbage — wrong
    types, wrong causes. Use `PARAMS_WIDE` for 104 and `PARAMS_STANDARD_101` for

@@ -85,6 +85,7 @@ impl ServerHandler for Outstation {
                     value: false,
                     qds: QualityDescriptor::INVALID,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             ],
         )
@@ -175,10 +176,24 @@ async fn pair(
     Arc<Log>,
     Arc<Log>,
 ) {
+    pair_with(mode, |_| {}).await
+}
+
+/// As [`pair`], with `tweak` applied to both stations' configuration.
+async fn pair_with(
+    mode: TransmissionMode,
+    tweak: impl Fn(&mut Config),
+) -> (
+    Arc<Server<Outstation>>,
+    Arc<Client<Master>>,
+    Arc<Log>,
+    Arc<Log>,
+) {
     let server_log = Arc::new(Log::default());
     let client_log = Arc::new(Log::default());
 
     let mut server_cfg = brisk(mode);
+    tweak(&mut server_cfg);
     server_cfg.transport = TransportType::TcpServer;
     server_cfg.tcp = TcpConfig {
         address: "127.0.0.1:0".into(),
@@ -195,6 +210,7 @@ async fn pair(
     srv.start().unwrap();
 
     let mut client_cfg = brisk(mode);
+    tweak(&mut client_cfg);
     client_cfg.transport = TransportType::TcpClient;
     client_cfg.tcp = TcpConfig {
         address: addr,
@@ -349,6 +365,7 @@ async fn control_commands_reach_the_outstation_and_are_confirmed() {
                 in_select: false,
             },
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         },
     )
     .await
@@ -454,6 +471,7 @@ async fn balanced_mode_lets_the_outstation_transmit_spontaneously() {
             value: true,
             qds: QualityDescriptor::GOOD,
             time: Some(chrono::Utc::now()),
+            time_flags: TimeTagFlags::GOOD,
         }],
     )
     .await
@@ -528,4 +546,38 @@ async fn a_full_buffer_reports_send_queue_full() {
     assert_eq!(srv.buffered(), (2, 0));
 
     srv.close();
+}
+
+#[tokio::test]
+async fn single_character_acknowledgements_carry_a_whole_interrogation() {
+    // With E5 on, most confirmations and every empty poll are a single octet
+    // with no address or control field; the link must still initialise and
+    // move a full interrogation, including the ACD-driven class 1 fetches.
+    for mode in [TransmissionMode::Unbalanced, TransmissionMode::Balanced] {
+        let (srv, cli, server_log, client_log) =
+            pair_with(mode, |c| c.use_single_char_ack = true).await;
+
+        cli.interrogation_cmd(
+            CauseOfTransmission::new(Cause::ACTIVATION),
+            1,
+            QualifierOfInterrogation::STATION,
+        )
+        .await
+        .unwrap();
+
+        eventually("the interrogation terminates", async || {
+            client_log.asdus.lock().await.iter().any(|a| {
+                a.type_id() == TypeId::C_IC_NA_1 && a.coa().cause == Cause::ACTIVATION_TERM
+            })
+        })
+        .await;
+        assert_eq!(server_log.interrogations.load(Ordering::SeqCst), 1, "{mode:?}");
+        assert!(
+            client_log.first_of(TypeId::M_ME_NC_1).await.is_some(),
+            "{mode:?}: the process image did not arrive"
+        );
+
+        cli.close();
+        srv.close();
+    }
 }

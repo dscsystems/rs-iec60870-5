@@ -13,6 +13,22 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use crate::asdu::codec::Asdu;
 use crate::asdu::identifier::TypeId;
 use crate::asdu::info::QualityDescriptor;
+use crate::asdu::time::TimeTagFlags;
+
+/// A time tag with its IV and SB flags, so an invalid or substituted time is
+/// never read in a log as a good one.
+fn tsf(t: Option<DateTime<Utc>>, flags: TimeTagFlags) -> String {
+    let mut s = ts(t);
+    if !s.is_empty() {
+        if flags.invalid {
+            s.push_str(" (IV)");
+        }
+        if flags.substituted {
+            s.push_str(" (SB)");
+        }
+    }
+    s
+}
 
 fn ts(t: Option<DateTime<Utc>>) -> String {
     match t {
@@ -62,7 +78,7 @@ impl fmt::Display for Asdu {
             TypeId::M_SP_NA_1 | TypeId::M_SP_TA_1 | TypeId::M_SP_TB_1 => {
                 self.get_single_point().map(|v| {
                     list(f, &v, |f, it| {
-                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), ts(it.time))
+                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), tsf(it.time, it.time_flags))
                     })
                 })
             }
@@ -75,7 +91,7 @@ impl fmt::Display for Asdu {
                             it.ioa,
                             it.value.value(),
                             qds(it.qds),
-                            ts(it.time)
+                            tsf(it.time, it.time_flags)
                         )
                     })
                 })
@@ -87,7 +103,7 @@ impl fmt::Display for Asdu {
                         if it.value.has_transient {
                             f.write_str(" transient")?;
                         }
-                        write!(f, "{}{}", qds(it.qds), ts(it.time))
+                        write!(f, "{}{}", qds(it.qds), tsf(it.time, it.time_flags))
                     })
                 })
             }
@@ -100,7 +116,7 @@ impl fmt::Display for Asdu {
                             it.ioa,
                             it.value,
                             qds(it.qds),
-                            ts(it.time)
+                            tsf(it.time, it.time_flags)
                         )
                     })
                 })
@@ -114,7 +130,7 @@ impl fmt::Display for Asdu {
                             it.ioa,
                             it.value.f64(),
                             qds(it.qds),
-                            ts(it.time)
+                            tsf(it.time, it.time_flags)
                         )
                     })
                 })
@@ -122,14 +138,14 @@ impl fmt::Display for Asdu {
             TypeId::M_ME_NB_1 | TypeId::M_ME_TB_1 | TypeId::M_ME_TE_1 => {
                 self.get_measured_value_scaled().map(|v| {
                     list(f, &v, |f, it| {
-                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), ts(it.time))
+                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), tsf(it.time, it.time_flags))
                     })
                 })
             }
             TypeId::M_ME_NC_1 | TypeId::M_ME_TC_1 | TypeId::M_ME_TF_1 => {
                 self.get_measured_value_float().map(|v| {
                     list(f, &v, |f, it| {
-                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), ts(it.time))
+                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), tsf(it.time, it.time_flags))
                     })
                 })
             }
@@ -151,7 +167,7 @@ impl fmt::Display for Asdu {
                         if c.is_invalid {
                             f.write_str(" invalid")?;
                         }
-                        f.write_str(&ts(it.time))
+                        f.write_str(&tsf(it.time, it.time_flags))
                     })
                 })
             }
@@ -165,7 +181,7 @@ impl fmt::Display for Asdu {
                             it.event.value(),
                             it.qdp.0,
                             it.msec,
-                            ts(it.time)
+                            tsf(it.time, it.time_flags)
                         )
                     })
                 })
@@ -178,7 +194,7 @@ impl fmt::Display for Asdu {
                     it.event.0,
                     it.qdp.0,
                     it.msec,
-                    ts(it.time)
+                    tsf(it.time, it.time_flags)
                 )
             }),
             TypeId::M_EP_TC_1 | TypeId::M_EP_TF_1 => {
@@ -190,7 +206,7 @@ impl fmt::Display for Asdu {
                         it.oci.0,
                         it.qdp.0,
                         it.msec,
-                        ts(it.time)
+                        tsf(it.time, it.time_flags)
                     )
                 })
             }
@@ -217,7 +233,7 @@ impl fmt::Display for Asdu {
                     c.ioa,
                     c.value,
                     c.qoc.value(),
-                    ts(c.time)
+                    tsf(c.time, c.time_flags)
                 )
             }),
             TypeId::C_DC_NA_1 | TypeId::C_DC_TA_1 => self.get_double_cmd().map(|c| {
@@ -227,7 +243,7 @@ impl fmt::Display for Asdu {
                     c.ioa,
                     c.value.value(),
                     c.qoc.value(),
-                    ts(c.time)
+                    tsf(c.time, c.time_flags)
                 )
             }),
             TypeId::C_RC_NA_1 | TypeId::C_RC_TA_1 => self.get_step_cmd().map(|c| {
@@ -237,7 +253,7 @@ impl fmt::Display for Asdu {
                     c.ioa,
                     c.value.value(),
                     c.qoc.value(),
-                    ts(c.time)
+                    tsf(c.time, c.time_flags)
                 )
             }),
             TypeId::C_SE_NA_1 | TypeId::C_SE_TA_1 => self.get_setpoint_normal_cmd().map(|c| {
@@ -247,7 +263,7 @@ impl fmt::Display for Asdu {
                     c.ioa,
                     c.value.f64(),
                     c.qos.value(),
-                    ts(c.time)
+                    tsf(c.time, c.time_flags)
                 )
             }),
             TypeId::C_SE_NB_1 | TypeId::C_SE_TB_1 => self.get_setpoint_scaled_cmd().map(|c| {
@@ -257,7 +273,7 @@ impl fmt::Display for Asdu {
                     c.ioa,
                     c.value,
                     c.qos.value(),
-                    ts(c.time)
+                    tsf(c.time, c.time_flags)
                 )
             }),
             TypeId::C_SE_NC_1 | TypeId::C_SE_TC_1 => self.get_setpoint_float_cmd().map(|c| {
@@ -267,11 +283,11 @@ impl fmt::Display for Asdu {
                     c.ioa,
                     c.value,
                     c.qos.value(),
-                    ts(c.time)
+                    tsf(c.time, c.time_flags)
                 )
             }),
             TypeId::C_BO_NA_1 | TypeId::C_BO_TA_1 => self.get_bits_string32_cmd().map(|c| {
-                write!(f, " IOA={} bits=0x{:08x}{}", c.ioa, c.value, ts(c.time))
+                write!(f, " IOA={} bits=0x{:08x}{}", c.ioa, c.value, tsf(c.time, c.time_flags))
             }),
             TypeId::P_ME_NA_1 => self.get_parameter_normal().map(|p| {
                 write!(
@@ -312,6 +328,79 @@ impl fmt::Display for Asdu {
             TypeId::C_CS_NA_1 => self
                 .get_clock_synchronization_cmd()
                 .map(|(ioa, t)| write!(f, " IOA={ioa}{}", ts(t))),
+            TypeId::F_FR_NA_1 => self.get_file_ready().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} LOF={} FRQ=0x{:02x}",
+                    i.ioa,
+                    i.nof,
+                    i.length_of_file,
+                    i.frq.value()
+                )
+            }),
+            TypeId::F_SR_NA_1 => self.get_section_ready().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} LOS={} SRQ=0x{:02x}",
+                    i.ioa,
+                    i.nof,
+                    i.nos,
+                    i.length_of_section,
+                    i.srq.value()
+                )
+            }),
+            TypeId::F_SC_NA_1 => self.get_call_or_select_file().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} SCQ=0x{:02x}",
+                    i.ioa,
+                    i.nof,
+                    i.nos,
+                    i.scq.value()
+                )
+            }),
+            TypeId::F_LS_NA_1 => self.get_last_section_or_segment().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} LSQ={} CHS=0x{:02x}",
+                    i.ioa, i.nof, i.nos, i.lsq.0, i.chs
+                )
+            }),
+            TypeId::F_AF_NA_1 => self.get_ack_file_or_section().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} AFQ=0x{:02x}",
+                    i.ioa,
+                    i.nof,
+                    i.nos,
+                    i.afq.value()
+                )
+            }),
+            // The segment payload itself is not dumped: a file transfer fills
+            // the log with it, and its length is what a reader needs.
+            TypeId::F_SG_NA_1 => self.get_file_segment().map(|i| {
+                write!(
+                    f,
+                    " IOA={} NOF={} NOS={} segment={}B",
+                    i.ioa,
+                    i.nof,
+                    i.nos,
+                    i.segment.len()
+                )
+            }),
+            TypeId::F_DR_TA_1 => self.get_file_directory().map(|infos| {
+                list(f, &infos, |f, i| {
+                    write!(
+                        f,
+                        "{}=NOF({}) {}B SOF=0x{:02x}{}",
+                        i.ioa,
+                        i.nof,
+                        i.length_of_file,
+                        i.sof.value(),
+                        tsf(i.time, i.time_flags)
+                    )
+                })
+            }),
             _ => {
                 let n = self.variable().number.max(1);
                 return write!(f, " items={n} payload={}B", self.info_obj.len());
@@ -328,6 +417,7 @@ impl fmt::Display for Asdu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::asdu::time::TimeTagFlags;
     use crate::asdu::identifier::{Cause, CauseOfTransmission};
     use crate::asdu::info::*;
     use crate::asdu::mproc::*;
@@ -347,6 +437,7 @@ mod tests {
                     value: false,
                     qds: QualityDescriptor::INVALID,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             ],
         )

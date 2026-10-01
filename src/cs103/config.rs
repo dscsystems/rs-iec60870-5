@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use crate::asdu::TimeZone;
 use crate::cs101::{SerialConfig, TcpConfig, TransportType};
 use crate::error::Result;
 
@@ -53,9 +54,19 @@ pub struct Config {
     pub timeout_send_link_msg: Duration,
     /// Capacity of the outbound ASDU queue.
     pub max_send_queue_size: usize,
+    /// How many times an unanswered confirmed frame is repeated, t₂ apart,
+    /// before the device is given up and its link restarted. Zero means no
+    /// repetition. Default 1.
+    pub max_repetitions: u8,
     /// Send a time synchronization followed by a general interrogation
     /// automatically whenever a device's link becomes active. On by default.
     pub auto_init: bool,
+    /// Time zone the CP32/CP56 time tags of this link are expressed in.
+    ///
+    /// Decides the SU (summer time) bit as well as the wall clock reading, so
+    /// it must match what the device expects. UTC is the standard's
+    /// recommendation and the default.
+    pub time_zone: TimeZone,
 }
 
 impl Default for Config {
@@ -68,8 +79,10 @@ impl Default for Config {
             timeout_response_t1: DEFAULT_TIMEOUT_RESPONSE_T1,
             timeout_repeat_t2: DEFAULT_TIMEOUT_REPEAT_T2,
             timeout_test_t3: DEFAULT_TIMEOUT_TEST_T3,
+            time_zone: TimeZone::Utc,
             timeout_send_link_msg: DEFAULT_TIMEOUT_SEND_LINK_MSG,
             max_send_queue_size: DEFAULT_MAX_SEND_QUEUE_SIZE,
+            max_repetitions: crate::cs101::DEFAULT_MAX_REPETITIONS,
             auto_init: true,
         }
     }
@@ -97,6 +110,7 @@ impl Config {
             timeout_test_t3: self.timeout_test_t3,
             timeout_send_link_msg: self.timeout_send_link_msg,
             max_send_queue_size: self.max_send_queue_size,
+            max_repetitions: self.max_repetitions,
             ..Default::default()
         };
         link.valid()?;
@@ -123,6 +137,7 @@ impl Config {
             timeout_test_t3: self.timeout_test_t3,
             timeout_send_link_msg: self.timeout_send_link_msg,
             max_send_queue_size: self.max_send_queue_size,
+            max_repetitions: self.max_repetitions,
             ..Default::default()
         }
     }

@@ -178,6 +178,7 @@ async fn rust_primary_interoperates_with_the_go_secondary() {
                 in_select: false,
             },
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         },
     )
     .await
@@ -293,6 +294,7 @@ impl ServerHandler for RustOutstation {
                     value: false,
                     qds: QualityDescriptor::INVALID,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             ],
         )
@@ -340,6 +342,7 @@ impl ServerHandler for RustOutstation {
                 time: chrono::DateTime::parse_from_rfc3339("2026-08-17T12:34:56.789Z")
                     .ok()
                     .map(|t| t.to_utc()),
+                    time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;

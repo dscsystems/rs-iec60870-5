@@ -42,7 +42,7 @@ cargo run --example cs104_server         # the outstation
 cargo run -p cs104-explorer -- 127.0.0.1:2404
 ```
 
-It also talks to any conforming 104 outstation — `lib60870`, OpenMUC j60870, a
+It also talks to any conforming 104 outstation — OpenMUC j60870, a
 real RTU, or a test set.
 
 ## Keys

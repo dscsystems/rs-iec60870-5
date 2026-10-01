@@ -99,14 +99,14 @@ mod transport;
 
 pub use client::{Client, ClientOption, DEFAULT_RECONNECT_INTERVAL};
 pub use config::{
-    Config, DEFAULT_LINK_ADDR_SIZE, DEFAULT_MAX_APDU_LENGTH, DEFAULT_MAX_SEND_QUEUE_SIZE,
+    Config, DEFAULT_LINK_ADDR_SIZE, DEFAULT_MAX_APDU_LENGTH, DEFAULT_MAX_REPETITIONS, DEFAULT_MAX_SEND_QUEUE_SIZE,
     DEFAULT_TCP_CONNECT_TIMEOUT, DEFAULT_TIMEOUT_REPEAT_T2, DEFAULT_TIMEOUT_RESPONSE_T1,
     DEFAULT_TIMEOUT_SEND_LINK_MSG, DEFAULT_TIMEOUT_TEST_T3, Parity, SerialConfig, StopBits,
     TcpConfig, TransmissionMode, TransportType,
 };
 pub use frame::{
-    ControlField, Frame, MAX_FRAME_LEN, SINGLE_CHAR_ACK, START_FIXED, START_VARIABLE,
-    is_broadcast_addr, prim_fc, read_frame, sec_fc,
+    ControlField, Frame, MAX_FRAME_LEN, MAX_LENGTH_FIELD, SINGLE_CHAR_ACK, START_FIXED,
+    START_VARIABLE, max_asdu_len, prim_fc, read_frame, sec_fc,
 };
 pub use handler::{ClientHandler, ServerHandler};
 pub use server::Server;

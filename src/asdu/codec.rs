@@ -26,8 +26,9 @@ use crate::asdu::info::{
 };
 use crate::asdu::params::Params;
 use crate::asdu::time::{
-    CP16TIME2A_SIZE, CP24TIME2A_SIZE, CP56TIME2A_SIZE, cp16time2a, cp24time2a, cp56time2a,
-    parse_cp16time2a, parse_cp24time2a, parse_cp56time2a,
+    CP16TIME2A_SIZE, CP24TIME2A_SIZE, CP56TIME2A_SIZE, TimeTagFlags, cp16time2a, cp24time2a,
+    cp24time2a_tag, cp56time2a, cp56time2a_tag, parse_cp16time2a, parse_cp24time2a,
+    parse_cp24time2a_tag, parse_cp56time2a, parse_cp56time2a_tag,
 };
 use crate::error::{Error, Result};
 
@@ -145,7 +146,11 @@ impl Asdu {
 
     /// Serialise to the wire format.
     pub fn marshal_binary(&self) -> Result<Vec<u8>> {
+        self.params.valid()?;
         let id = &self.identifier;
+        if id.type_id.0 == 0 || !(1..=127).contains(&id.variable.number) {
+            return Err(Error::InfoObjIndexFit);
+        }
         if id.coa.cause == Cause::UNUSED {
             return Err(Error::CauseZero);
         }
@@ -168,18 +173,14 @@ impl Asdu {
             return Err(Error::LengthOutOfRange);
         }
 
-        if id.type_id.0 == 0 {
-            return Err(Error::TypeIdentifier);
+        // Known layouts must account for every outgoing octet. Private types
+        // keep application-defined layouts; lenient padding is inbound only.
+        if id.type_id.info_obj_size().is_ok() || id.type_id == TypeId::F_SG_NA_1 {
+            let mut checked = self.clone();
+            checked.params.allow_trailing_octets = false;
+            checked.fix_info_obj_size()?;
         }
-        if id.variable.number == 0 || id.variable.number > 127 {
-            return Err(Error::InfoObjIndexFit);
-        }
-        self.params.valid()?;
-        // Unknown layouts (including private/security types) are defined by
-        // the caller. Known standard layouts must match exactly.
-        if id.type_id == TypeId::F_SG_NA_1 || id.type_id.info_obj_size().is_ok() {
-            self.validate_info_obj()?;
-        }
+
         let mut raw = Vec::with_capacity(len);
         raw.push(id.type_id.0);
         raw.push(id.variable.value());
@@ -203,7 +204,7 @@ impl Asdu {
 
     /// Parse an ASDU from the wire format using the given parameters.
     ///
-    /// The information object payload must have exactly the length implied
+    /// The information object payload is trimmed to exactly the length implied
     /// by the type identification and the variable structure qualifier; a
     /// payload shorter than that is rejected with [`Error::UnexpectedEof`].
     pub fn unmarshal_binary(params: Params, raw: &[u8]) -> Result<Asdu> {
@@ -243,56 +244,70 @@ impl Asdu {
         Ok(asdu)
     }
 
-    /// Validate the payload against the type and variable structure qualifier.
-    /// Trailing octets are rejected, so malformed commands cannot be executed.
-    pub fn validate_info_obj(&self) -> Result<()> {
-        self.params.valid()?;
-        let size = self.expected_info_obj_len()?;
+    /// Check the information object payload against the size implied by the
+    /// type identification and the variable structure qualifier.
+    ///
+    /// A short payload is [`Error::UnexpectedEof`]. A long one is
+    /// [`Error::TrailingOctets`], unless
+    /// [`Params::allow_trailing_octets`](crate::asdu::Params::allow_trailing_octets)
+    /// is set, in which case the surplus is discarded.
+    pub fn fix_info_obj_size(&mut self) -> Result<()> {
+        let v = self.identifier.variable;
+        if !(1..=127).contains(&v.number)
+            || ((120..=126).contains(&self.type_id().0)
+                && (v.is_sequence || (self.type_id() != TypeId::F_DR_TA_1 && v.number != 1)))
+        {
+            return Err(Error::InfoObjIndexFit);
+        }
+        // A variable-length object carries its own length, so "expected" is
+        // only meaningful once that octet is present.
+        let size = match self.variable_info_obj_size() {
+            Some(0) => return Err(Error::UnexpectedEof),
+            Some(size) => size,
+            None => {
+                let obj_size = self.identifier.type_id.info_obj_size()?;
+                let n = self.identifier.variable.number as usize;
+                let addr_size = self.params.info_obj_addr_size as usize;
+                let size = if self.identifier.variable.is_sequence {
+                    addr_size + n * obj_size
+                } else {
+                    n * (addr_size + obj_size)
+                };
+                if size == 0 {
+                    return Err(Error::InfoObjIndexFit);
+                }
+                size
+            }
+        };
+
         if size > self.info_obj.len() {
             return Err(Error::UnexpectedEof);
         }
-        if size != self.info_obj.len() {
-            return Err(Error::InfoObjSizeMismatch);
+        if size < self.info_obj.len() {
+            if !self.params.allow_trailing_octets {
+                return Err(Error::TrailingOctets);
+            }
+            self.info_obj.truncate(size);
         }
         Ok(())
     }
 
-    fn expected_info_obj_len(&self) -> Result<usize> {
-        let n = self.variable().number as usize;
-        if n == 0 || n > 127 {
-            return Err(Error::InfoObjIndexFit);
+    /// The size of an information object whose length is not fixed by the type
+    /// identification, or `None` when this type is not such a case.
+    ///
+    /// The compatible range defines one: `F_SG_NA_1` (segment), whose length is
+    /// carried in its own LOS (length of segment) octet. `Some(0)` means the
+    /// type was recognised but the payload is too short to hold that octet.
+    fn variable_info_obj_size(&self) -> Option<usize> {
+        if self.identifier.type_id != TypeId::F_SG_NA_1 {
+            return None;
         }
-        let addr = self.params.info_obj_addr_size as usize;
-        let tid = self.type_id().0;
-        if (120..=126).contains(&tid) && (self.variable().is_sequence || (tid != 126 && n != 1)) {
-            return Err(Error::InfoObjIndexFit);
+        // IOA + NOF(2) + NOS(1) + LOS(1) + segment data(LOS)
+        let head = self.params.info_obj_addr_size as usize + 4;
+        if self.info_obj.len() < head {
+            return Some(0);
         }
-        let size = if tid == 125 {
-            let head = addr + 4;
-            if self.info_obj.len() < head {
-                return Err(Error::UnexpectedEof);
-            }
-            head + self.info_obj[addr + 3] as usize
-        } else {
-            let obj = self.type_id().info_obj_size()?;
-            if self.variable().is_sequence {
-                addr + n * obj
-            } else {
-                n * (addr + obj)
-            }
-        };
-        Ok(size)
-    }
-
-    /// Validate the information object payload. Kept for API compatibility.
-    pub fn fix_info_obj_size(&mut self) -> Result<()> {
-        if self.params.allow_trailing_octets {
-            let size = self.expected_info_obj_len()?;
-            if self.info_obj.len() > size {
-                self.info_obj.truncate(size);
-            }
-        }
-        self.validate_info_obj()
+        Some(head + self.info_obj[self.params.info_obj_addr_size as usize + 3] as usize)
     }
 
     /// An appender that writes information elements into this ASDU.
@@ -310,6 +325,7 @@ impl Asdu {
             params: self.params,
             buf: &self.info_obj,
             pos: 0,
+            last_flags: TimeTagFlags::GOOD,
         }
     }
 
@@ -373,6 +389,16 @@ impl Encoder<'_> {
         Ok(self)
     }
 
+    /// Append a 3-octet length of file (LOF).
+    ///
+    /// The element is 3 octets, so only the low 24 bits are written; callers
+    /// bound the value against
+    /// [`LENGTH_OF_FILE_MAX`](crate::asdu::LENGTH_OF_FILE_MAX) first.
+    pub fn length_of_file(&mut self, n: u32) -> &mut Self {
+        self.buf.extend_from_slice(&n.to_le_bytes()[..3]);
+        self
+    }
+
     /// Append a normalized value (NVA).
     pub fn normalize(&mut self, n: Normalize) -> &mut Self {
         self.buf.extend_from_slice(&n.0.to_le_bytes());
@@ -432,6 +458,20 @@ impl Encoder<'_> {
         self
     }
 
+    /// Append a CP56Time2a time tag carrying the given IV and SB flags.
+    pub fn cp56time2a_tag(&mut self, t: Option<DateTime<Utc>>, flags: TimeTagFlags) -> &mut Self {
+        self.buf
+            .extend_from_slice(&cp56time2a_tag(t, flags, self.params.info_obj_time_zone));
+        self
+    }
+
+    /// Append a CP24Time2a time tag carrying the given IV and SB flags.
+    pub fn cp24time2a_tag(&mut self, t: Option<DateTime<Utc>>, flags: TimeTagFlags) -> &mut Self {
+        self.buf
+            .extend_from_slice(&cp24time2a_tag(t, flags, self.params.info_obj_time_zone));
+        self
+    }
+
     /// Append a CP16Time2a elapsed-millisecond tag.
     pub fn cp16time2a(&mut self, msec: u16) -> &mut Self {
         self.buf.extend_from_slice(&cp16time2a(msec));
@@ -454,6 +494,8 @@ pub struct InfoObjReader<'a> {
     params: Params,
     buf: &'a [u8],
     pos: usize,
+    /// The validity flags of the time tag read last by a `*_tag` method.
+    last_flags: TimeTagFlags,
 }
 
 impl<'a> InfoObjReader<'a> {
@@ -497,6 +539,17 @@ impl<'a> InfoObjReader<'a> {
             }
             _ => Err(Error::Param),
         }
+    }
+
+    /// Read a 3-octet length of file (LOF).
+    pub fn length_of_file(&mut self) -> Result<u32> {
+        let b = self.take(3)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], 0]))
+    }
+
+    /// Read `n` raw octets, as the payload of a variable-length element.
+    pub fn take_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
+        self.take(n)
     }
 
     /// Read a normalized value (NVA).
@@ -547,6 +600,31 @@ impl<'a> InfoObjReader<'a> {
     pub fn cp24time2a(&mut self) -> Result<Option<DateTime<Utc>>> {
         let b = self.take(CP24TIME2A_SIZE)?;
         Ok(parse_cp24time2a(b, self.params.info_obj_time_zone))
+    }
+
+    /// Read a CP56Time2a time tag's reading whatever its validity, keeping
+    /// its flags for [`InfoObjReader::time_flags`].
+    pub fn cp56time2a_tag(&mut self) -> Result<Option<DateTime<Utc>>> {
+        let b = self.take(CP56TIME2A_SIZE)?;
+        let (t, flags) = parse_cp56time2a_tag(b, self.params.info_obj_time_zone);
+        self.last_flags = flags;
+        Ok(t)
+    }
+
+    /// Read a CP24Time2a time tag's reading whatever its validity, keeping
+    /// its flags for [`InfoObjReader::time_flags`].
+    pub fn cp24time2a_tag(&mut self) -> Result<Option<DateTime<Utc>>> {
+        let b = self.take(CP24TIME2A_SIZE)?;
+        let (t, flags) = parse_cp24time2a_tag(b, self.params.info_obj_time_zone);
+        self.last_flags = flags;
+        Ok(t)
+    }
+
+    /// The IV and SB flags of the time tag read last with
+    /// [`InfoObjReader::cp56time2a_tag`] or [`InfoObjReader::cp24time2a_tag`],
+    /// and [`TimeTagFlags::GOOD`] before any has been read.
+    pub fn time_flags(&self) -> TimeTagFlags {
+        self.last_flags
     }
 
     /// Read a CP16Time2a elapsed-millisecond tag.
@@ -704,15 +782,70 @@ mod tests {
     #[test]
     fn unmarshal_rejects_trailing_octets_and_short_payloads() {
         // One M_SP_NA_1 object: 3 address octets + 1 value octet.
-        let raw = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01, 0xde, 0xad];
+        let exact = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01];
         assert_eq!(
-            Asdu::unmarshal_binary(PARAMS_WIDE, &raw),
-            Err(Error::InfoObjSizeMismatch)
+            Asdu::unmarshal_binary(PARAMS_WIDE, &exact)
+                .unwrap()
+                .info_obj
+                .len(),
+            4
+        );
+
+        // A conforming sender cannot produce a surplus octet, so two extra
+        // ones mean the frame is not what its qualifier claims.
+        let padded = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01, 0xde, 0xad];
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &padded),
+            Err(Error::TrailingOctets)
         );
 
         let short = [1u8, 1, 3, 0, 1, 0, 1, 0];
         assert_eq!(
             Asdu::unmarshal_binary(PARAMS_WIDE, &short),
+            Err(Error::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn trailing_octets_are_discarded_only_when_the_parameter_allows_it() {
+        let lenient = Params {
+            allow_trailing_octets: true,
+            ..PARAMS_WIDE
+        };
+        let padded = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01, 0xde, 0xad];
+        let a = Asdu::unmarshal_binary(lenient, &padded).unwrap();
+        assert_eq!(a.info_obj, vec![1, 0, 0, 0x01], "the surplus is discarded");
+    }
+
+    #[test]
+    fn a_file_segment_is_sized_by_its_own_length_octet() {
+        // F_SG_NA_1: IOA(3) + NOF(2) + NOS(1) + LOS(1) + 3 segment octets.
+        let raw = [
+            125u8, 1, 13, 0, 1, 0, // identifier: F_SG_NA_1, 1 object, FileTransfer, CA 1
+            0x64, 0, 0, // IOA 100
+            0x02, 0,    // NOF
+            0x01, // NOS
+            0x03, // LOS = 3
+            0xaa, 0xbb, 0xcc,
+        ];
+        let a = Asdu::unmarshal_binary(PARAMS_WIDE, &raw).unwrap();
+        assert_eq!(a.info_obj.len(), 10);
+
+        // One octet short of what LOS promises.
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &raw[..raw.len() - 1]),
+            Err(Error::UnexpectedEof)
+        );
+        // One octet more than LOS accounts for.
+        let mut padded = raw.to_vec();
+        padded.push(0xdd);
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &padded),
+            Err(Error::TrailingOctets)
+        );
+        // Truncated before the LOS octet itself.
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &raw[..9]),
             Err(Error::UnexpectedEof)
         );
     }

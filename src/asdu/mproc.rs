@@ -13,6 +13,7 @@ use crate::asdu::codec::{Asdu, check_valid};
 use crate::asdu::identifier::{Cause, CauseOfTransmission, CommonAddr, Identifier, TypeId, VariableStruct};
 use crate::asdu::info::*;
 use crate::asdu::params::Params;
+use crate::asdu::time::TimeTagFlags;
 use crate::error::{Error, Result};
 
 /// A single-point measurement.
@@ -27,6 +28,12 @@ pub struct SinglePointInfo {
     pub qds: QualityDescriptor,
     /// Time tag; ignored by the untagged type.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 impl SinglePointInfo {
@@ -37,6 +44,7 @@ impl SinglePointInfo {
             value,
             qds: QualityDescriptor::GOOD,
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         }
     }
 }
@@ -53,6 +61,12 @@ pub struct DoublePointInfo {
     pub qds: QualityDescriptor,
     /// Time tag; ignored by the untagged type.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A step (tap changer) position measurement.
@@ -67,6 +81,12 @@ pub struct StepPositionInfo {
     pub qds: QualityDescriptor,
     /// Time tag; ignored by the untagged type.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A 32 bit string measurement.
@@ -81,6 +101,12 @@ pub struct BitString32Info {
     pub qds: QualityDescriptor,
     /// Time tag; ignored by the untagged type.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A normalized measured value.
@@ -95,6 +121,12 @@ pub struct MeasuredValueNormalInfo {
     pub qds: QualityDescriptor,
     /// Time tag; ignored by the untagged types.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A scaled measured value.
@@ -109,6 +141,12 @@ pub struct MeasuredValueScaledInfo {
     pub qds: QualityDescriptor,
     /// Time tag; ignored by the untagged type.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// A short floating point measured value.
@@ -123,6 +161,12 @@ pub struct MeasuredValueFloatInfo {
     pub qds: QualityDescriptor,
     /// Time tag; ignored by the untagged type.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// An integrated total (counter) reading.
@@ -135,6 +179,12 @@ pub struct BinaryCounterReadingInfo {
     pub value: BinaryCounterReading,
     /// Time tag; ignored by the untagged type.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// An event of protection equipment.
@@ -151,6 +201,12 @@ pub struct EventOfProtectionEquipmentInfo {
     pub msec: u16,
     /// Time tag of the event.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// Packed start events of protection equipment.
@@ -167,6 +223,12 @@ pub struct PackedStartEventsOfProtectionEquipmentInfo {
     pub msec: u16,
     /// Time tag of the event.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// Packed output circuit information of protection equipment.
@@ -183,6 +245,12 @@ pub struct PackedOutputCircuitInfoInfo {
     pub msec: u16,
     /// Time tag of the event.
     pub time: Option<DateTime<Utc>>,
+    /// IV (invalid) and SB (substituted) of the time tag.
+    ///
+    /// `time` holds the reading even when it is invalid, so check
+    /// [`TimeTagFlags::is_valid`] before taking it as the time of the
+    /// event. [`TimeTagFlags::GOOD`] for the untagged types.
+    pub time_flags: TimeTagFlags,
 }
 
 /// Packed single-point information with status change detection.
@@ -315,10 +383,10 @@ impl Asdu {
             match type_id {
                 TypeId::M_SP_NA_1 => {}
                 TypeId::M_SP_TA_1 => {
-                    e.cp24time2a(v.time);
+                    e.cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_SP_TB_1 => {
-                    e.cp56time2a(v.time);
+                    e.cp56time2a_tag(v.time, v.time_flags);
                 }
                 _ => return Err(Error::TypeIdNotMatch),
             }
@@ -381,8 +449,8 @@ impl Asdu {
             let value = r.byte()?;
             let time = match self.type_id() {
                 TypeId::M_SP_NA_1 => None,
-                TypeId::M_SP_TA_1 => r.cp24time2a()?,
-                TypeId::M_SP_TB_1 => r.cp56time2a()?,
+                TypeId::M_SP_TA_1 => r.cp24time2a_tag()?,
+                TypeId::M_SP_TB_1 => r.cp56time2a_tag()?,
                 _ => return Err(Error::TypeIdNotMatch),
             };
             out.push(SinglePointInfo {
@@ -390,6 +458,7 @@ impl Asdu {
                 value: value & 0x01 == 0x01,
                 qds: QualityDescriptor(value & 0xf0),
                 time,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -418,10 +487,10 @@ impl Asdu {
             match type_id {
                 TypeId::M_DP_NA_1 => {}
                 TypeId::M_DP_TA_1 => {
-                    e.cp24time2a(v.time);
+                    e.cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_DP_TB_1 => {
-                    e.cp56time2a(v.time);
+                    e.cp56time2a_tag(v.time, v.time_flags);
                 }
                 _ => return Err(Error::TypeIdNotMatch),
             }
@@ -475,8 +544,8 @@ impl Asdu {
             let value = r.byte()?;
             let time = match self.type_id() {
                 TypeId::M_DP_NA_1 => None,
-                TypeId::M_DP_TA_1 => r.cp24time2a()?,
-                TypeId::M_DP_TB_1 => r.cp56time2a()?,
+                TypeId::M_DP_TA_1 => r.cp24time2a_tag()?,
+                TypeId::M_DP_TB_1 => r.cp56time2a_tag()?,
                 _ => return Err(Error::TypeIdNotMatch),
             };
             out.push(DoublePointInfo {
@@ -484,6 +553,7 @@ impl Asdu {
                 value: DoublePoint::parse(value),
                 qds: QualityDescriptor(value & 0xf0),
                 time,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -512,10 +582,10 @@ impl Asdu {
             match type_id {
                 TypeId::M_ST_NA_1 => {}
                 TypeId::M_ST_TA_1 => {
-                    e.cp24time2a(v.time);
+                    e.cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_ST_TB_1 => {
-                    e.cp56time2a(v.time);
+                    e.cp56time2a_tag(v.time, v.time_flags);
                 }
                 _ => return Err(Error::TypeIdNotMatch),
             }
@@ -570,8 +640,8 @@ impl Asdu {
             let qds = QualityDescriptor(r.byte()?);
             let time = match self.type_id() {
                 TypeId::M_ST_NA_1 => None,
-                TypeId::M_ST_TA_1 => r.cp24time2a()?,
-                TypeId::M_ST_TB_1 => r.cp56time2a()?,
+                TypeId::M_ST_TA_1 => r.cp24time2a_tag()?,
+                TypeId::M_ST_TB_1 => r.cp56time2a_tag()?,
                 _ => return Err(Error::TypeIdNotMatch),
             };
             out.push(StepPositionInfo {
@@ -579,6 +649,7 @@ impl Asdu {
                 value,
                 qds,
                 time,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -607,10 +678,10 @@ impl Asdu {
             match type_id {
                 TypeId::M_BO_NA_1 => {}
                 TypeId::M_BO_TA_1 => {
-                    e.cp24time2a(v.time);
+                    e.cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_BO_TB_1 => {
-                    e.cp56time2a(v.time);
+                    e.cp56time2a_tag(v.time, v.time_flags);
                 }
                 _ => return Err(Error::TypeIdNotMatch),
             }
@@ -675,8 +746,8 @@ impl Asdu {
             let qds = QualityDescriptor(r.byte()?);
             let time = match self.type_id() {
                 TypeId::M_BO_NA_1 => None,
-                TypeId::M_BO_TA_1 => r.cp24time2a()?,
-                TypeId::M_BO_TB_1 => r.cp56time2a()?,
+                TypeId::M_BO_TA_1 => r.cp24time2a_tag()?,
+                TypeId::M_BO_TB_1 => r.cp56time2a_tag()?,
                 _ => return Err(Error::TypeIdNotMatch),
             };
             out.push(BitString32Info {
@@ -684,6 +755,7 @@ impl Asdu {
                 value,
                 qds,
                 time,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -717,10 +789,10 @@ impl Asdu {
                     e.byte(v.qds.0);
                 }
                 TypeId::M_ME_TA_1 => {
-                    e.byte(v.qds.0).cp24time2a(v.time);
+                    e.byte(v.qds.0).cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_ME_TD_1 => {
-                    e.byte(v.qds.0).cp56time2a(v.time);
+                    e.byte(v.qds.0).cp56time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_ME_ND_1 => {} // without quality descriptor
                 _ => return Err(Error::TypeIdNotMatch),
@@ -808,11 +880,11 @@ impl Asdu {
                 TypeId::M_ME_NA_1 => (QualityDescriptor(r.byte()?), None),
                 TypeId::M_ME_TA_1 => {
                     let q = QualityDescriptor(r.byte()?);
-                    (q, r.cp24time2a()?)
+                    (q, r.cp24time2a_tag()?)
                 }
                 TypeId::M_ME_TD_1 => {
                     let q = QualityDescriptor(r.byte()?);
-                    (q, r.cp56time2a()?)
+                    (q, r.cp56time2a_tag()?)
                 }
                 TypeId::M_ME_ND_1 => (QualityDescriptor::GOOD, None),
                 _ => return Err(Error::TypeIdNotMatch),
@@ -822,6 +894,7 @@ impl Asdu {
                 value,
                 qds,
                 time,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -850,10 +923,10 @@ impl Asdu {
             match type_id {
                 TypeId::M_ME_NB_1 => {}
                 TypeId::M_ME_TB_1 => {
-                    e.cp24time2a(v.time);
+                    e.cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_ME_TE_1 => {
-                    e.cp56time2a(v.time);
+                    e.cp56time2a_tag(v.time, v.time_flags);
                 }
                 _ => return Err(Error::TypeIdNotMatch),
             }
@@ -915,8 +988,8 @@ impl Asdu {
             let qds = QualityDescriptor(r.byte()?);
             let time = match self.type_id() {
                 TypeId::M_ME_NB_1 => None,
-                TypeId::M_ME_TB_1 => r.cp24time2a()?,
-                TypeId::M_ME_TE_1 => r.cp56time2a()?,
+                TypeId::M_ME_TB_1 => r.cp24time2a_tag()?,
+                TypeId::M_ME_TE_1 => r.cp56time2a_tag()?,
                 _ => return Err(Error::TypeIdNotMatch),
             };
             out.push(MeasuredValueScaledInfo {
@@ -924,6 +997,7 @@ impl Asdu {
                 value,
                 qds,
                 time,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -955,10 +1029,10 @@ impl Asdu {
             match type_id {
                 TypeId::M_ME_NC_1 => {}
                 TypeId::M_ME_TC_1 => {
-                    e.cp24time2a(v.time);
+                    e.cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_ME_TF_1 => {
-                    e.cp56time2a(v.time);
+                    e.cp56time2a_tag(v.time, v.time_flags);
                 }
                 _ => return Err(Error::TypeIdNotMatch),
             }
@@ -1013,8 +1087,8 @@ impl Asdu {
             let qds = QualityDescriptor(r.byte()? & 0xf1);
             let time = match self.type_id() {
                 TypeId::M_ME_NC_1 => None,
-                TypeId::M_ME_TC_1 => r.cp24time2a()?,
-                TypeId::M_ME_TF_1 => r.cp56time2a()?,
+                TypeId::M_ME_TC_1 => r.cp24time2a_tag()?,
+                TypeId::M_ME_TF_1 => r.cp56time2a_tag()?,
                 _ => return Err(Error::TypeIdNotMatch),
             };
             out.push(MeasuredValueFloatInfo {
@@ -1022,6 +1096,7 @@ impl Asdu {
                 value,
                 qds,
                 time,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -1050,10 +1125,10 @@ impl Asdu {
             match type_id {
                 TypeId::M_IT_NA_1 => {}
                 TypeId::M_IT_TA_1 => {
-                    e.cp24time2a(v.time);
+                    e.cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_IT_TB_1 => {
-                    e.cp56time2a(v.time);
+                    e.cp56time2a_tag(v.time, v.time_flags);
                 }
                 _ => return Err(Error::TypeIdNotMatch),
             }
@@ -1109,11 +1184,16 @@ impl Asdu {
             let value = r.binary_counter_reading()?;
             let time = match self.type_id() {
                 TypeId::M_IT_NA_1 => None,
-                TypeId::M_IT_TA_1 => r.cp24time2a()?,
-                TypeId::M_IT_TB_1 => r.cp56time2a()?,
+                TypeId::M_IT_TA_1 => r.cp24time2a_tag()?,
+                TypeId::M_IT_TB_1 => r.cp56time2a_tag()?,
                 _ => return Err(Error::TypeIdNotMatch),
             };
-            out.push(BinaryCounterReadingInfo { ioa, value, time });
+            out.push(BinaryCounterReadingInfo {
+            ioa,
+            value,
+            time,
+            time_flags: r.time_flags(),
+        });
         }
         Ok(out)
     }
@@ -1141,10 +1221,10 @@ impl Asdu {
             e.byte(v.event.value() | (v.qdp.0 & 0xf8)).cp16time2a(v.msec);
             match type_id {
                 TypeId::M_EP_TA_1 => {
-                    e.cp24time2a(v.time);
+                    e.cp24time2a_tag(v.time, v.time_flags);
                 }
                 TypeId::M_EP_TD_1 => {
-                    e.cp56time2a(v.time);
+                    e.cp56time2a_tag(v.time, v.time_flags);
                 }
                 _ => return Err(Error::TypeIdNotMatch),
             }
@@ -1186,8 +1266,8 @@ impl Asdu {
             let value = r.byte()?;
             let msec = r.cp16time2a()?;
             let time = match self.type_id() {
-                TypeId::M_EP_TA_1 => r.cp24time2a()?,
-                TypeId::M_EP_TD_1 => r.cp56time2a()?,
+                TypeId::M_EP_TA_1 => r.cp24time2a_tag()?,
+                TypeId::M_EP_TD_1 => r.cp56time2a_tag()?,
                 _ => return Err(Error::TypeIdNotMatch),
             };
             out.push(EventOfProtectionEquipmentInfo {
@@ -1196,6 +1276,7 @@ impl Asdu {
                 qdp: QualityDescriptorProtection(value & 0xf8),
                 msec,
                 time,
+                time_flags: r.time_flags(),
             });
         }
         Ok(out)
@@ -1223,10 +1304,10 @@ impl Asdu {
             .cp16time2a(info.msec);
         match type_id {
             TypeId::M_EP_TB_1 => {
-                e.cp24time2a(info.time);
+                e.cp24time2a_tag(info.time, info.time_flags);
             }
             TypeId::M_EP_TE_1 => {
-                e.cp56time2a(info.time);
+                e.cp56time2a_tag(info.time, info.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -1266,8 +1347,8 @@ impl Asdu {
         let qdp = QualityDescriptorProtection(r.byte()? & 0xf8);
         let msec = r.cp16time2a()?;
         let time = match self.type_id() {
-            TypeId::M_EP_TB_1 => r.cp24time2a()?,
-            TypeId::M_EP_TE_1 => r.cp56time2a()?,
+            TypeId::M_EP_TB_1 => r.cp24time2a_tag()?,
+            TypeId::M_EP_TE_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
         Ok(PackedStartEventsOfProtectionEquipmentInfo {
@@ -1276,6 +1357,7 @@ impl Asdu {
             qdp,
             msec,
             time,
+            time_flags: r.time_flags(),
         })
     }
 
@@ -1301,10 +1383,10 @@ impl Asdu {
             .cp16time2a(info.msec);
         match type_id {
             TypeId::M_EP_TC_1 => {
-                e.cp24time2a(info.time);
+                e.cp24time2a_tag(info.time, info.time_flags);
             }
             TypeId::M_EP_TF_1 => {
-                e.cp56time2a(info.time);
+                e.cp56time2a_tag(info.time, info.time_flags);
             }
             _ => return Err(Error::TypeIdNotMatch),
         }
@@ -1342,8 +1424,8 @@ impl Asdu {
         let qdp = QualityDescriptorProtection(r.byte()? & 0xf8);
         let msec = r.cp16time2a()?;
         let time = match self.type_id() {
-            TypeId::M_EP_TC_1 => r.cp24time2a()?,
-            TypeId::M_EP_TF_1 => r.cp56time2a()?,
+            TypeId::M_EP_TC_1 => r.cp24time2a_tag()?,
+            TypeId::M_EP_TF_1 => r.cp56time2a_tag()?,
             _ => return Err(Error::TypeIdNotMatch),
         };
         Ok(PackedOutputCircuitInfoInfo {
@@ -1352,6 +1434,7 @@ impl Asdu {
             qdp,
             msec,
             time,
+            time_flags: r.time_flags(),
         })
     }
 
@@ -1430,6 +1513,7 @@ mod tests {
                 value: true,
                 qds: QualityDescriptor::INVALID,
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .unwrap();
@@ -1492,6 +1576,7 @@ mod tests {
                 value: true,
                 qds: QualityDescriptor::GOOD,
                 time,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .unwrap();
@@ -1506,6 +1591,7 @@ mod tests {
                 value: DoublePoint::DeterminedOn,
                 qds: QualityDescriptor::GOOD,
                 time,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .unwrap();
@@ -1524,13 +1610,14 @@ mod tests {
             },
             qds: QualityDescriptor::BLOCKED,
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         };
         let a = Asdu::step(PARAMS_WIDE, false, coa(Cause::SPONTANEOUS), 1, &[info]).unwrap();
         assert_eq!(a.get_step_position().unwrap()[0], info);
     }
 
     #[test]
-    fn measured_float_masks_quality_to_ov_nt_iv() {
+    fn measured_float_quality_drops_only_the_reserved_bits() {
         let a = Asdu::measured_value_float(
             PARAMS_WIDE,
             false,
@@ -1539,9 +1626,11 @@ mod tests {
             &[MeasuredValueFloatInfo {
                 ioa: 400,
                 value: 22.5,
-                // BLOCKED (0x10) and SUBSTITUTED (0x20) are not carried here.
+                // Every bit set: only the reserved bits 1..=3 must be lost,
+                // while OV, BL, SB, NT and IV all survive.
                 qds: QualityDescriptor(0xff),
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .unwrap();
@@ -1557,6 +1646,7 @@ mod tests {
             value: Normalize(16384),
             qds: QualityDescriptor::INVALID,
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         }];
         let a =
             Asdu::measured_value_normal_no_quality(PARAMS_WIDE, false, coa(Cause::PERIODIC), 1, &infos)
@@ -1580,6 +1670,7 @@ mod tests {
                 is_invalid: false,
             },
             time: None,
+            time_flags: TimeTagFlags::GOOD,
         };
         assert!(
             Asdu::integrated_totals(
@@ -1608,6 +1699,7 @@ mod tests {
             qdp: QualityDescriptorProtection::INVALID,
             msec: 1234,
             time: t(),
+            time_flags: TimeTagFlags::GOOD,
         };
         assert_eq!(
             Asdu::event_of_protection_equipment_cp56time2a(
@@ -1636,6 +1728,7 @@ mod tests {
             qdp: QualityDescriptorProtection::BLOCKED,
             msec: 42,
             time: t(),
+            time_flags: TimeTagFlags::GOOD,
         };
         let a =
             Asdu::packed_start_events_cp56time2a(PARAMS_WIDE, coa(Cause::SPONTANEOUS), 1, info)
@@ -1651,6 +1744,7 @@ mod tests {
             qdp: QualityDescriptorProtection::GOOD,
             msec: 7,
             time: t(),
+            time_flags: TimeTagFlags::GOOD,
         };
         let a = Asdu::packed_output_circuit_info_cp56time2a(
             PARAMS_WIDE,
@@ -1767,5 +1861,119 @@ mod tests {
             let b = Asdu::unmarshal_binary(p, &raw).unwrap();
             assert_eq!(a, b, "round trip failed for {}", a.type_id());
         }
+    }
+
+    fn flagged(invalid: bool, substituted: bool) -> TimeTagFlags {
+        TimeTagFlags {
+            invalid,
+            substituted,
+        }
+    }
+
+    #[test]
+    fn time_tag_flags_survive_a_wire_round_trip() {
+        let t = chrono::Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap();
+        for flags in [
+            flagged(false, false),
+            flagged(true, false),
+            flagged(false, true),
+            flagged(true, true),
+        ] {
+            // CP56Time2a.
+            let a = Asdu::single_cp56time2a(
+                PARAMS_WIDE,
+                coa(Cause::SPONTANEOUS),
+                1,
+                &[SinglePointInfo {
+                    ioa: 1,
+                    value: true,
+                    time: Some(t),
+                    time_flags: flags,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            let back = Asdu::unmarshal_binary(PARAMS_WIDE, &a.marshal_binary().unwrap()).unwrap();
+            let got = back.get_single_point().unwrap()[0];
+            assert_eq!(got.time_flags, flags);
+            assert_eq!(got.time, Some(t), "the reading is kept for {flags:?}");
+
+            // CP24Time2a, in another family.
+            let a = Asdu::measured_value_float_cp24time2a(
+                PARAMS_WIDE,
+                coa(Cause::SPONTANEOUS),
+                1,
+                &[MeasuredValueFloatInfo {
+                    ioa: 2,
+                    value: 1.5,
+                    time: Some(chrono::Utc::now()),
+                    time_flags: flags,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            assert_eq!(a.get_measured_value_float().unwrap()[0].time_flags, flags);
+        }
+    }
+
+    #[test]
+    fn the_flags_sit_in_the_minutes_octet_where_the_standard_puts_them() {
+        let t = chrono::Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap();
+        let a = Asdu::double_cp56time2a(
+            PARAMS_WIDE,
+            coa(Cause::SPONTANEOUS),
+            1,
+            &[DoublePointInfo {
+                ioa: 1,
+                value: DoublePoint::DeterminedOn,
+                time: Some(t),
+                time_flags: flagged(true, true),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        // IOA(3) + DIQ(1), then the tag: ms(2), minutes.
+        let minutes = a.info_obj[3 + 1 + 2];
+        assert_eq!(minutes & 0xc0, 0xc0, "IV in bit 7, SB in bit 6");
+        assert_eq!(minutes & 0x3f, 6);
+    }
+
+    #[test]
+    fn an_invalid_time_from_a_peer_is_reported_not_dropped() {
+        // A device whose clock is not synchronized still tags its events. The
+        // reading is kept — the order of events is worth having — and the
+        // flag says it must not be taken as the event time.
+        let t = chrono::Utc.with_ymd_and_hms(2026, 3, 4, 5, 6, 7).unwrap();
+        let mut a = Asdu::single_cp56time2a(
+            PARAMS_WIDE,
+            coa(Cause::SPONTANEOUS),
+            1,
+            &[SinglePointInfo {
+                ioa: 1,
+                value: true,
+                time: Some(t),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        a.info_obj[3 + 1 + 2] |= 0x80; // the peer sets IV
+        let got = a.get_single_point().unwrap()[0];
+        assert_eq!(got.time, Some(t));
+        assert!(got.time_flags.invalid);
+        assert!(!got.time_flags.is_valid());
+        assert!(a.to_string().contains("(IV)"), "the log line must show it: {a}");
+    }
+
+    #[test]
+    fn an_untagged_type_reports_good_flags() {
+        let a = Asdu::single(
+            PARAMS_WIDE,
+            false,
+            coa(Cause::SPONTANEOUS),
+            1,
+            &[SinglePointInfo::new(1, true)],
+        )
+        .unwrap();
+        assert_eq!(a.get_single_point().unwrap()[0].time_flags, TimeTagFlags::GOOD);
     }
 }

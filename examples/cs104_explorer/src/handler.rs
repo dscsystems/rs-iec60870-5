@@ -100,9 +100,18 @@ fn bool_str(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
 
-fn ts(t: Option<DateTime<Utc>>) -> String {
-    t.map(|t| t.format("%H:%M:%S%.3f").to_string())
-        .unwrap_or_default()
+/// A time tag for the table, marked when its IV or SB flag is set so an
+/// unsynchronized or substituted time is never mistaken for a good one.
+fn ts(t: Option<DateTime<Utc>>, flags: TimeTagFlags) -> String {
+    let Some(t) = t else { return String::new() };
+    let mut s = t.format("%H:%M:%S%.3f").to_string();
+    if flags.invalid {
+        s.push_str(" IV");
+    }
+    if flags.substituted {
+        s.push_str(" SB");
+    }
+    s
 }
 
 /// Decode the monitor-direction information objects of an ASDU into points.
@@ -114,13 +123,16 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
     let tid = type_name(a.type_id());
     let cause = cause_name(a.coa());
 
-    let mk = |ioa: InfoObjAddr, value: String, quality: String, time: Option<DateTime<Utc>>| Point {
+    let mk = |ioa: InfoObjAddr,
+              value: String,
+              quality: String,
+              (time, flags): (Option<DateTime<Utc>>, TimeTagFlags)| Point {
         ioa,
         type_name: tid.clone(),
         value,
         quality,
         cause: cause.clone(),
-        time: ts(time),
+        time: ts(time, flags),
         count: 0,
     };
 
@@ -129,7 +141,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
             .get_single_point()
             .map(|v| {
                 v.into_iter()
-                    .map(|p| mk(p.ioa, bool_str(p.value).into(), p.qds.to_string(), p.time))
+                    .map(|p| mk(p.ioa, bool_str(p.value).into(), p.qds.to_string(), (p.time, p.time_flags)))
                     .collect()
             })
             .unwrap_or_default(),
@@ -138,7 +150,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
             .get_double_point()
             .map(|v| {
                 v.into_iter()
-                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), p.time))
+                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), (p.time, p.time_flags)))
                     .collect()
             })
             .unwrap_or_default(),
@@ -152,7 +164,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
                         if p.value.has_transient {
                             value.push_str(" (transient)");
                         }
-                        mk(p.ioa, value, p.qds.to_string(), p.time)
+                        mk(p.ioa, value, p.qds.to_string(), (p.time, p.time_flags))
                     })
                     .collect()
             })
@@ -167,7 +179,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
                             p.ioa,
                             format!("0x{:08X}", p.value),
                             p.qds.to_string(),
-                            p.time,
+                            (p.time, p.time_flags),
                         )
                     })
                     .collect()
@@ -183,7 +195,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
                             p.ioa,
                             format!("{:.5}", p.value.f64()),
                             p.qds.to_string(),
-                            p.time,
+                            (p.time, p.time_flags),
                         )
                     })
                     .collect()
@@ -194,7 +206,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
             .get_measured_value_scaled()
             .map(|v| {
                 v.into_iter()
-                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), p.time))
+                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), (p.time, p.time_flags)))
                     .collect()
             })
             .unwrap_or_default(),
@@ -203,7 +215,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
             .get_measured_value_float()
             .map(|v| {
                 v.into_iter()
-                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), p.time))
+                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), (p.time, p.time_flags)))
                     .collect()
             })
             .unwrap_or_default(),
@@ -226,7 +238,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
                         if p.value.is_adjusted {
                             flags.push("CA");
                         }
-                        mk(p.ioa, value, flags.join(","), p.time)
+                        mk(p.ioa, value, flags.join(","), (p.time, p.time_flags))
                     })
                     .collect()
             })
@@ -241,7 +253,7 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
                             p.ioa,
                             format!("ST 0x{:04X} CD 0x{:04X}", p.scd.status(), p.scd.change_detection()),
                             p.qds.to_string(),
-                            None,
+                            (None, TimeTagFlags::GOOD),
                         )
                     })
                     .collect()
@@ -275,6 +287,7 @@ mod tests {
                     value: false,
                     qds: QualityDescriptor::INVALID,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             ],
         )
@@ -303,6 +316,7 @@ mod tests {
                 value: true,
                 qds: QualityDescriptor::GOOD,
                 time: Some(t),
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .unwrap();
@@ -435,6 +449,7 @@ mod tests {
                     is_invalid: true,
                 },
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .unwrap();

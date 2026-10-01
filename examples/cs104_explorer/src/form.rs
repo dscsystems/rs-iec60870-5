@@ -147,6 +147,7 @@ pub fn build(input: &FormInput<'_>) -> Result<Asdu, String> {
                 value: parse_bool(value),
                 qoc,
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             },
         ),
 
@@ -160,6 +161,7 @@ pub fn build(input: &FormInput<'_>) -> Result<Asdu, String> {
                 value: parse_double(value),
                 qoc,
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             },
         ),
 
@@ -173,6 +175,7 @@ pub fn build(input: &FormInput<'_>) -> Result<Asdu, String> {
                 value: parse_step(value),
                 qoc,
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             },
         ),
 
@@ -191,6 +194,7 @@ pub fn build(input: &FormInput<'_>) -> Result<Asdu, String> {
                     value: v,
                     qos,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             )
         }
@@ -210,6 +214,7 @@ pub fn build(input: &FormInput<'_>) -> Result<Asdu, String> {
                     value: v,
                     qos,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             )
         }
@@ -229,6 +234,7 @@ pub fn build(input: &FormInput<'_>) -> Result<Asdu, String> {
                     value: Normalize::from_f64(clamp_norm(v)),
                     qos,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             )
         }
@@ -244,6 +250,7 @@ pub fn build(input: &FormInput<'_>) -> Result<Asdu, String> {
                     ioa,
                     value: v,
                     time: None,
+                    time_flags: TimeTagFlags::GOOD,
                 },
             )
         }

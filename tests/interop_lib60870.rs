@@ -2,9 +2,12 @@
 // Source-available under the DSC Systems Source-Available License; see LICENSE.
 
 //! Live IEC 104 and file codec checks against lib60870-C's public API.
-#![cfg(feature = "cs104")]
+#![cfg(all(feature = "cs104", feature = "filetransfer"))]
 mod common;
 use common::*;
+#[path = "support/file_receiver.rs"]
+mod file_receiver;
+use file_receiver::Receiver;
 use rs_iec60870_5::{asdu::*, cs104::*, filetransfer::*};
 use std::{
     path::{Path, PathBuf},
@@ -121,6 +124,7 @@ async fn rust_master_with_lib60870_outstation() {
                     ..Default::default()
                 },
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             },
         )
         .await
@@ -225,9 +229,9 @@ impl ServerHandler for Outstation {
 async fn lib60870_master_with_rust_outstation() {
     let Some(bin) = lib_bin() else { return };
     let store = Arc::new(MemStore::new());
-    store.write(100, 2, &fixture()).unwrap();
-    let mut sender = Sender::new(store);
-    sender.set_section_size(256).unwrap();
+    store.insert(100, NameOfFile(2), fixture());
+    let sender = Sender::new(store);
+    sender.set_section_size(256);
     let server = Server::new(Outstation {
         sender: Mutex::new(sender),
     });
@@ -270,9 +274,9 @@ fn file_codecs_match_lib60870_byte_for_byte() {
             1,
             FileReadyInfo {
                 ioa: 100,
-                nof: 2,
+                nof: NameOfFile(2),
                 length_of_file: 600,
-                frq: 0,
+                frq: FileReadyQualifier::parse(0),
             },
         )
         .unwrap(),
@@ -282,10 +286,10 @@ fn file_codecs_match_lib60870_byte_for_byte() {
             1,
             SectionReadyInfo {
                 ioa: 100,
-                nof: 2,
+                nof: NameOfFile(2),
                 nos: 1,
                 length_of_section: 600,
-                srq: 0,
+                srq: SectionReadyQualifier::parse(0),
             },
         )
         .unwrap(),
@@ -295,9 +299,9 @@ fn file_codecs_match_lib60870_byte_for_byte() {
             1,
             CallOrSelectFileInfo {
                 ioa: 100,
-                nof: 2,
+                nof: NameOfFile(2),
                 nos: 1,
-                scq: 6,
+                scq: SelectAndCallQualifier::parse(6),
             },
         )
         .unwrap(),
@@ -307,9 +311,9 @@ fn file_codecs_match_lib60870_byte_for_byte() {
             1,
             LastSectionOrSegmentInfo {
                 ioa: 100,
-                nof: 2,
+                nof: NameOfFile(2),
                 nos: 1,
-                lsq: 3,
+                lsq: LastSectionQualifier(3),
                 chs: 42,
             },
         )
@@ -320,9 +324,9 @@ fn file_codecs_match_lib60870_byte_for_byte() {
             1,
             AckFileOrSectionInfo {
                 ioa: 100,
-                nof: 2,
+                nof: NameOfFile(2),
                 nos: 1,
-                afq: 3,
+                afq: AckFileOrSectionQualifier::parse(3),
             },
         )
         .unwrap(),
@@ -330,9 +334,9 @@ fn file_codecs_match_lib60870_byte_for_byte() {
             p,
             c,
             1,
-            SegmentInfo {
+            &SegmentInfo {
                 ioa: 100,
-                nof: 2,
+                nof: NameOfFile(2),
                 nos: 1,
                 segment: fixture()[..236].to_vec(),
             },
@@ -344,10 +348,11 @@ fn file_codecs_match_lib60870_byte_for_byte() {
             1,
             &[DirectoryInfo {
                 ioa: 100,
-                nof: 2,
+                nof: NameOfFile(2),
                 length_of_file: 600,
-                sof: 32,
+                sof: StatusOfFile::parse(32),
                 time: Some(time),
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .unwrap(),
@@ -417,9 +422,9 @@ async fn file_transfer_with_current_go_outstation() {
 async fn file_transfer_with_current_go_master() {
     let Some(bins) = go_bins() else { return };
     let store = Arc::new(MemStore::new());
-    store.write(100, 2, &fixture()).unwrap();
-    let mut sender = Sender::new(store);
-    sender.set_section_size(256).unwrap();
+    store.insert(100, NameOfFile(2), fixture());
+    let sender = Sender::new(store);
+    sender.set_section_size(256);
     let server = Server::new(Outstation {
         sender: Mutex::new(sender),
     });
@@ -517,6 +522,7 @@ async fn rust_101_primary_with_lib60870_secondary() {
                     ..Default::default()
                 },
                 time: None,
+                time_flags: TimeTagFlags::GOOD,
             },
         )
         .await
