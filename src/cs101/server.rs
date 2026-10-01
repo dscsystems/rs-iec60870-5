@@ -114,7 +114,8 @@ impl<H: ServerHandler> Server<H> {
     pub fn with_config(mut self: Arc<Self>, mut config: Config) -> Result<Arc<Self>> {
         config.valid()?;
         let s = Arc::get_mut(&mut self).ok_or(Error::Config("configure before starting"))?;
-        let shared = Arc::get_mut(&mut s.shared).ok_or(Error::Config("configure before starting"))?;
+        let shared =
+            Arc::get_mut(&mut s.shared).ok_or(Error::Config("configure before starting"))?;
         shared.max_queue = config.max_send_queue_size;
         shared.balanced = config.is_balanced();
         s.config = config;
@@ -294,7 +295,7 @@ impl<H: ServerHandler> Server<H> {
         self
     }
 
-    async fn run_link(&self, stream: LinkStream) {
+    async fn run_link(self: &Arc<Self>, stream: LinkStream) {
         let cfg = &self.config;
         let addr_size = cfg.link_addr_size;
 
@@ -302,6 +303,24 @@ impl<H: ServerHandler> Server<H> {
         let (tx_frame, mut rx_frame) = mpsc::channel::<Frame>(20);
         let (tx_out, mut rx_out) = mpsc::channel::<Vec<u8>>(20);
         let (stop_tx, stop_rx) = watch::channel(false);
+
+        // Application handlers may wait for outgoing queue room. Run them in
+        // order outside the link driver so acknowledgements and polls continue.
+        let (asdu_tx, mut asdu_rx) = mpsc::unbounded_channel::<Asdu>();
+        let endpoint = Arc::clone(self);
+        let mut stop = stop_rx.clone();
+        let dispatcher_task = tokio::spawn(async move {
+            loop {
+                let pack = tokio::select! {
+                    _ = stop.changed() => break,
+                    pack = asdu_rx.recv() => match pack { Some(pack) => pack, None => break },
+                };
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = dispatch_server(&*endpoint.handler, endpoint.as_connect(), &pack, endpoint.server_number) => {},
+                }
+            }
+        });
 
         let reader_task = {
             let mut stop = stop_rx.clone();
@@ -370,13 +389,7 @@ impl<H: ServerHandler> Server<H> {
                     if let Some(raw) = outcome.asdu {
                         match Asdu::unmarshal_binary(self.shared.params, &raw) {
                             Ok(pack) => {
-                                dispatch_server(
-                                    &*self.handler,
-                                    self.as_connect(),
-                                    &pack,
-                                    self.server_number,
-                                )
-                                .await
+                                let _ = asdu_tx.send(pack);
                             }
                             Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
                         }
@@ -394,7 +407,7 @@ impl<H: ServerHandler> Server<H> {
 
         let _ = stop_tx.send(true);
         drop(tx_out);
-        let _ = tokio::join!(reader_task, writer_task);
+        let _ = tokio::join!(reader_task, writer_task, dispatcher_task);
     }
 }
 
@@ -806,8 +819,8 @@ impl SecondaryState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cs101::frame::{SINGLE_CHAR_ACK, START_FIXED};
     use crate::asdu::PARAMS_STANDARD_101;
+    use crate::cs101::frame::{SINGLE_CHAR_ACK, START_FIXED};
 
     fn shared() -> Shared {
         Shared {
@@ -838,9 +851,16 @@ mod tests {
     fn primary_frame(fun: u8, fcv: bool, fcb: bool, addr: u16, asdu: Vec<u8>) -> Frame {
         let control = ControlField::primary(fun, fcv, fcb, false);
         if asdu.is_empty() {
-            Frame::Fixed { control, link_addr: addr }
+            Frame::Fixed {
+                control,
+                link_addr: addr,
+            }
         } else {
-            Frame::Variable { control, link_addr: addr, asdu }
+            Frame::Variable {
+                control,
+                link_addr: addr,
+                asdu,
+            }
         }
     }
 
@@ -852,11 +872,20 @@ mod tests {
     async fn a_broadcast_of_unconfirmed_user_data_is_delivered_but_not_answered() {
         let (mut sec, cfg, mut rx) = secondary();
         let sh = shared();
-        let f = primary_frame(prim_fc::USER_DATA_NO_CONF, false, false, 0xff, vec![1, 2, 3]);
+        let f = primary_frame(
+            prim_fc::USER_DATA_NO_CONF,
+            false,
+            false,
+            0xff,
+            vec![1, 2, 3],
+        );
 
         let out = sec.handle_frame(&f, &sh, &cfg).await;
         assert_eq!(out.asdu, Some(vec![1, 2, 3]), "the ASDU is still delivered");
-        assert!(rx.try_recv().is_err(), "but nothing may go back on the line");
+        assert!(
+            rx.try_recv().is_err(),
+            "but nothing may go back on the line"
+        );
     }
 
     #[tokio::test]
@@ -921,7 +950,10 @@ mod tests {
 
             let out = sec.handle_frame(&f, &sh, &cfg).await;
             assert!(!out.link_became_active, "fc {fun}");
-            assert!(rx.try_recv().is_err(), "fc {fun} with FCV={fcv} was answered");
+            assert!(
+                rx.try_recv().is_err(),
+                "fc {fun} with FCV={fcv} was answered"
+            );
             assert_eq!(sec.fcb_expected, before, "fc {fun} moved the FCB");
         }
     }
@@ -961,7 +993,10 @@ mod tests {
         // the waiting events from the primary.
         let (mut sec, cfg, mut rx) = e5_secondary();
         let sh = shared();
-        sh.class1.lock().unwrap().push_back(crate::asdu::Asdu::new_empty(PARAMS_STANDARD_101));
+        sh.class1
+            .lock()
+            .unwrap()
+            .push_back(crate::asdu::Asdu::new_empty(PARAMS_STANDARD_101));
         let f = primary_frame(prim_fc::RESET_LINK, false, false, 1, Vec::new());
         sec.handle_frame(&f, &sh, &cfg).await;
         let raw = rx.try_recv().unwrap();

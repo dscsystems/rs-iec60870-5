@@ -1,0 +1,40 @@
+name: Interoperability
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - uses: actions/checkout@v4
+        with:
+          repository: riclolsen/go-iecp5
+          ref: 778fe38466157a0acf7a5db39949ced1b2bfa68b
+          path: tests/interop/go-iecp5
+      - uses: actions/checkout@v4
+        with:
+          repository: mz-automation/lib60870
+          ref: 7a388e3e133999e1ca77ba7521d55d074b7cd2bc
+          path: tests/interop/lib60870-upstream
+      - name: Build lib60870-C
+        run: make -C tests/interop/lib60870-upstream/lib60870-C -j2
+      - name: Test all protocols and reference peers
+        run: cargo test --all-features --locked
+        env:
+          LIB60870_ROOT: ${{ github.workspace }}/tests/interop/lib60870-upstream/lib60870-C
+          IEC60870_INTEROP_REQUIRED: '1'
+      - name: Check optional feature combinations
+        run: |
+          cargo test --no-default-features --locked
+          cargo check --no-default-features --features cs101,tls --locked
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

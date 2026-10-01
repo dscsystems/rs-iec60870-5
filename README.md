@@ -31,6 +31,8 @@ Vocabulary: *master* = controlling station = client; *outstation* = RTU = slave
 ### IEC 104 controlled station
 
 ```rust,no_run
+# #[cfg(feature = "cs104")]
+# mod example {
 use rs_iec60870_5::asdu::*;
 use rs_iec60870_5::cs104::{Server, ServerHandler};
 
@@ -93,11 +95,14 @@ tokio::spawn(async move {
 
 srv.listen_and_serve("0.0.0.0:2404").await
 # }
+# }
 ```
 
 ### IEC 104 master
 
 ```rust,no_run
+# #[cfg(feature = "cs104")]
+# mod example {
 use rs_iec60870_5::asdu::*;
 use rs_iec60870_5::cs104::{Client, ClientHandler, ClientOption};
 
@@ -130,6 +135,7 @@ client
     )
     .await
 # }
+# }
 ```
 
 A 104 connection starts in STOPDT and carries nothing until `STARTDT` is
@@ -143,6 +149,10 @@ is reached through a terminal server. Only the transport changes — the handler
 and the ASDUs are identical:
 
 ```rust
+# #[cfg(feature = "cs101")]
+# mod example {
+# #[test]
+# fn configure() {
 use rs_iec60870_5::cs101::{Config, SerialConfig, TcpConfig, TransportType};
 
 // A local serial port: 8E1 is the standard framing, and the default.
@@ -155,6 +165,8 @@ let mut cfg = Config::new();
 cfg.transport = TransportType::TcpClient;       // or TcpServer to listen
 cfg.tcp = TcpConfig { address: "10.0.0.9:2400".into(), ..Default::default() };
 # assert_eq!(cfg.transport_label(), "10.0.0.9:2400");
+# }
+# }
 ```
 
 The serial transport needs the `serial` feature. TCP encapsulation is still

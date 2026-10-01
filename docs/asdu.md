@@ -521,3 +521,8 @@ failing. With the `serde` feature the ASDU types also derive `Serialize` and
 [`Error::LengthOutOfRange`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 [`Error::BufferFull`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 [`Error::SendQueueFull`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
+
+`Connect::send_until(asdu, deadline)` retries `BufferFull` and `SendQueueFull`
+until an absolute Tokio deadline. Other errors return immediately. File transfer
+uses this method automatically; the IEC 104 server override preserves per-group
+routing and retries only refused copies.

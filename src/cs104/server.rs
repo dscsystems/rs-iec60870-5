@@ -18,8 +18,8 @@ use crate::cs104::config::Config;
 use crate::cs104::connection::{Callbacks, Connection, Role, RunOptions, run};
 use crate::cs104::handler::{ServerDispatcher, ServerHandler};
 use crate::cs104::redundancy::{Groups, Route, ServerMode, outcome};
-use crate::net::{TlsServerConfig, accept_stream, connect_endpoint};
 use crate::error::{Error, Result};
+use crate::net::{TlsServerConfig, accept_stream, connect_endpoint};
 
 /// Tracks the live sessions of a controlled station.
 #[derive(Default)]
@@ -246,7 +246,12 @@ impl<H: ServerHandler> Server<H> {
         Ok(())
     }
 
-    async fn serve_one(self: Arc<Self>, tcp: tokio::net::TcpStream, peer: SocketAddr, group: usize) {
+    async fn serve_one(
+        self: Arc<Self>,
+        tcp: tokio::net::TcpStream,
+        peer: SocketAddr,
+        group: usize,
+    ) {
         let stream = match accept_stream(tcp, self.tls.as_ref()).await {
             Ok(s) => s,
             Err(e) => {
@@ -272,16 +277,10 @@ impl<H: ServerHandler> Server<H> {
         let sessions = Arc::clone(&self.sessions);
         let groups = Arc::clone(&self.groups);
         let mut joined: Option<(usize, Arc<Connection>)> = None;
-        run(
-            stream,
-            opts,
-            dispatcher,
-            self.shutdown.subscribe(),
-            |c| {
-                groups.lock().unwrap().join(group, Arc::clone(&c));
-                joined = Some((sessions.insert(Arc::clone(&c)), c));
-            },
-        )
+        run(stream, opts, dispatcher, self.shutdown.subscribe(), |c| {
+            groups.lock().unwrap().join(group, Arc::clone(&c));
+            joined = Some((sessions.insert(Arc::clone(&c)), c));
+        })
         .await;
 
         if let Some((id, conn)) = joined {
@@ -335,6 +334,15 @@ fn server_callbacks<H: ServerHandler>(
 impl<H: ServerHandler> Connect for Server<H> {
     fn params(&self) -> Params {
         self.params
+    }
+
+    async fn send_until(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        Server::send_wait(
+            self,
+            a,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
     }
 
     /// Broadcast a copy of `a`, once per redundancy group: to the group's

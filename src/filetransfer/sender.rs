@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use crate::asdu::{
     AckFileOrSectionInfo, AckFileOrSectionQualifier, AfqAction, Asdu, CallOrSelectFileInfo, Cause,
     CauseOfTransmission, CommonAddr, Connect, DirectoryInfo, FileError, FileReadyInfo, InfoObjAddr,
-    LastSectionOrSegmentInfo, LastSectionQualifier, NameOfFile, Params, ScqAction, SectionReadyInfo,
-    SegmentInfo, StatusOfFile, TimeTagFlags, TypeId, file_checksum,
+    LastSectionOrSegmentInfo, LastSectionQualifier, NameOfFile, Params, ScqAction,
+    SectionReadyInfo, SegmentInfo, StatusOfFile, TimeTagFlags, TypeId, file_checksum,
 };
 use crate::error::{Error, Result};
 use crate::filetransfer::store::{Store, is_file_asdu, split_sections};
@@ -158,17 +158,20 @@ impl Sender {
         nof: NameOfFile,
     ) -> Result<()> {
         let data = self.store.read(ioa, nof).await?;
-        conn.send(Asdu::file_ready(
-            conn.params(),
-            transfer(),
-            ca,
-            FileReadyInfo {
-                ioa,
-                nof,
-                length_of_file: data.len() as u32,
-                frq: Default::default(),
-            },
-        )?)
+        super::send(
+            conn,
+            Asdu::file_ready(
+                conn.params(),
+                transfer(),
+                ca,
+                FileReadyInfo {
+                    ioa,
+                    nof,
+                    length_of_file: data.len() as u32,
+                    frq: Default::default(),
+                },
+            )?,
+        )
         .await
     }
 
@@ -192,7 +195,7 @@ impl Sender {
         // send is synchronous cannot re-enter this state machine while it is
         // held.
         for asdu in reply.send {
-            if let Err(e) = conn.send(asdu).await {
+            if let Err(e) = super::send(conn, asdu).await {
                 self.abort();
                 return Err(e);
             }
@@ -370,8 +373,15 @@ impl Sender {
                 time_flags: TimeTagFlags::GOOD,
             })
             .collect();
-        Asdu::file_directory(params, CauseOfTransmission::new(Cause::REQUEST), ca, &infos)
-            .map(|a| vec![a])
+        let capacity = ((crate::asdu::ASDU_SIZE_MAX - params.identifier_size())
+            / (params.info_obj_addr_size as usize + 13))
+            .min(127);
+        infos
+            .chunks(capacity)
+            .map(|batch| {
+                Asdu::file_directory(params, CauseOfTransmission::new(Cause::REQUEST), ca, batch)
+            })
+            .collect::<Result<Vec<_>>>()
             .into()
     }
 

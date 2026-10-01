@@ -18,6 +18,8 @@
 //! # Quick start: IEC 104 master
 //!
 //! ```no_run
+//! # #[cfg(feature = "cs104")]
+//! # mod example {
 //! use rs_iec60870_5::asdu::*;
 //! use rs_iec60870_5::cs104::{Client, ClientOption};
 //!
@@ -42,6 +44,7 @@
 //!         .await?;
 //!     Ok(())
 //! }
+//! # }
 //! ```
 //!
 //! # Interoperability

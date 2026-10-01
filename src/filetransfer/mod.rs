@@ -85,3 +85,12 @@ pub use store::{Entry, MemStore, Store};
 
 #[cfg(test)]
 mod tests;
+
+/// Bound backpressure without stopping the protocol driver.
+async fn send(conn: &dyn crate::asdu::Connect, asdu: crate::asdu::Asdu) -> crate::Result<()> {
+    conn.send_until(
+        asdu,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .await
+}

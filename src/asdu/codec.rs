@@ -146,7 +146,11 @@ impl Asdu {
 
     /// Serialise to the wire format.
     pub fn marshal_binary(&self) -> Result<Vec<u8>> {
+        self.params.valid()?;
         let id = &self.identifier;
+        if id.type_id.0 == 0 || !(1..=127).contains(&id.variable.number) {
+            return Err(Error::InfoObjIndexFit);
+        }
         if id.coa.cause == Cause::UNUSED {
             return Err(Error::CauseZero);
         }
@@ -167,6 +171,14 @@ impl Asdu {
         let len = self.params.identifier_size() + self.info_obj.len();
         if len > ASDU_SIZE_MAX {
             return Err(Error::LengthOutOfRange);
+        }
+
+        // Known layouts must account for every outgoing octet. Private types
+        // keep application-defined layouts; lenient padding is inbound only.
+        if id.type_id.info_obj_size().is_ok() || id.type_id == TypeId::F_SG_NA_1 {
+            let mut checked = self.clone();
+            checked.params.allow_trailing_octets = false;
+            checked.fix_info_obj_size()?;
         }
 
         let mut raw = Vec::with_capacity(len);
@@ -196,8 +208,9 @@ impl Asdu {
     /// by the type identification and the variable structure qualifier; a
     /// payload shorter than that is rejected with [`Error::UnexpectedEof`].
     pub fn unmarshal_binary(params: Params, raw: &[u8]) -> Result<Asdu> {
-        if !(1..=2).contains(&params.cause_size) || !(1..=2).contains(&params.common_addr_size) {
-            return Err(Error::Param);
+        params.valid()?;
+        if raw.len() > ASDU_SIZE_MAX {
+            return Err(Error::LengthOutOfRange);
         }
         let len_dui = params.identifier_size();
         if len_dui > raw.len() {
@@ -239,6 +252,13 @@ impl Asdu {
     /// [`Params::allow_trailing_octets`](crate::asdu::Params::allow_trailing_octets)
     /// is set, in which case the surplus is discarded.
     pub fn fix_info_obj_size(&mut self) -> Result<()> {
+        let v = self.identifier.variable;
+        if !(1..=127).contains(&v.number)
+            || ((120..=126).contains(&self.type_id().0)
+                && (v.is_sequence || (self.type_id() != TypeId::F_DR_TA_1 && v.number != 1)))
+        {
+            return Err(Error::InfoObjIndexFit);
+        }
         // A variable-length object carries its own length, so "expected" is
         // only meaningful once that octet is present.
         let size = match self.variable_info_obj_size() {
@@ -362,8 +382,7 @@ impl Encoder<'_> {
                 if addr > 16_777_215 {
                     return Err(Error::InfoObjAddrFit);
                 }
-                self.buf
-                    .extend_from_slice(&addr.to_le_bytes()[..3]);
+                self.buf.extend_from_slice(&addr.to_le_bytes()[..3]);
             }
             _ => return Err(Error::Param),
         }
@@ -707,10 +726,7 @@ mod tests {
 
     #[test]
     fn round_trip_through_unmarshal() {
-        let mut a = Asdu::new(
-            PARAMS_WIDE,
-            ident(TypeId::M_ME_NC_1, 2, Cause::PERIODIC, 1),
-        );
+        let mut a = Asdu::new(PARAMS_WIDE, ident(TypeId::M_ME_NC_1, 2, Cause::PERIODIC, 1));
         {
             let mut e = a.encoder();
             e.info_obj_addr(100).unwrap().f32(1.5).byte(0);
@@ -768,7 +784,10 @@ mod tests {
         // One M_SP_NA_1 object: 3 address octets + 1 value octet.
         let exact = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01];
         assert_eq!(
-            Asdu::unmarshal_binary(PARAMS_WIDE, &exact).unwrap().info_obj.len(),
+            Asdu::unmarshal_binary(PARAMS_WIDE, &exact)
+                .unwrap()
+                .info_obj
+                .len(),
             4
         );
 
@@ -804,7 +823,7 @@ mod tests {
         let raw = [
             125u8, 1, 13, 0, 1, 0, // identifier: F_SG_NA_1, 1 object, FileTransfer, CA 1
             0x64, 0, 0, // IOA 100
-            0x02, 0, // NOF
+            0x02, 0,    // NOF
             0x01, // NOS
             0x03, // LOS = 3
             0xaa, 0xbb, 0xcc,
@@ -854,7 +873,12 @@ mod tests {
                 1,
             ),
         );
-        a.encoder().info_obj_addr(100).unwrap().byte(1).byte(0).byte(1);
+        a.encoder()
+            .info_obj_addr(100)
+            .unwrap()
+            .byte(1)
+            .byte(0)
+            .byte(1);
         let mut r = a.reader();
         let mut addr = 0;
         for i in 0..3 {
@@ -866,7 +890,10 @@ mod tests {
 
     #[test]
     fn reader_reports_truncation_instead_of_panicking() {
-        let a = Asdu::new(PARAMS_WIDE, ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1));
+        let a = Asdu::new(
+            PARAMS_WIDE,
+            ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1),
+        );
         let mut r = a.reader();
         assert_eq!(r.byte(), Err(Error::UnexpectedEof));
         assert_eq!(r.cp56time2a(), Err(Error::UnexpectedEof));
@@ -874,12 +901,18 @@ mod tests {
 
     #[test]
     fn encoder_enforces_the_address_width() {
-        let mut a = Asdu::new(PARAMS_NARROW, ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1));
+        let mut a = Asdu::new(
+            PARAMS_NARROW,
+            ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1),
+        );
         assert_eq!(
             a.encoder().info_obj_addr(256).err(),
             Some(Error::InfoObjAddrFit)
         );
-        let mut a = Asdu::new(PARAMS_WIDE, ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1));
+        let mut a = Asdu::new(
+            PARAMS_WIDE,
+            ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1),
+        );
         assert!(a.encoder().info_obj_addr(16_777_215).is_ok());
         assert_eq!(
             a.encoder().info_obj_addr(16_777_216).err(),
@@ -927,7 +960,10 @@ mod tests {
             is_adjusted: false,
             is_invalid: true,
         };
-        let mut a = Asdu::new(PARAMS_WIDE, ident(TypeId::M_IT_NA_1, 1, Cause::SPONTANEOUS, 1));
+        let mut a = Asdu::new(
+            PARAMS_WIDE,
+            ident(TypeId::M_IT_NA_1, 1, Cause::SPONTANEOUS, 1),
+        );
         a.encoder().binary_counter_reading(bcr);
         assert_eq!(a.reader().binary_counter_reading().unwrap(), bcr);
     }

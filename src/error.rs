@@ -54,7 +54,10 @@ pub enum Error {
     InroGroupNumFit,
 
     /// The encoded ASDU would exceed the 249 octet maximum.
-    #[error("asdu: asdu field length larger than max {}", crate::asdu::ASDU_SIZE_MAX)]
+    #[error(
+        "asdu: asdu field length larger than max {}",
+        crate::asdu::ASDU_SIZE_MAX
+    )]
     LengthOutOfRange,
 
     /// A send helper was called without any information object.
@@ -72,6 +75,10 @@ pub enum Error {
     /// The buffer ended before the ASDU was complete.
     #[error("asdu: unexpected end of information object buffer")]
     UnexpectedEof,
+
+    /// A bounded send exhausted its deadline.
+    #[error("send deadline expired")]
+    SendTimeout,
 
     // -- file transfer ----------------------------------------------------
     /// The requested file does not exist in the store.
@@ -182,8 +189,14 @@ impl PartialEq for Error {
             (Frame(a), Frame(b)) => a == b,
             (Apci(a), Apci(b)) => a == b,
             (
-                PartialBroadcast { failed: fa, total: ta },
-                PartialBroadcast { failed: fb, total: tb },
+                PartialBroadcast {
+                    failed: fa,
+                    total: ta,
+                },
+                PartialBroadcast {
+                    failed: fb,
+                    total: tb,
+                },
             ) => fa == fb && ta == tb,
             (Config(a), Config(b)) => a == b,
             (InvalidAddress(a), InvalidAddress(b)) => a == b,

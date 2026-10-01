@@ -29,6 +29,26 @@ pub trait Connect: Send + Sync {
     /// Queue an ASDU for transmission.
     async fn send(&self, a: Asdu) -> Result<()>;
 
+    /// Send with bounded backpressure, retrying only queue-full errors.
+    /// Dropping this future cancels the wait.
+    async fn send_until(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        loop {
+            match self.send(a.clone()).await {
+                Err(crate::Error::BufferFull | crate::Error::SendQueueFull) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(crate::Error::SendTimeout);
+                    }
+                    tokio::time::sleep_until(
+                        deadline
+                            .min(tokio::time::Instant::now() + std::time::Duration::from_millis(2)),
+                    )
+                    .await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// The remote address, when the endpoint has a single one.
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         None
@@ -45,6 +65,10 @@ impl<T: Connect + ?Sized> Connect for &T {
         (**self).send(a).await
     }
 
+    async fn send_until(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        (**self).send_until(a, deadline).await
+    }
+
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         (**self).peer_addr()
     }
@@ -58,6 +82,10 @@ impl<T: Connect + ?Sized> Connect for std::sync::Arc<T> {
 
     async fn send(&self, a: Asdu) -> Result<()> {
         (**self).send(a).await
+    }
+
+    async fn send_until(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        (**self).send_until(a, deadline).await
     }
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
@@ -207,8 +235,14 @@ pub trait ConnectExt: Connect {
         ca: CommonAddr,
         infos: &[BitString32Info],
     ) -> Result<()> {
-        self.send(Asdu::bitstring32(self.params(), is_sequence, coa, ca, infos)?)
-            .await
+        self.send(Asdu::bitstring32(
+            self.params(),
+            is_sequence,
+            coa,
+            ca,
+            infos,
+        )?)
+        .await
     }
 
     /// Send `M_BO_TA_1`: bit string of 32 bits with a CP24Time2a time tag.
@@ -713,8 +747,13 @@ pub trait ConnectExt: Connect {
         ca: CommonAddr,
         qcc: QualifierCountCall,
     ) -> Result<()> {
-        self.send(Asdu::counter_interrogation_cmd(self.params(), coa, ca, qcc)?)
-            .await
+        self.send(Asdu::counter_interrogation_cmd(
+            self.params(),
+            coa,
+            ca,
+            qcc,
+        )?)
+        .await
     }
 
     /// Send `C_RD_NA_1`: a read command.
@@ -740,11 +779,7 @@ pub trait ConnectExt: Connect {
     }
 
     /// Send `C_TS_NA_1`: a test command.
-    async fn send_test_command(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-    ) -> Result<()> {
+    async fn send_test_command(&self, coa: CauseOfTransmission, ca: CommonAddr) -> Result<()> {
         self.send(Asdu::test_command(self.params(), coa, ca)?).await
     }
 

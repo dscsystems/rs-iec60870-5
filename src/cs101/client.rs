@@ -364,7 +364,7 @@ impl<H: ClientHandler> Client<H> {
     /// Run the link procedure over one open stream, returning the error that
     /// ended it (if any).
     async fn run_link(
-        &self,
+        self: &Arc<Self>,
         stream: crate::cs101::transport::LinkStream,
         link_req: &mut mpsc::UnboundedReceiver<u8>,
     ) -> Option<Error> {
@@ -376,6 +376,24 @@ impl<H: ClientHandler> Client<H> {
         let (tx_frame, mut rx_frame) = mpsc::channel::<Frame>(20);
         let (tx_out, mut rx_out) = mpsc::channel::<Vec<u8>>(20);
         let (stop_tx, stop_rx) = watch::channel(false);
+
+        // Application handlers may wait for outgoing queue room. Run them in
+        // order outside the link driver so acknowledgements and polls continue.
+        let (asdu_tx, mut asdu_rx) = mpsc::unbounded_channel::<Asdu>();
+        let endpoint = Arc::clone(self);
+        let mut stop = stop_rx.clone();
+        let dispatcher_task = tokio::spawn(async move {
+            loop {
+                let pack = tokio::select! {
+                    _ = stop.changed() => break,
+                    pack = asdu_rx.recv() => match pack { Some(pack) => pack, None => break },
+                };
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = dispatch_client(&*endpoint.handler, endpoint.as_connect(), &pack, endpoint.option.client_number) => {},
+                }
+            }
+        });
 
         let reader_task = {
             let mut stop = stop_rx.clone();
@@ -463,13 +481,7 @@ impl<H: ClientHandler> Client<H> {
                     if let Some(asdu) = frame.asdu().filter(|_| outcome.deliver) {
                         match Asdu::unmarshal_binary(self.option.params, asdu) {
                             Ok(pack) => {
-                                dispatch_client(
-                                    &*self.handler,
-                                    self.as_connect(),
-                                    &pack,
-                                    self.option.client_number,
-                                )
-                                .await
+                                let _ = asdu_tx.send(pack);
                             }
                             Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
                         }
@@ -507,7 +519,7 @@ impl<H: ClientHandler> Client<H> {
 
         let _ = stop_tx.send(true);
         drop(tx_out);
-        let _ = tokio::join!(reader_task, writer_task);
+        let _ = tokio::join!(reader_task, writer_task, dispatcher_task);
         fatal
     }
 
@@ -588,8 +600,13 @@ impl<H: ClientHandler> Client<H> {
         ca: CommonAddr,
         qcc: QualifierCountCall,
     ) -> Result<()> {
-        self.send(Asdu::counter_interrogation_cmd(self.params(), coa, ca, qcc)?)
-            .await
+        self.send(Asdu::counter_interrogation_cmd(
+            self.params(),
+            coa,
+            ca,
+            qcc,
+        )?)
+        .await
     }
 
     /// Send `C_RD_NA_1`: a read command.
@@ -599,7 +616,8 @@ impl<H: ClientHandler> Client<H> {
         ca: CommonAddr,
         ioa: InfoObjAddr,
     ) -> Result<()> {
-        self.send(Asdu::read_cmd(self.params(), coa, ca, ioa)?).await
+        self.send(Asdu::read_cmd(self.params(), coa, ca, ioa)?)
+            .await
     }
 
     /// Send `C_CS_NA_1`: a clock synchronization command.
@@ -732,13 +750,7 @@ impl LinkState {
     }
 
     /// Send a confirmed primary frame and arm the t₁ response timer.
-    async fn send_prim_confirmed(
-        &mut self,
-        addr: u16,
-        fun: u8,
-        fcv: bool,
-        t1: Duration,
-    ) -> bool {
+    async fn send_prim_confirmed(&mut self, addr: u16, fun: u8, fcv: bool, t1: Duration) -> bool {
         let fcb = self.secs[&addr].fcb;
         let ctrl = ControlField::primary(fun, fcv, fcb, self.dir);
         let frame = Frame::Fixed {
@@ -825,7 +837,9 @@ impl LinkState {
     /// Abort the outstanding transaction without toggling the FCB and send the
     /// station back to the start of the initialization procedure.
     fn fail_transaction(&mut self, addr: u16) {
-        let Some(p) = self.last_sent.take() else { return };
+        let Some(p) = self.last_sent.take() else {
+            return;
+        };
         if p.addr != addr {
             self.last_sent = Some(p);
             return;
@@ -1192,7 +1206,7 @@ impl LinkState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asdu::{Cause, CauseOfTransmission, Identifier, TypeId, VariableStruct};
+    use crate::asdu::{Cause, CauseOfTransmission};
 
     fn shared() -> Shared {
         Shared {
@@ -1208,15 +1222,13 @@ mod tests {
     }
 
     fn asdu() -> Asdu {
-        Asdu::new(
+        Asdu::interrogation_cmd(
             PARAMS_STANDARD_101,
-            Identifier::new(
-                TypeId::C_IC_NA_1,
-                VariableStruct::single(),
-                CauseOfTransmission::new(Cause::ACTIVATION),
-                1,
-            ),
+            CauseOfTransmission::new(Cause::ACTIVATION),
+            1,
+            crate::asdu::QualifierOfInterrogation::STATION,
         )
+        .unwrap()
     }
 
     /// A primary with one active secondary at address 1, plus the receiver its
@@ -1232,7 +1244,10 @@ mod tests {
     fn secondary_frame(fun: u8, acd: bool, dfc: bool) -> Frame {
         let mut control = ControlField::secondary(fun, acd, false);
         control.dfc = dfc;
-        Frame::Fixed { control, link_addr: 1 }
+        Frame::Fixed {
+            control,
+            link_addr: 1,
+        }
     }
 
     // DFC is the secondary saying its buffers are full. IEC 60870-5-2 subclass
@@ -1243,7 +1258,10 @@ mod tests {
     async fn user_data_is_held_while_the_station_signals_dfc() {
         let (mut link, mut rx) = primary();
         let sh = shared();
-        sh.queue.lock().unwrap().push_back(Outgoing { asdu: asdu(), addr: 1 });
+        sh.queue.lock().unwrap().push_back(Outgoing {
+            asdu: asdu(),
+            addr: 1,
+        });
 
         link.handle_frame(&secondary_frame(sec_fc::CONF_ACK, false, true), false)
             .await;
@@ -1259,7 +1277,10 @@ mod tests {
     async fn queued_data_goes_out_once_the_station_clears_dfc() {
         let (mut link, _rx) = primary();
         let sh = shared();
-        sh.queue.lock().unwrap().push_back(Outgoing { asdu: asdu(), addr: 1 });
+        sh.queue.lock().unwrap().push_back(Outgoing {
+            asdu: asdu(),
+            addr: 1,
+        });
 
         link.handle_frame(&secondary_frame(sec_fc::CONF_ACK, false, true), false)
             .await;
@@ -1358,18 +1379,29 @@ mod tests {
     async fn a_repeated_balanced_frame_is_acknowledged_but_not_delivered_again() {
         let (mut link, mut rx) = primary();
         // The peer's first FCV frame after a reset carries FCB = 1.
-        assert!(link.handle_frame(&peer_user_data(true, true), true).await.deliver);
+        assert!(
+            link.handle_frame(&peer_user_data(true, true), true)
+                .await
+                .deliver
+        );
         assert!(rx.try_recv().is_ok(), "acknowledged");
 
         // Our acknowledgement was lost; the peer repeats with the same FCB.
         assert!(
-            !link.handle_frame(&peer_user_data(true, true), true).await.deliver,
+            !link
+                .handle_frame(&peer_user_data(true, true), true)
+                .await
+                .deliver,
             "the repeat was delivered as new data"
         );
         assert!(rx.try_recv().is_ok(), "the repeat is acknowledged again");
 
         // The next genuine frame toggles the FCB and is delivered.
-        assert!(link.handle_frame(&peer_user_data(false, true), true).await.deliver);
+        assert!(
+            link.handle_frame(&peer_user_data(false, true), true)
+                .await
+                .deliver
+        );
     }
 
     #[tokio::test]
@@ -1377,7 +1409,12 @@ mod tests {
         let (mut link, mut rx) = primary();
         let before = link.fcb_expected;
         // Confirmed user data always counts frames; FCV = 0 is malformed.
-        assert!(!link.handle_frame(&peer_user_data(true, false), true).await.deliver);
+        assert!(
+            !link
+                .handle_frame(&peer_user_data(true, false), true)
+                .await
+                .deliver
+        );
         assert!(rx.try_recv().is_err(), "not answered");
         assert_eq!(link.fcb_expected, before, "the FCB did not move");
     }

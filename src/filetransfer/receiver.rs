@@ -161,20 +161,23 @@ impl Receiver {
 
     /// Call the directory of `ca`: `F_SC_NA_1` with the default qualifier.
     pub async fn request_directory(&self, conn: &dyn Connect, ca: CommonAddr) -> Result<()> {
-        conn.send(Asdu::call_or_select_file(
-            conn.params(),
-            CauseOfTransmission::new(Cause::REQUEST),
-            ca,
-            CallOrSelectFileInfo {
-                ioa: INFO_OBJ_ADDR_IRRELEVANT,
-                nof: NameOfFile::DEFAULT,
-                nos: 0,
-                scq: SelectAndCallQualifier {
-                    action: ScqAction::DEFAULT,
-                    error: FileError::NONE,
+        super::send(
+            conn,
+            Asdu::call_or_select_file(
+                conn.params(),
+                CauseOfTransmission::new(Cause::REQUEST),
+                ca,
+                CallOrSelectFileInfo {
+                    ioa: INFO_OBJ_ADDR_IRRELEVANT,
+                    nof: NameOfFile::DEFAULT,
+                    nos: 0,
+                    scq: SelectAndCallQualifier {
+                        action: ScqAction::DEFAULT,
+                        error: FileError::NONE,
+                    },
                 },
-            },
-        )?)
+            )?,
+        )
         .await
     }
 
@@ -203,8 +206,9 @@ impl Receiver {
                 file_buf: Vec::new(),
             });
         }
-        let r = conn
-            .send(Asdu::call_or_select_file(
+        let r = super::send(
+            conn,
+            Asdu::call_or_select_file(
                 conn.params(),
                 transfer(),
                 ca,
@@ -217,8 +221,9 @@ impl Receiver {
                         error: FileError::NONE,
                     },
                 },
-            )?)
-            .await;
+            )?,
+        )
+        .await;
         if r.is_err() {
             // The transfer never started, so it must not be left marked busy.
             self.abort();
@@ -255,7 +260,7 @@ impl Receiver {
             cb(ca, dir);
         }
         for asdu in reply.send {
-            if let Err(e) = conn.send(asdu).await {
+            if let Err(e) = super::send(conn, asdu).await {
                 self.abort();
                 return Err(e);
             }
@@ -334,7 +339,10 @@ impl Receiver {
             Err(e) => return Reply::failed(e),
         };
         let mut active = self.active.lock().unwrap();
-        let Some(t) = active.as_mut().filter(|t| t.nof == info.nof) else {
+        let Some(t) = active
+            .as_mut()
+            .filter(|t| t.nof == info.nof && t.ioa == info.ioa && t.ca == a.common_addr())
+        else {
             return Reply::failed(Error::NoTransfer);
         };
         if info.srq.is_not_ready {
@@ -368,10 +376,9 @@ impl Receiver {
             Err(e) => return Reply::failed(e),
         };
         let mut active = self.active.lock().unwrap();
-        let Some(t) = active
-            .as_mut()
-            .filter(|t| t.nof == info.nof && t.nos == info.nos)
-        else {
+        let Some(t) = active.as_mut().filter(|t| {
+            t.nof == info.nof && t.nos == info.nos && t.ioa == info.ioa && t.ca == a.common_addr()
+        }) else {
             return Reply::failed(Error::NoTransfer);
         };
         t.section_buf.extend_from_slice(&info.segment);
@@ -384,7 +391,10 @@ impl Receiver {
             Err(e) => return Reply::failed(e),
         };
         let mut active = self.active.lock().unwrap();
-        let Some(t) = active.as_mut().filter(|t| t.nof == info.nof) else {
+        let Some(t) = active
+            .as_mut()
+            .filter(|t| t.nof == info.nof && t.ioa == info.ioa && t.ca == a.common_addr())
+        else {
             return Reply::failed(Error::NoTransfer);
         };
         let (ca, ioa, nof) = (t.ca, t.ioa, t.nof);

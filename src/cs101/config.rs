@@ -124,10 +124,10 @@ pub struct TcpConfig {
     pub connect_timeout: Option<Duration>,
     /// Wrap the stream in TLS when set. Requires the `tls` feature.
     #[cfg(feature = "tls")]
-    pub tls_client: Option<crate::cs104::TlsClientConfig>,
+    pub tls_client: Option<crate::net::TlsClientConfig>,
     /// Wrap accepted connections in TLS when set. Requires the `tls` feature.
     #[cfg(feature = "tls")]
-    pub tls_server: Option<crate::cs104::TlsServerConfig>,
+    pub tls_server: Option<crate::net::TlsServerConfig>,
 }
 
 // -- defaults and ranges --------------------------------------------------

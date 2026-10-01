@@ -191,7 +191,8 @@ component has already told the peer whatever the procedure requires.
   again.
 * **An empty file is still a transfer**: one empty section, no segments, and
   the closing markers. It completes rather than hanging.
-* **Bulk data fills the send queue.** A transfer of any size pushes hundreds of
-  ASDUs; on a `cs104::Server`, prefer `Server::send_wait` or the
-  [`waiting`](cs104.md) wrapper so a master that is briefly behind does not
-  silently lose segments.
+* **Bulk data fills the send queue.** The transfer components retry queue-full
+  errors through `Connect::send_until`, with a 30-second deadline per ASDU.
+  IEC 101 dispatches application handlers outside its link driver, so polling
+  continues while a handler waits for class-buffer room. IEC 104 server
+  broadcasts retry only the sessions that refused a copy.
