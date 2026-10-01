@@ -461,4 +461,4 @@ The repository's own tests are worth reading as recipes:
 10. Select-before-execute is yours to implement; check `qoc.in_select`.
 11. Handlers must not block. Hand long work to your own task and send later —
     every endpoint is `Send + Sync` and cloneable behind an `Arc`.
-12. File transfer (`F_*`) and IEC 62351-5 (`S_*`) types are not implemented.
+12. Monitor-direction file transfer types 120–126 and the `filetransfer` service are implemented (see `docs/filetransfer.md`). Control-direction file transfer, query-log type 127, and IEC 62351-5 (`S_*`) services are not implemented.

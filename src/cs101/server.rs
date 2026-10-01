@@ -114,7 +114,8 @@ impl<H: ServerHandler> Server<H> {
     pub fn with_config(mut self: Arc<Self>, mut config: Config) -> Result<Arc<Self>> {
         config.valid()?;
         let s = Arc::get_mut(&mut self).ok_or(Error::Config("configure before starting"))?;
-        let shared = Arc::get_mut(&mut s.shared).ok_or(Error::Config("configure before starting"))?;
+        let shared =
+            Arc::get_mut(&mut s.shared).ok_or(Error::Config("configure before starting"))?;
         shared.max_queue = config.max_send_queue_size;
         shared.balanced = config.is_balanced();
         s.config = config;
@@ -294,7 +295,7 @@ impl<H: ServerHandler> Server<H> {
         self
     }
 
-    async fn run_link(&self, stream: LinkStream) {
+    async fn run_link(self: &Arc<Self>, stream: LinkStream) {
         let cfg = &self.config;
         let addr_size = cfg.link_addr_size;
 
@@ -302,6 +303,27 @@ impl<H: ServerHandler> Server<H> {
         let (tx_frame, mut rx_frame) = mpsc::channel::<Frame>(20);
         let (tx_out, mut rx_out) = mpsc::channel::<Vec<u8>>(20);
         let (stop_tx, stop_rx) = watch::channel(false);
+        // Application handlers may wait for outbound queue room. Run them
+        // separately so FT1.2 acknowledgements and polling continue meanwhile.
+        let (tx_pack, mut rx_pack) = mpsc::channel::<Asdu>(20);
+        let dispatch_task = {
+            let endpoint = Arc::clone(self);
+            let mut stop = stop_rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.changed() => return,
+                        pack = rx_pack.recv() => {
+                            let Some(pack) = pack else { return };
+                            tokio::select! {
+                                _ = stop.changed() => return,
+                                _ = dispatch_server(&*endpoint.handler, endpoint.as_connect(), &pack, endpoint.server_number) => {},
+                            }
+                        }
+                    }
+                }
+            })
+        };
 
         let reader_task = {
             let mut stop = stop_rx.clone();
@@ -370,13 +392,7 @@ impl<H: ServerHandler> Server<H> {
                     if let Some(raw) = outcome.asdu {
                         match Asdu::unmarshal_binary(self.shared.params, &raw) {
                             Ok(pack) => {
-                                dispatch_server(
-                                    &*self.handler,
-                                    self.as_connect(),
-                                    &pack,
-                                    self.server_number,
-                                )
-                                .await
+                                if tx_pack.send(pack).await.is_err() { break; }
                             }
                             Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
                         }
@@ -394,7 +410,7 @@ impl<H: ServerHandler> Server<H> {
 
         let _ = stop_tx.send(true);
         drop(tx_out);
-        let _ = tokio::join!(reader_task, writer_task);
+        let _ = tokio::join!(reader_task, writer_task, dispatch_task);
     }
 }
 
@@ -412,6 +428,7 @@ impl<H: ServerHandler> Connect for Server<H> {
         if !self.is_connected() {
             return Err(Error::UseClosedConnection);
         }
+        a.marshal_binary()?;
         let queue = if self.shared.balanced {
             &self.shared.prim_queue
         } else if a.coa().cause == Cause::PERIODIC || a.coa().cause == Cause::BACKGROUND {
@@ -576,6 +593,14 @@ impl SecondaryState {
                 self.handle_peer_secondary_frame(ctrl, cfg);
             } else {
                 tracing::warn!("ignoring a frame with PRM=0");
+            }
+            return out;
+        }
+
+        if crate::cs101::frame::is_broadcast_addr(addr, self.addr_size) {
+            // A broadcast must never trigger replies from multiple stations.
+            if ctrl.fun == prim_fc::USER_DATA_NO_CONF && !ctrl.fcv {
+                out.asdu = frame.asdu().map(|a| a.to_vec());
             }
             return out;
         }
@@ -754,5 +779,45 @@ impl SecondaryState {
             asdu: raw,
         };
         self.prim_send_confirmed(f, cfg).await;
+    }
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+    struct Handler;
+    #[async_trait::async_trait]
+    impl ServerHandler for Handler {}
+    #[tokio::test]
+    async fn no_link_service_answers_a_broadcast() {
+        let cfg = Config::default();
+        let server = Server::new(Handler);
+        let (tx, mut rx) = mpsc::channel(20);
+        let mut state = SecondaryState::new(&cfg, tx);
+        for fun in [
+            prim_fc::RESET_LINK,
+            prim_fc::TEST_LINK,
+            prim_fc::REQ_STATUS,
+            prim_fc::REQ_DATA1,
+            prim_fc::REQ_DATA2,
+            prim_fc::USER_DATA_CONF,
+        ] {
+            let frame = Frame::Fixed {
+                control: ControlField::primary(fun, false, false, false),
+                link_addr: 255,
+            };
+            let outcome = state.handle_frame(&frame, &server.shared, &cfg).await;
+            assert!(rx.try_recv().is_err());
+            assert!(outcome.asdu.is_none());
+            assert!(!outcome.link_became_active);
+        }
+        let frame = Frame::Variable {
+            control: ControlField::primary(prim_fc::USER_DATA_NO_CONF, false, false, false),
+            link_addr: 255,
+            asdu: vec![1, 2, 3],
+        };
+        let outcome = state.handle_frame(&frame, &server.shared, &cfg).await;
+        assert_eq!(outcome.asdu, Some(vec![1, 2, 3]));
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -58,6 +58,7 @@ struct Device {
     fcb: bool,
     /// A response set ACD: a class 1 request is due.
     want_class1: bool,
+    dfc: bool,
 }
 
 /// A confirmed frame awaiting an acknowledgement.
@@ -587,6 +588,7 @@ impl LinkState {
                         phase: Phase::Status,
                         fcb: false,
                         want_class1: false,
+                        dfc: false,
                     },
                 )
             })
@@ -692,7 +694,9 @@ impl LinkState {
     /// Abort the outstanding transaction without toggling the FCB, sending the
     /// device back to the start of the initialization procedure.
     fn fail_transaction(&mut self, addr: u8) {
-        let Some(p) = self.last_sent.take() else { return };
+        let Some(p) = self.last_sent.take() else {
+            return;
+        };
         if p.addr != addr {
             self.last_sent = Some(p);
             return;
@@ -728,8 +732,8 @@ impl LinkState {
             tracing::warn!(%ctrl, "unexpected PRM=1 frame; 103 is unbalanced only");
             return active;
         }
-        if ctrl.dfc {
-            tracing::warn!(addr, "the device signals data flow control (buffers full)");
+        if let Some(device) = self.devices.get_mut(&addr) {
+            device.dfc = ctrl.dfc;
         }
 
         match frame {
@@ -773,7 +777,7 @@ impl LinkState {
             let due = {
                 let dev = self.devices.get_mut(&addr).expect("checked");
                 dev.want_class1 = true;
-                dev.phase == Phase::Active
+                dev.phase == Phase::Active && !dev.dfc
             };
             if due && self.last_sent.is_none() {
                 self.send_prim_confirmed(addr, prim_fc::REQ_DATA1, true)
@@ -807,6 +811,7 @@ impl LinkState {
                 tracing::debug!(device = addr, "resetting the communication unit");
                 (prim_fc::RESET_LINK, false)
             }
+            Phase::Active if self.devices[&addr].dfc => (prim_fc::REQ_STATUS, false),
             Phase::Active if self.devices[&addr].want_class1 => (prim_fc::REQ_DATA1, true),
             Phase::Active => (prim_fc::REQ_DATA2, true),
         };
@@ -826,7 +831,7 @@ impl LinkState {
                         tracing::error!(addr, "dropping a queued ASDU for an unknown device");
                         q.remove(i);
                     }
-                    Some(dev) if dev.phase == Phase::Active => {
+                    Some(dev) if dev.phase == Phase::Active && !dev.dfc => {
                         found = q.remove(i);
                         break;
                     }
@@ -920,7 +925,10 @@ impl LinkState {
     /// Execute a manual link-layer request from the application API.
     async fn handle_link_request(&mut self, req: LinkRequest) {
         if self.last_sent.is_some() {
-            tracing::debug!(fun = req.fun, "manual link request dropped: the link is busy");
+            tracing::debug!(
+                fun = req.fun,
+                "manual link request dropped: the link is busy"
+            );
             return;
         }
         if !self.devices.contains_key(&req.addr) {
@@ -970,11 +978,7 @@ mod tests {
     #[test]
     fn an_invalid_configuration_is_rejected_up_front() {
         // A serial transport with no port name cannot be opened.
-        assert!(
-            ClientOption::new()
-                .with_config(Config::default())
-                .is_err()
-        );
+        assert!(ClientOption::new().with_config(Config::default()).is_err());
         assert!(
             ClientOption::new()
                 .with_config(Config {
@@ -1187,5 +1191,39 @@ mod tests {
         // The second timeout gives up; with a single device that ends the link.
         assert_eq!(link.on_t1_timeout(&cfg).await, Err(Error::TimeoutT1));
         assert!(!link.any_active());
+    }
+    #[tokio::test]
+    async fn dfc_pauses_class_polls_and_resumes_when_status_clears() {
+        let (mut link, mut out) = state().await;
+        let shared = Shared {
+            max_queue: 10,
+            default_addr: 1,
+            connected: AtomicBool::new(true),
+            link_active: AtomicBool::new(false),
+            queue: Mutex::new(VecDeque::new()),
+            link_req: mpsc::unbounded_channel().0,
+            active_notify: Notify::new(),
+        };
+        link.devices.get_mut(&1).unwrap().phase = Phase::Active;
+        link.handle_frame(&Frame::Fixed {
+            control: ControlField {
+                dfc: true,
+                ..ControlField::secondary(sec_fc::RESP_STATUS, false, false)
+            },
+            link_addr: 1,
+        })
+        .await;
+        link.tick(&shared).await;
+        assert_eq!(
+            sent_fun(&out.recv().await.unwrap()).fun,
+            prim_fc::REQ_STATUS
+        );
+        link.handle_frame(&Frame::Fixed {
+            control: ControlField::secondary(sec_fc::RESP_STATUS, false, false),
+            link_addr: 1,
+        })
+        .await;
+        link.tick(&shared).await;
+        assert_eq!(sent_fun(&out.recv().await.unwrap()).fun, prim_fc::REQ_DATA2);
     }
 }

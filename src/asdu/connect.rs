@@ -4,6 +4,7 @@
 //! The [`Connect`] abstraction shared by every endpoint, and the [`ConnectExt`]
 //! convenience methods that build and send an ASDU in one call.
 
+use crate::asdu::file::*;
 use chrono::{DateTime, Utc};
 
 use crate::asdu::codec::Asdu;
@@ -28,6 +29,26 @@ pub trait Connect: Send + Sync {
     /// Queue an ASDU for transmission.
     async fn send(&self, a: Asdu) -> Result<()>;
 
+    /// Send with bounded backpressure, retrying only queue-full errors.
+    /// Dropping this future cancels the wait.
+    async fn send_wait(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        loop {
+            match self.send(a.clone()).await {
+                Err(crate::Error::BufferFull | crate::Error::SendQueueFull) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(crate::Error::SendTimeout);
+                    }
+                    tokio::time::sleep_until(
+                        deadline
+                            .min(tokio::time::Instant::now() + std::time::Duration::from_millis(2)),
+                    )
+                    .await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// The remote address, when the endpoint has a single one.
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         None
@@ -44,6 +65,10 @@ impl<T: Connect + ?Sized> Connect for &T {
         (**self).send(a).await
     }
 
+    async fn send_wait(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        (**self).send_wait(a, deadline).await
+    }
+
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         (**self).peer_addr()
     }
@@ -57,6 +82,10 @@ impl<T: Connect + ?Sized> Connect for std::sync::Arc<T> {
 
     async fn send(&self, a: Asdu) -> Result<()> {
         (**self).send(a).await
+    }
+
+    async fn send_wait(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        (**self).send_wait(a, deadline).await
     }
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
@@ -92,6 +121,83 @@ pub trait ConnectExt: Connect {
         cause: crate::asdu::identifier::Cause,
     ) -> Result<()> {
         self.send(request.reply_mirror(cause)).await
+    }
+
+    /// Send `F_FR_NA_1`.
+    async fn send_file_ready(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: FileReadyInfo,
+    ) -> Result<()> {
+        self.send(Asdu::file_ready(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_SR_NA_1`.
+    async fn send_section_ready(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: SectionReadyInfo,
+    ) -> Result<()> {
+        self.send(Asdu::section_ready(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_SC_NA_1`.
+    async fn send_call_or_select_file(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: CallOrSelectFileInfo,
+    ) -> Result<()> {
+        self.send(Asdu::call_or_select_file(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_LS_NA_1`.
+    async fn send_last_section_or_segment(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: LastSectionOrSegmentInfo,
+    ) -> Result<()> {
+        self.send(Asdu::last_section_or_segment(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_AF_NA_1`.
+    async fn send_ack_file_or_section(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: AckFileOrSectionInfo,
+    ) -> Result<()> {
+        self.send(Asdu::ack_file_or_section(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_SG_NA_1`.
+    async fn send_file_segment(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: SegmentInfo,
+    ) -> Result<()> {
+        self.send(Asdu::file_segment(self.params(), coa, ca, info)?)
+            .await
+    }
+
+    /// Send `F_DR_TA_1`.
+    async fn send_file_directory(
+        &self,
+        coa: CauseOfTransmission,
+        ca: CommonAddr,
+        info: &[DirectoryInfo],
+    ) -> Result<()> {
+        self.send(Asdu::file_directory(self.params(), coa, ca, info)?)
+            .await
     }
 
     // -- monitor direction ------------------------------------------------
@@ -206,8 +312,14 @@ pub trait ConnectExt: Connect {
         ca: CommonAddr,
         infos: &[BitString32Info],
     ) -> Result<()> {
-        self.send(Asdu::bitstring32(self.params(), is_sequence, coa, ca, infos)?)
-            .await
+        self.send(Asdu::bitstring32(
+            self.params(),
+            is_sequence,
+            coa,
+            ca,
+            infos,
+        )?)
+        .await
     }
 
     /// Send `M_BO_TA_1`: bit string of 32 bits with a CP24Time2a time tag.
@@ -712,8 +824,13 @@ pub trait ConnectExt: Connect {
         ca: CommonAddr,
         qcc: QualifierCountCall,
     ) -> Result<()> {
-        self.send(Asdu::counter_interrogation_cmd(self.params(), coa, ca, qcc)?)
-            .await
+        self.send(Asdu::counter_interrogation_cmd(
+            self.params(),
+            coa,
+            ca,
+            qcc,
+        )?)
+        .await
     }
 
     /// Send `C_RD_NA_1`: a read command.
@@ -739,11 +856,7 @@ pub trait ConnectExt: Connect {
     }
 
     /// Send `C_TS_NA_1`: a test command.
-    async fn send_test_command(
-        &self,
-        coa: CauseOfTransmission,
-        ca: CommonAddr,
-    ) -> Result<()> {
+    async fn send_test_command(&self, coa: CauseOfTransmission, ca: CommonAddr) -> Result<()> {
         self.send(Asdu::test_command(self.params(), coa, ca)?).await
     }
 
@@ -828,6 +941,34 @@ pub trait ConnectExt: Connect {
 }
 
 impl<T: Connect + ?Sized> ConnectExt for T {}
+
+/// A connection wrapper for bulk replies with a shared send deadline.
+/// Server broadcasts use the server's per-session retry to avoid duplicates.
+pub struct Waiting<'a> {
+    connection: &'a dyn Connect,
+    deadline: tokio::time::Instant,
+}
+impl<'a> Waiting<'a> {
+    /// Bound all sends through this wrapper by `deadline`.
+    pub fn new(connection: &'a dyn Connect, deadline: tokio::time::Instant) -> Self {
+        Self {
+            connection,
+            deadline,
+        }
+    }
+}
+#[async_trait::async_trait]
+impl Connect for Waiting<'_> {
+    fn params(&self) -> Params {
+        self.connection.params()
+    }
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.connection.peer_addr()
+    }
+    async fn send(&self, a: Asdu) -> Result<()> {
+        self.connection.send_wait(a, self.deadline).await
+    }
+}
 
 #[cfg(test)]
 mod tests {

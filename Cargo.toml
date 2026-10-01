@@ -51,6 +51,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 ], optional = true }
 tokio-serial = { version = "5", optional = true }
 
+[target.'cfg(any(unix, windows))'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["cs101", "cs103", "cs104"]
 

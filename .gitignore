@@ -7,3 +7,5 @@ target/
 
 # Release archives built by .github/workflows/release.yml
 /dist
+
+/tests/interop/lib60870-upstream/

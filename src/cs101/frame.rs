@@ -23,14 +23,24 @@ use crate::error::{Error, Result};
 
 /// The single-character acknowledgement.
 pub const SINGLE_CHAR_ACK: u8 = 0xE5;
+/// Whether a link address is the broadcast address for this width.
+/// Width zero is point-to-point and has no broadcast address.
+pub fn is_broadcast_addr(addr: u16, width: u8) -> bool {
+    match width {
+        1 => addr == 0xff,
+        2 => addr == 0xffff,
+        _ => false,
+    }
+}
+
 /// Start character of a fixed-length frame.
 pub const START_FIXED: u8 = 0x10;
 /// Start character of a variable-length frame.
 pub const START_VARIABLE: u8 = 0x68;
 /// End character of both fixed- and variable-length frames.
 pub const END_CHAR: u8 = 0x16;
-/// Maximum length of a frame transfer unit.
-pub const MAX_FRAME_LEN: usize = 255;
+/// Maximum wire length: the 255-octet length field plus six framing octets.
+pub const MAX_FRAME_LEN: usize = 261;
 
 // -- control field bits ---------------------------------------------------
 /// DIR: direction. In balanced mode, set by station A.
@@ -252,10 +262,7 @@ impl Frame {
         match self {
             Frame::SingleCharAck => Ok(vec![SINGLE_CHAR_ACK]),
 
-            Frame::Fixed {
-                control,
-                link_addr,
-            } => {
+            Frame::Fixed { control, link_addr } => {
                 let addr = encode_link_addr(*link_addr, link_addr_size);
                 let mut buf = Vec::with_capacity(4 + addr.len());
                 buf.push(START_FIXED);
@@ -570,7 +577,10 @@ mod tests {
         let mut stream: &[u8] = &[0xaa, 0xbb, 0xe5];
         assert!(read_frame(&mut stream, 1).await.is_err());
         assert!(read_frame(&mut stream, 1).await.is_err());
-        assert_eq!(read_frame(&mut stream, 1).await.unwrap(), Frame::SingleCharAck);
+        assert_eq!(
+            read_frame(&mut stream, 1).await.unwrap(),
+            Frame::SingleCharAck
+        );
     }
 
     #[tokio::test]
@@ -588,7 +598,7 @@ mod tests {
         let f = Frame::Variable {
             control: ControlField::primary(prim_fc::USER_DATA_CONF, true, true, false),
             link_addr: 1,
-            asdu: vec![0; 250],
+            asdu: vec![0; 254],
         };
         assert_eq!(
             f.marshal(1),
@@ -608,5 +618,24 @@ mod tests {
         assert!(f.control().unwrap().acd);
         assert_eq!(Frame::SingleCharAck.control(), None);
         assert_eq!(Frame::SingleCharAck.asdu(), None);
+    }
+}
+
+#[cfg(test)]
+mod maximum_length_tests {
+    use super::*;
+    #[tokio::test]
+    async fn full_eight_bit_length_field_round_trips() {
+        for width in [1, 2] {
+            let frame = Frame::Variable {
+                control: ControlField::primary(prim_fc::USER_DATA_CONF, true, true, false),
+                link_addr: 1,
+                asdu: vec![42; 254 - width as usize],
+            };
+            let raw = frame.marshal(width).unwrap();
+            assert_eq!(raw[1], 255);
+            assert_eq!(raw.len(), 261);
+            assert_eq!(read_frame(&mut raw.as_slice(), width).await.unwrap(), frame);
+        }
     }
 }

@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 
 use crate::asdu::TimeZone;
 
@@ -319,7 +319,12 @@ pub fn cp32time2a(t: Option<DateTime<Utc>>, zone: TimeZone) -> [u8; CP32TIME2A_S
     };
     let (_, _, _, _, hour, min, sec, milli) = zone.parts(t);
     let msec = milli + sec * 1000;
-    [msec as u8, (msec >> 8) as u8, min as u8, hour as u8]
+    [
+        msec as u8,
+        (msec >> 8) as u8,
+        min as u8,
+        hour as u8 | if zone.summer_time(t) { 0x80 } else { 0 },
+    ]
 }
 
 /// Decode a 4-octet CP32Time2a tag.
@@ -338,13 +343,27 @@ pub fn parse_cp32time2a(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     let min = (b[2] & 0x3f) as u32;
     let hour = (b[3] & 0x1f) as u32;
 
+    if x >= 60_000 || min > 59 || hour > 23 {
+        return None;
+    }
     let (year, month, day, _, _) = zone.now_parts();
     let val = zone.instant_from(year, month, day, hour, min, sec, msec)?;
-    if val > Utc::now() + Duration::minutes(5) {
-        Some(val - Duration::days(1))
+    let val = if val > Utc::now() + Duration::minutes(5) {
+        // Move by a calendar day rather than 24 hours across DST changes.
+        let previous = NaiveDate::from_ymd_opt(year, month, day)?.pred_opt()?;
+        zone.instant_from(
+            previous.year(),
+            previous.month(),
+            previous.day(),
+            hour,
+            min,
+            sec,
+            msec,
+        )?
     } else {
-        Some(val)
-    }
+        val
+    };
+    Some(zone.resolve_summer_time(val, b[3] & 0x80 != 0))
 }
 
 #[cfg(test)]
@@ -373,8 +392,22 @@ mod tests {
 
     #[test]
     fn measurand_scales_to_full_scale_fraction() {
-        assert_eq!(Measurand { val: 4096 / 2, ..Default::default() }.f64(), 0.5);
-        assert_eq!(Measurand { val: -4096, ..Default::default() }.f64(), -1.0);
+        assert_eq!(
+            Measurand {
+                val: 4096 / 2,
+                ..Default::default()
+            }
+            .f64(),
+            0.5
+        );
+        assert_eq!(
+            Measurand {
+                val: -4096,
+                ..Default::default()
+            }
+            .f64(),
+            -1.0
+        );
         assert_eq!(Measurand::default().f64(), 0.0);
     }
 
@@ -391,8 +424,8 @@ mod tests {
 
     #[test]
     fn cp32_encodes_the_time_of_day() {
-        let t = Utc.with_ymd_and_hms(2026, 8, 17, 21, 17, 45).unwrap()
-            + Duration::milliseconds(678);
+        let t =
+            Utc.with_ymd_and_hms(2026, 8, 17, 21, 17, 45).unwrap() + Duration::milliseconds(678);
         let b = cp32time2a(Some(t), TimeZone::Utc);
         let msec = 45 * 1000 + 678u32;
         assert_eq!(b, [msec as u8, (msec >> 8) as u8, 17, 21]);

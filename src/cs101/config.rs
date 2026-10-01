@@ -124,10 +124,10 @@ pub struct TcpConfig {
     pub connect_timeout: Option<Duration>,
     /// Wrap the stream in TLS when set. Requires the `tls` feature.
     #[cfg(feature = "tls")]
-    pub tls_client: Option<crate::cs104::TlsClientConfig>,
+    pub tls_client: Option<crate::net::TlsClientConfig>,
     /// Wrap accepted connections in TLS when set. Requires the `tls` feature.
     #[cfg(feature = "tls")]
-    pub tls_server: Option<crate::cs104::TlsServerConfig>,
+    pub tls_server: Option<crate::net::TlsServerConfig>,
 }
 
 // -- defaults and ranges --------------------------------------------------
@@ -371,7 +371,10 @@ mod tests {
             timeout_repeat_t2: Duration::from_secs(5),
             ..serial_cfg()
         };
-        assert_eq!(c.valid(), Err(Error::Config("timeout t2 must be less than t1")));
+        assert_eq!(
+            c.valid(),
+            Err(Error::Config("timeout t2 must be less than t1"))
+        );
     }
 
     #[test]

@@ -202,7 +202,25 @@ where
 
         let total = field_len + 2;
         r.read_exact(&mut buf[2..total]).await?;
+        validate(&buf[..total])?;
         return Ok(total);
+    }
+}
+
+/// Reject malformed control fields before they reach the state machine.
+fn validate(frame: &[u8]) -> Result<()> {
+    let c = &frame[2..6];
+    let valid = if c[0] & 1 == 0 {
+        c[2] & 1 == 0 && frame.len() > 6
+    } else if c[0] & 3 == 1 {
+        frame.len() == 6 && c[0] == 1 && c[1] == 0 && c[2] & 1 == 0
+    } else {
+        frame.len() == 6 && c[1..] == [0, 0, 0] && UFunction::from_bits(c[0] & 0xfc).is_some()
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Frame("invalid APCI control field"))
     }
 }
 
@@ -225,7 +243,16 @@ mod tests {
     fn i_frame_encodes_both_sequence_numbers() {
         let f = new_i_frame(0, 0, &[1, 2, 3]).unwrap();
         assert_eq!(f, vec![0x68, 7, 0, 0, 0, 0, 1, 2, 3]);
-        assert_eq!(parse(&f), (Apci::I { send_sn: 0, recv_sn: 0 }, &[1u8, 2, 3][..]));
+        assert_eq!(
+            parse(&f),
+            (
+                Apci::I {
+                    send_sn: 0,
+                    recv_sn: 0
+                },
+                &[1u8, 2, 3][..]
+            )
+        );
 
         // 15 bit numbers straddle the two octets: value << 1.
         let f = new_i_frame(0x7fff, 0x1234, &[]).unwrap();
@@ -318,7 +345,13 @@ mod tests {
         let n = read_apdu(&mut stream, &mut buf).await.unwrap();
         assert_eq!(n, 7);
         let (apci, asdu) = parse(&buf[..n]);
-        assert_eq!(apci, Apci::I { send_sn: 0, recv_sn: 0 });
+        assert_eq!(
+            apci,
+            Apci::I {
+                send_sn: 0,
+                recv_sn: 0
+            }
+        );
         assert_eq!(asdu, &[0x64]);
     }
 

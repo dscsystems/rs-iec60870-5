@@ -8,6 +8,7 @@
 //! | [`asdu`] | Application layer shared by 101 and 104: ASDU encoding and decoding for the standard type identifications, causes of transmission, quality descriptors and time tags |
 //! | [`cs104`] | IEC 60870-5-104 client (master) and server (controlled station) over TCP/IP, optionally TLS |
 //! | [`cs101`] | IEC 60870-5-101 primary and secondary station over serial FT1.2, unbalanced (multi-drop) and balanced |
+//! | [`filetransfer`] | Monitor-direction file service shared by 101 and 104 |
 //! | [`cs103`] | IEC 60870-5-103 primary station (master) for protection equipment |
 //!
 //! Vocabulary: *master* = controlling station = client; *outstation* = RTU =
@@ -18,6 +19,8 @@
 //! # Quick start: IEC 104 master
 //!
 //! ```no_run
+//! # #[cfg(feature = "cs104")]
+//! # mod example {
 //! use rs_iec60870_5::asdu::*;
 //! use rs_iec60870_5::cs104::{Client, ClientOption};
 //!
@@ -42,12 +45,13 @@
 //!         .await?;
 //!     Ok(())
 //! }
+//! # }
 //! ```
 //!
 //! # Interoperability
 //!
-//! The wire behaviour is verified against `github.com/riclolsen/go-iecp5` and
-//! is designed to interoperate with other publicly available projects and
+//! The wire behaviour is verified against `github.com/riclolsen/go-iecp5`
+//! and lib60870-C for IEC 101/104. It is designed to interoperate with
 //! other conforming implementations at the default parameters
 //! (k = 12, w = 8, t₁ = 15 s, t₂ = 10 s, t₃ = 20 s).
 
@@ -55,6 +59,7 @@
 
 pub mod asdu;
 mod error;
+pub mod filetransfer;
 pub mod net;
 
 #[cfg(feature = "cs101")]

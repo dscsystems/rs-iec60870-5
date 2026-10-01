@@ -54,7 +54,10 @@ pub enum Error {
     InroGroupNumFit,
 
     /// The encoded ASDU would exceed the 249 octet maximum.
-    #[error("asdu: asdu field length larger than max {}", crate::asdu::ASDU_SIZE_MAX)]
+    #[error(
+        "asdu: asdu field length larger than max {}",
+        crate::asdu::ASDU_SIZE_MAX
+    )]
     LengthOutOfRange,
 
     /// A send helper was called without any information object.
@@ -72,6 +75,18 @@ pub enum Error {
     /// The buffer ended before the ASDU was complete.
     #[error("asdu: unexpected end of information object buffer")]
     UnexpectedEof,
+
+    /// The payload contains more octets than the type and count account for.
+    #[error("asdu: information object size mismatch")]
+    InfoObjSizeMismatch,
+
+    /// A bounded send exhausted its deadline.
+    #[error("send deadline expired")]
+    SendTimeout,
+
+    /// A file transfer failed or received an unexpected service.
+    #[error("file transfer: {0}")]
+    FileTransfer(&'static str),
 
     // -- link and transport layers ----------------------------------------
     /// The connection is closed or was never established.
@@ -128,7 +143,7 @@ impl PartialEq for Error {
         use Error::*;
         match (self, other) {
             (Io(_), _) | (_, Io(_)) => false,
-            (Frame(a), Frame(b)) => a == b,
+            (Frame(a), Frame(b)) | (FileTransfer(a), FileTransfer(b)) => a == b,
             (Config(a), Config(b)) => a == b,
             (InvalidAddress(a), InvalidAddress(b)) => a == b,
             _ => std::mem::discriminant(self) == std::mem::discriminant(other),

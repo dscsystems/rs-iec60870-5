@@ -24,6 +24,7 @@ use identical parameters** or every ASDU will be mis-parsed.
 | `common_addr_size` | common (station) address octets | 1, 2 |
 | `info_obj_addr_size` | information object address octets | 1, 2, 3 |
 | `info_obj_time_zone` | zone used to encode and decode CP24/CP56 tags | [`TimeZone`] |
+| `allow_trailing_octets` | discard extra inbound payload octets for a known legacy peer | `false` by default |
 
 Predefined:
 
@@ -135,8 +136,8 @@ Control direction (master to device):
 identifications (`128..=255`) round-trip unchanged. `TypeId::name()` gives the
 mnemonic or `None`; `TypeId::info_obj_size()` gives the element size.
 
-File transfer types (120–127) and the IEC 62351-5 security types are
-enumerated but not implemented.
+File transfer types 120–126 have codecs and a monitor-direction service.
+Query-log type 127 and IEC 62351-5 security types are enumerated only.
 
 ## Building ASDUs
 
@@ -410,9 +411,10 @@ assert_eq!(a, back);
 # }
 ```
 
-`unmarshal_binary` trims the payload to exactly the length the type
-identification and the variable structure qualifier imply; a shorter payload is
-rejected. For hand-built ASDUs, [`Asdu::encoder`] appends information elements
+`unmarshal_binary` requires exactly the payload length implied by the type
+identification and variable structure qualifier. Short and trailing payloads
+are rejected. `Params::allow_trailing_octets` explicitly enables legacy trimming
+on receipt; outbound supported types are always validated strictly. For hand-built ASDUs, [`Asdu::encoder`] appends information elements
 and [`Asdu::reader`] reads them back.
 
 `ASDU_SIZE_MAX` is 249 octets including the identifier. Builders check it and
@@ -477,3 +479,12 @@ failing. With the `serde` feature the ASDU types also derive `Serialize` and
 [`Error::LengthOutOfRange`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 [`Error::BufferFull`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
 [`Error::SendQueueFull`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/enum.Error.html
+
+## File ASDUs
+
+Types 120–126 expose `file_ready`, `section_ready`, `call_or_select_file`,
+`last_section_or_segment`, `ack_file_or_section`, `file_segment` and
+`file_directory` constructors, matching `get_*` decoders and `send_*` helpers.
+The segment's LOS byte determines its variable payload size. All file types
+require SQ=0; only directories allow multiple information objects.
+See [file transfer](filetransfer.md) for the procedure and service API.

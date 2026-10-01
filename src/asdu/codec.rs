@@ -168,6 +168,18 @@ impl Asdu {
             return Err(Error::LengthOutOfRange);
         }
 
+        if id.type_id.0 == 0 {
+            return Err(Error::TypeIdentifier);
+        }
+        if id.variable.number == 0 || id.variable.number > 127 {
+            return Err(Error::InfoObjIndexFit);
+        }
+        self.params.valid()?;
+        // Unknown layouts (including private/security types) are defined by
+        // the caller. Known standard layouts must match exactly.
+        if id.type_id == TypeId::F_SG_NA_1 || id.type_id.info_obj_size().is_ok() {
+            self.validate_info_obj()?;
+        }
         let mut raw = Vec::with_capacity(len);
         raw.push(id.type_id.0);
         raw.push(id.variable.value());
@@ -191,12 +203,13 @@ impl Asdu {
 
     /// Parse an ASDU from the wire format using the given parameters.
     ///
-    /// The information object payload is trimmed to exactly the length implied
+    /// The information object payload must have exactly the length implied
     /// by the type identification and the variable structure qualifier; a
     /// payload shorter than that is rejected with [`Error::UnexpectedEof`].
     pub fn unmarshal_binary(params: Params, raw: &[u8]) -> Result<Asdu> {
-        if !(1..=2).contains(&params.cause_size) || !(1..=2).contains(&params.common_addr_size) {
-            return Err(Error::Param);
+        params.valid()?;
+        if raw.len() > ASDU_SIZE_MAX {
+            return Err(Error::LengthOutOfRange);
         }
         let len_dui = params.identifier_size();
         if len_dui > raw.len() {
@@ -230,28 +243,56 @@ impl Asdu {
         Ok(asdu)
     }
 
-    /// Trim the information object payload to the size implied by the type
-    /// identification and the variable structure qualifier.
-    pub fn fix_info_obj_size(&mut self) -> Result<()> {
-        let obj_size = self.identifier.type_id.info_obj_size()?;
-        let n = self.identifier.variable.number as usize;
-        let addr_size = self.params.info_obj_addr_size as usize;
-
-        let size = if self.identifier.variable.is_sequence {
-            addr_size + n * obj_size
-        } else {
-            n * (addr_size + obj_size)
-        };
-
-        if size == 0 {
-            return Err(Error::InfoObjIndexFit);
-        }
+    /// Validate the payload against the type and variable structure qualifier.
+    /// Trailing octets are rejected, so malformed commands cannot be executed.
+    pub fn validate_info_obj(&self) -> Result<()> {
+        self.params.valid()?;
+        let size = self.expected_info_obj_len()?;
         if size > self.info_obj.len() {
             return Err(Error::UnexpectedEof);
         }
-        // A longer payload is not explicitly prohibited by the standard; trim it.
-        self.info_obj.truncate(size);
+        if size != self.info_obj.len() {
+            return Err(Error::InfoObjSizeMismatch);
+        }
         Ok(())
+    }
+
+    fn expected_info_obj_len(&self) -> Result<usize> {
+        let n = self.variable().number as usize;
+        if n == 0 || n > 127 {
+            return Err(Error::InfoObjIndexFit);
+        }
+        let addr = self.params.info_obj_addr_size as usize;
+        let tid = self.type_id().0;
+        if (120..=126).contains(&tid) && (self.variable().is_sequence || (tid != 126 && n != 1)) {
+            return Err(Error::InfoObjIndexFit);
+        }
+        let size = if tid == 125 {
+            let head = addr + 4;
+            if self.info_obj.len() < head {
+                return Err(Error::UnexpectedEof);
+            }
+            head + self.info_obj[addr + 3] as usize
+        } else {
+            let obj = self.type_id().info_obj_size()?;
+            if self.variable().is_sequence {
+                addr + n * obj
+            } else {
+                n * (addr + obj)
+            }
+        };
+        Ok(size)
+    }
+
+    /// Validate the information object payload. Kept for API compatibility.
+    pub fn fix_info_obj_size(&mut self) -> Result<()> {
+        if self.params.allow_trailing_octets {
+            let size = self.expected_info_obj_len()?;
+            if self.info_obj.len() > size {
+                self.info_obj.truncate(size);
+            }
+        }
+        self.validate_info_obj()
     }
 
     /// An appender that writes information elements into this ASDU.
@@ -325,8 +366,7 @@ impl Encoder<'_> {
                 if addr > 16_777_215 {
                     return Err(Error::InfoObjAddrFit);
                 }
-                self.buf
-                    .extend_from_slice(&addr.to_le_bytes()[..3]);
+                self.buf.extend_from_slice(&addr.to_le_bytes()[..3]);
             }
             _ => return Err(Error::Param),
         }
@@ -608,10 +648,7 @@ mod tests {
 
     #[test]
     fn round_trip_through_unmarshal() {
-        let mut a = Asdu::new(
-            PARAMS_WIDE,
-            ident(TypeId::M_ME_NC_1, 2, Cause::PERIODIC, 1),
-        );
+        let mut a = Asdu::new(PARAMS_WIDE, ident(TypeId::M_ME_NC_1, 2, Cause::PERIODIC, 1));
         {
             let mut e = a.encoder();
             e.info_obj_addr(100).unwrap().f32(1.5).byte(0);
@@ -665,11 +702,13 @@ mod tests {
     }
 
     #[test]
-    fn unmarshal_trims_trailing_octets_and_rejects_short_payloads() {
+    fn unmarshal_rejects_trailing_octets_and_short_payloads() {
         // One M_SP_NA_1 object: 3 address octets + 1 value octet.
         let raw = [1u8, 1, 3, 0, 1, 0, 1, 0, 0, 0x01, 0xde, 0xad];
-        let a = Asdu::unmarshal_binary(PARAMS_WIDE, &raw).unwrap();
-        assert_eq!(a.info_obj.len(), 4);
+        assert_eq!(
+            Asdu::unmarshal_binary(PARAMS_WIDE, &raw),
+            Err(Error::InfoObjSizeMismatch)
+        );
 
         let short = [1u8, 1, 3, 0, 1, 0, 1, 0];
         assert_eq!(
@@ -701,7 +740,12 @@ mod tests {
                 1,
             ),
         );
-        a.encoder().info_obj_addr(100).unwrap().byte(1).byte(0).byte(1);
+        a.encoder()
+            .info_obj_addr(100)
+            .unwrap()
+            .byte(1)
+            .byte(0)
+            .byte(1);
         let mut r = a.reader();
         let mut addr = 0;
         for i in 0..3 {
@@ -713,7 +757,10 @@ mod tests {
 
     #[test]
     fn reader_reports_truncation_instead_of_panicking() {
-        let a = Asdu::new(PARAMS_WIDE, ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1));
+        let a = Asdu::new(
+            PARAMS_WIDE,
+            ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1),
+        );
         let mut r = a.reader();
         assert_eq!(r.byte(), Err(Error::UnexpectedEof));
         assert_eq!(r.cp56time2a(), Err(Error::UnexpectedEof));
@@ -721,12 +768,18 @@ mod tests {
 
     #[test]
     fn encoder_enforces_the_address_width() {
-        let mut a = Asdu::new(PARAMS_NARROW, ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1));
+        let mut a = Asdu::new(
+            PARAMS_NARROW,
+            ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1),
+        );
         assert_eq!(
             a.encoder().info_obj_addr(256).err(),
             Some(Error::InfoObjAddrFit)
         );
-        let mut a = Asdu::new(PARAMS_WIDE, ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1));
+        let mut a = Asdu::new(
+            PARAMS_WIDE,
+            ident(TypeId::M_SP_NA_1, 1, Cause::SPONTANEOUS, 1),
+        );
         assert!(a.encoder().info_obj_addr(16_777_215).is_ok());
         assert_eq!(
             a.encoder().info_obj_addr(16_777_216).err(),
@@ -774,7 +827,10 @@ mod tests {
             is_adjusted: false,
             is_invalid: true,
         };
-        let mut a = Asdu::new(PARAMS_WIDE, ident(TypeId::M_IT_NA_1, 1, Cause::SPONTANEOUS, 1));
+        let mut a = Asdu::new(
+            PARAMS_WIDE,
+            ident(TypeId::M_IT_NA_1, 1, Cause::SPONTANEOUS, 1),
+        );
         a.encoder().binary_counter_reading(bcr);
         assert_eq!(a.reader().binary_counter_reading().unwrap(), bcr);
     }

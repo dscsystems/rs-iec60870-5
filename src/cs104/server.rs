@@ -17,8 +17,8 @@ use crate::cs104::client::ClientOption;
 use crate::cs104::config::Config;
 use crate::cs104::connection::{Callbacks, Connection, Role, RunOptions, run};
 use crate::cs104::handler::{ServerDispatcher, ServerHandler};
-use crate::net::{TlsServerConfig, accept_stream, connect_endpoint};
 use crate::error::{Error, Result};
+use crate::net::{TlsServerConfig, accept_stream, connect_endpoint};
 
 /// Tracks the live sessions of a controlled station.
 #[derive(Default)]
@@ -199,13 +199,9 @@ impl<H: ServerHandler> Server<H> {
 
         let sessions = Arc::clone(&self.sessions);
         let mut id = None;
-        run(
-            stream,
-            opts,
-            dispatcher,
-            self.shutdown.subscribe(),
-            |c| id = Some(sessions.insert(c)),
-        )
+        run(stream, opts, dispatcher, self.shutdown.subscribe(), |c| {
+            id = Some(sessions.insert(c))
+        })
         .await;
 
         if let Some(id) = id {
@@ -241,17 +237,50 @@ impl<H: ServerHandler> Connect for Server<H> {
         self.params
     }
 
+    async fn send_wait(&self, a: Asdu, deadline: tokio::time::Instant) -> Result<()> {
+        // Snapshot once: successful sessions must never receive a retry.
+        a.marshal_binary()?;
+        let mut pending = self.sessions.all();
+        let mut first_error = None;
+        loop {
+            let mut retry = Vec::new();
+            for session in pending {
+                match session.send(a.clone()).await {
+                    Err(Error::BufferFull | Error::SendQueueFull) => retry.push(session),
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
+                    Ok(()) => {}
+                }
+            }
+            if retry.is_empty() {
+                return first_error.map_or(Ok(()), Err);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::SendTimeout);
+            }
+            tokio::time::sleep_until(
+                deadline.min(tokio::time::Instant::now() + std::time::Duration::from_millis(2)),
+            )
+            .await;
+            pending = retry;
+        }
+    }
+
     /// Broadcast a copy of `a` to every connected session.
     ///
-    /// A session that cannot take it right now (its queue is full) is skipped
-    /// with a warning rather than failing the whole broadcast.
+    /// Every session is attempted; the first refusal is reported to the caller.
+    /// Retrying the whole broadcast can duplicate successful deliveries; use
+    /// [`Connect::send_wait`] when every master must receive it once.
     async fn send(&self, a: Asdu) -> Result<()> {
+        a.marshal_binary()?;
+        let mut first_error = None;
         for session in self.sessions.all() {
             if let Err(e) = session.send(a.clone()).await {
-                tracing::warn!(peer = ?session.peer_addr(), error = %e, "broadcast to session failed");
+                first_error.get_or_insert(e);
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 }
 

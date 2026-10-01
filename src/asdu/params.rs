@@ -54,8 +54,9 @@ impl TimeZone {
 
     /// Rebuild an instant from broken-down calendar fields interpreted in this zone.
     ///
-    /// Ambiguous or non-existent local times (DST transitions) resolve to the
-    /// earliest valid instant, mirroring Go's `time.Date` normalisation.
+    /// Ambiguous local times initially choose the earliest instant; CP56/CP32
+    /// decoders then select the occurrence matching the SU bit. Non-existent
+    /// local times are rejected.
     // Broken-down calendar fields; grouping them into a struct would only move
     // the same seven values behind a name used in exactly three places.
     #[allow(clippy::too_many_arguments)]
@@ -74,18 +75,62 @@ impl TimeZone {
             TimeZone::Utc => Utc
                 .with_ymd_and_hms(year, month, day, hour, min, sec)
                 .single()
-                .and_then(|t| t.with_nanosecond(nano)),
+                .map(|t| t + chrono::Duration::nanoseconds(nano as i64)),
             TimeZone::Local => Local
                 .with_ymd_and_hms(year, month, day, hour, min, sec)
                 .earliest()
-                .and_then(|t| t.with_nanosecond(nano))
+                .map(|t| t + chrono::Duration::nanoseconds(nano as i64))
                 .map(|t| t.with_timezone(&Utc)),
             TimeZone::Fixed(off) => off
                 .with_ymd_and_hms(year, month, day, hour, min, sec)
                 .earliest()
-                .and_then(|t| t.with_nanosecond(nano))
+                .map(|t| t + chrono::Duration::nanoseconds(nano as i64))
                 .map(|t| t.with_timezone(&Utc)),
         }
+    }
+
+    /// Summer-time flag of a local instant. UTC/fixed-offset zones have none.
+    pub(crate) fn summer_time(&self, t: DateTime<Utc>) -> bool {
+        if !matches!(self, TimeZone::Local) {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            let timestamp = t.timestamp() as libc::time_t;
+            let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
+            // SAFETY: both pointers are valid and localtime_r initializes tm
+            // on success. No process-global time-zone state is modified here.
+            let result = unsafe { libc::localtime_r(&timestamp, broken_down.as_mut_ptr()) };
+            !result.is_null() && unsafe { broken_down.assume_init() }.tm_isdst > 0
+        }
+        #[cfg(windows)]
+        {
+            let timestamp = t.timestamp() as libc::time_t;
+            let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
+            // SAFETY: localtime_s initializes the destination on success.
+            let result = unsafe { libc::localtime_s(broken_down.as_mut_ptr(), &timestamp) };
+            result == 0 && unsafe { broken_down.assume_init() }.tm_isdst > 0
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
+    /// Resolve the repeated autumn hour according to the wire SU flag.
+    pub(crate) fn resolve_summer_time(&self, t: DateTime<Utc>, summer: bool) -> DateTime<Utc> {
+        if !matches!(self, TimeZone::Local) || self.summer_time(t) == summer {
+            return t;
+        }
+        let wall = t.with_timezone(&Local).naive_local();
+        if let chrono::LocalResult::Ambiguous(first, second) = Local.from_local_datetime(&wall) {
+            for candidate in [first.with_timezone(&Utc), second.with_timezone(&Utc)] {
+                if self.summer_time(candidate) == summer {
+                    return candidate;
+                }
+            }
+        }
+        t
     }
 
     /// "Now" as broken-down fields in this zone, used to complete CP24 time tags.
@@ -106,8 +151,6 @@ impl TimeZone {
     }
 }
 
-use chrono::Timelike as _;
-
 /// Specific parameters related to an ASDU.
 ///
 /// See companion standard 101, subclass 7.1. **Both peers must be configured
@@ -126,6 +169,9 @@ pub struct Params {
     pub info_obj_addr_size: u8,
     /// Time zone used to interpret CP24/CP56 time tags.
     pub info_obj_time_zone: TimeZone,
+    /// Accept and discard trailing payload octets from legacy peers.
+    /// Strict validation is the default; enable only for a known counterpart.
+    pub allow_trailing_octets: bool,
 }
 
 /// The smallest configuration: COT 1, CA 1, IOA 1.
@@ -135,6 +181,7 @@ pub const PARAMS_NARROW: Params = Params {
     common_addr_size: 1,
     info_obj_addr_size: 1,
     info_obj_time_zone: TimeZone::Utc,
+    allow_trailing_octets: false,
 };
 
 /// The standard configuration for IEC 60870-5-101: COT 1, CA 1, IOA 2.
@@ -144,6 +191,7 @@ pub const PARAMS_STANDARD_101: Params = Params {
     common_addr_size: 1,
     info_obj_addr_size: 2,
     info_obj_time_zone: TimeZone::Utc,
+    allow_trailing_octets: false,
 };
 
 /// The largest configuration: COT 2 (with originator address), CA 2, IOA 3.
@@ -155,6 +203,7 @@ pub const PARAMS_WIDE: Params = Params {
     common_addr_size: 2,
     info_obj_addr_size: 3,
     info_obj_time_zone: TimeZone::Utc,
+    allow_trailing_octets: false,
 };
 
 /// Alias of [`PARAMS_WIDE`], the IEC 60870-5-104 standard layout.

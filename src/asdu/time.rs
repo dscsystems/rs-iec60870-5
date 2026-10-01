@@ -42,7 +42,7 @@ pub fn cp56time2a(t: Option<DateTime<Utc>>, zone: TimeZone) -> [u8; CP56TIME2A_S
         msec as u8,
         (msec >> 8) as u8,
         min as u8,
-        hour as u8,
+        hour as u8 | if zone.summer_time(t) { 0x80 } else { 0 },
         ((dow as u8) << 5) | (day as u8),
         month as u8,
         (year - 2000).rem_euclid(100) as u8,
@@ -65,7 +65,11 @@ pub fn parse_cp56time2a(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     let day = (b[4] & 0x1f) as u32;
     let month = (b[5] & 0x0f) as u32;
     let year = 2000 + (b[6] & 0x7f) as i32;
+    if x >= 60_000 || min > 59 || hour > 23 || year > 2099 {
+        return None;
+    }
     zone.instant_from(year, month, day, hour, min, sec, msec)
+        .map(|t| zone.resolve_summer_time(t, b[3] & 0x80 != 0))
 }
 
 /// Encode an instant as a 3-octet CP24Time2a tag (minutes and milliseconds only).
@@ -93,6 +97,9 @@ pub fn parse_cp24time2a(b: &[u8], zone: TimeZone) -> Option<DateTime<Utc>> {
     let sec = x / 1000;
     let min = (b[2] & 0x3f) as u32;
 
+    if x >= 60_000 || min > 59 {
+        return None;
+    }
     let (year, month, day, hour, current_min) = zone.now_parts();
     let val = zone.instant_from(year, month, day, hour, min, sec, msec)?;
     if min > current_min + 5 {

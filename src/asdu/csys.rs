@@ -122,9 +122,7 @@ impl Asdu {
     }
 
     /// Decode `C_CS_NA_1`.
-    pub fn get_clock_synchronization_cmd(
-        &self,
-    ) -> Result<(InfoObjAddr, Option<DateTime<Utc>>)> {
+    pub fn get_clock_synchronization_cmd(&self) -> Result<(InfoObjAddr, Option<DateTime<Utc>>)> {
         let mut r = self.reader();
         let ioa = r.info_obj_addr()?;
         Ok((ioa, r.cp56time2a()?))
@@ -161,6 +159,9 @@ impl Asdu {
         ca: CommonAddr,
         t: DateTime<Utc>,
     ) -> Result<Asdu> {
+        if coa.cause != Cause::ACTIVATION {
+            return Err(Error::CmdCause);
+        }
         let mut u = start_sys(params, TypeId::C_TS_TA_1, coa, ca)?;
         u.encoder()
             .info_obj_addr(INFO_OBJ_ADDR_IRRELEVANT)?
@@ -269,9 +270,8 @@ mod tests {
 
     #[test]
     fn interrogation_cmd_uses_the_irrelevant_address() {
-        let a =
-            Asdu::interrogation_cmd(PARAMS_WIDE, act(), 1, QualifierOfInterrogation::STATION)
-                .unwrap();
+        let a = Asdu::interrogation_cmd(PARAMS_WIDE, act(), 1, QualifierOfInterrogation::STATION)
+            .unwrap();
         assert_eq!(a.info_obj, vec![0, 0, 0, 20]);
         assert_eq!(
             a.get_interrogation_cmd().unwrap(),

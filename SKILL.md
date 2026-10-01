@@ -366,7 +366,7 @@ services codecs, disturbance data, the device side.
     Every endpoint is `Send + Sync` and shared behind an `Arc`.
 11. Select-before-execute is application-level: check `cmd.qoc.in_select` (or
     `qos.in_select`) and confirm without operating when it is a select.
-12. File transfer (`F_*`) and IEC 62351-5 (`S_*`) types are not implemented.
+12. Monitor-direction file transfer types 120–126 and the `filetransfer` service are implemented (see `docs/filetransfer.md`). Control-direction file transfer, query-log type 127, and IEC 62351-5 (`S_*`) services are not implemented.
 13. go-iecp5 cannot size types 58–64 (CP56-tagged commands) and drops them on
     receipt; this crate handles them, but avoid those types against a go-iecp5
     peer.

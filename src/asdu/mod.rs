@@ -48,6 +48,8 @@ mod cpara;
 mod cproc;
 mod csys;
 mod display;
+mod file;
+pub use file::*;
 mod identifier;
 mod info;
 mod mproc;
@@ -55,7 +57,7 @@ mod params;
 pub mod time;
 
 pub use codec::{ASDU_SIZE_MAX, Asdu, Encoder, InfoObjReader};
-pub use connect::{Connect, ConnectExt};
+pub use connect::{Connect, ConnectExt, Waiting};
 pub use cpara::{
     ParameterActivationInfo, ParameterFloatInfo, ParameterNormalInfo, ParameterScaledInfo,
 };
@@ -68,13 +70,13 @@ pub use identifier::{
     OriginAddr, TypeId, VariableStruct,
 };
 pub use info::{
-    BinaryCounterReading, CauseOfInitial, CoiCause, DoubleCommand, DoublePoint,
+    BinaryCounterReading, CauseOfInitial, CoiCause, DoubleCommand, DoublePoint, FBP_TEST_WORD,
     INFO_OBJ_ADDR_IRRELEVANT, InfoObjAddr, Normalize, OutputCircuitInfo, QccFreeze, QccRequest,
     QocQual, QosQual, QpmCategory, QualifierCountCall, QualifierOfCommand,
     QualifierOfInterrogation, QualifierOfParameterAct, QualifierOfParameterMv,
     QualifierOfResetProcessCmd, QualifierOfSetpointCmd, QualityDescriptor,
-    QualityDescriptorProtection, SingleCommand, SingleEvent, SinglePoint, StartEvent, StepCommand,
-    StepPosition, StatusAndStatusChangeDetection, FBP_TEST_WORD,
+    QualityDescriptorProtection, SingleCommand, SingleEvent, SinglePoint, StartEvent,
+    StatusAndStatusChangeDetection, StepCommand, StepPosition,
 };
 pub use mproc::{
     BinaryCounterReadingInfo, BitString32Info, DoublePointInfo, EventOfProtectionEquipmentInfo,

@@ -5,7 +5,8 @@ Pure Rust implementation of the IEC 60870-5 telecontrol protocols: **-104**
 client and server sides for 101 and 104.
 
 Async throughout, built on Tokio. Verified for wire compatibility against
-[`go-iecp5`](https://github.com/riclolsen/go-iecp5) in every direction.
+[`go-iecp5`](https://github.com/riclolsen/go-iecp5) in every direction, and against
+[lib60870-C](https://github.com/mz-automation/lib60870) for IEC 101 and 104.
 
 ```toml
 [dependencies]
@@ -20,6 +21,7 @@ rs-iec60870-5 = "0.1"
 | [`cs104`] | IEC 60870-5-104 master and controlled station over TCP/IP, optionally TLS |
 | [`cs101`] | IEC 60870-5-101 primary and secondary station over serial FT1.2, unbalanced (multi-drop) and balanced |
 | [`cs103`] | IEC 60870-5-103 master for protection equipment |
+| [`filetransfer`](docs/filetransfer.md) | Monitor-direction file service for IEC 101/104: directories, offers, sections, segments and checksum retries |
 
 Vocabulary: *master* = controlling station = client; *outstation* = RTU = slave
 = controlled station = server. *Monitor direction* is data flowing to the master
@@ -30,6 +32,8 @@ Vocabulary: *master* = controlling station = client; *outstation* = RTU = slave
 ### IEC 104 controlled station
 
 ```rust,no_run
+# #[cfg(feature = "cs104")]
+# mod example {
 use rs_iec60870_5::asdu::*;
 use rs_iec60870_5::cs104::{Server, ServerHandler};
 
@@ -92,11 +96,14 @@ tokio::spawn(async move {
 
 srv.listen_and_serve("0.0.0.0:2404").await
 # }
+# }
 ```
 
 ### IEC 104 master
 
 ```rust,no_run
+# #[cfg(feature = "cs104")]
+# mod example {
 use rs_iec60870_5::asdu::*;
 use rs_iec60870_5::cs104::{Client, ClientHandler, ClientOption};
 
@@ -129,6 +136,7 @@ client
     )
     .await
 # }
+# }
 ```
 
 A 104 connection starts in STOPDT and carries nothing until `STARTDT` is
@@ -142,6 +150,10 @@ is reached through a terminal server. Only the transport changes — the handler
 and the ASDUs are identical:
 
 ```rust
+# #[cfg(feature = "cs101")]
+# mod example {
+# #[test]
+# fn configure() {
 use rs_iec60870_5::cs101::{Config, SerialConfig, TcpConfig, TransportType};
 
 // A local serial port: 8E1 is the standard framing, and the default.
@@ -154,6 +166,8 @@ let mut cfg = Config::new();
 cfg.transport = TransportType::TcpClient;       // or TcpServer to listen
 cfg.tcp = TcpConfig { address: "10.0.0.9:2400".into(), ..Default::default() };
 # assert_eq!(cfg.transport_label(), "10.0.0.9:2400");
+# }
+# }
 ```
 
 The serial transport needs the `serial` feature. TCP encapsulation is still
@@ -240,6 +254,10 @@ with correct per-station FCB tracking, class 1/2 buffering, ACD and DFC
 signalling and multi-drop round-robin polling; balanced mode with both stations
 transmitting spontaneously. Serial, TCP dial-out and TCP listen transports.
 
+**filetransfer.** Monitor-direction directories, file selection and offers,
+section/segment transfer, checksum verification with retransmission, and a
+pluggable store. See [the file transfer guide](docs/filetransfer.md).
+
 **cs103.** Master only: automatic link initialization (status, reset of the
 communication unit), identification collection, automatic time synchronization
 and general interrogation, cyclic measurand polling with event fetch on ACD,
@@ -247,8 +265,7 @@ general commands with RII-matched acknowledgements, multi-drop.
 
 ## Not implemented
 
-* File transfer ASDUs (`F_FR_NA_1` … `F_DR_TA_1`) — the type identifications are
-  defined, but there is no file transfer service.
+* Control-direction file transfer and query-log type `F_SC_NB_1` (127).
 * IEC 62351-5 security ASDUs (`S_*`) — enumerated only.
 * Select-before-execute supervision is left to the application: command ASDUs
   reach the handler, which decides how to confirm and execute them. The S/E bit
@@ -271,14 +288,32 @@ The defaults (k = 12, w = 8, t₁ = 15 s, t₂ = 10 s, t₃ = 20 s, `PARAMS_WIDE
 104 and `PARAMS_STANDARD_101` for 101) are chosen to interoperate with
 other publicly available projects and conforming test sets.
 
+lib60870-C is tested in both 104 TCP directions (interrogation, select command,
+quality flags, directory and multi-section file transfers), and both 101
+serial directions through Unix pseudo terminals (link initialization,
+class polling, interrogation and command confirmation). PTYs test protocol
+bytes; physical serial parity and timing require hardware validation.
+
+The reference revisions and reproducible commands are listed in the
+[interop harness](tests/interop/README.md). CI requires the peers and fails
+if they are missing or cannot build.
+
 ### One deliberate difference from go-iecp5
 
-go-iecp5 cannot size type identifications 58–64 (the CP56Time2a-tagged command
+The pinned go-iecp5 revision cannot size type identifications 58–64 (the CP56Time2a-tagged command
 types), so it drops them on receipt. This crate encodes *and* decodes them per
 the standard, which is a strict superset: a go-iecp5 peer will still not accept
 them, so avoid those types when the other end is go-iecp5.
 
 ## Pitfalls
+
+* ASDUs with trailing payload octets are now refused. For a known legacy peer,
+  set `Params::allow_trailing_octets = true` to retain the previous trimming
+  behavior. Outbound standard ASDUs must always match their type/count.
+* For bulk replies use `Waiting::new(connection, deadline)` or
+  `Connect::send_wait`. A server broadcast reports refusals; retrying the whole
+  broadcast can duplicate deliveries to masters that already accepted it.
+
 
 1. **`Params` must match on both peers.** A mismatch decodes as garbage — wrong
    types, wrong causes. Use `PARAMS_WIDE` for 104 and `PARAMS_STANDARD_101` for

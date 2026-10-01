@@ -311,14 +311,25 @@ pub(crate) async fn run<S, D>(
     let mut test_fr_since: Option<Instant> = None;
     let mut start_dt_since: Option<Instant> = None;
     let mut stop_dt_since: Option<Instant> = None;
+    let mut pending_stop = false;
 
     let mut ticker = tokio::time::interval(TIMEOUT_RESOLUTION);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        if pending_stop && ack_no_send == seq_no_send {
+            if tx_raw
+                .send(new_u_frame(UFunction::StopDtConfirm).to_vec())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            pending_stop = false;
+        }
         // "k" caps the number of unacknowledged I-frames in flight.
         let window_open = seq_no_count(ack_no_send, seq_no_send) < cfg.send_unack_limit_k;
-        let may_send = conn.is_active() && window_open;
+        let may_send = conn.is_active() && stop_dt_since.is_none() && window_open;
 
         tokio::select! {
             biased;
@@ -347,7 +358,7 @@ pub(crate) async fn run<S, D>(
             ctrl = rx_ctrl.recv() => {
                 let Some(ctrl) = ctrl else { break };
                 let (func, since) = match ctrl {
-                    Ctrl::StartDt => (UFunction::StartDtActive, &mut start_dt_since),
+                    Ctrl::StartDt => { stop_dt_since = None; (UFunction::StartDtActive, &mut start_dt_since) },
                     Ctrl::StopDt => (UFunction::StopDtActive, &mut stop_dt_since),
                 };
                 *since = Some(Instant::now());
@@ -379,7 +390,7 @@ pub(crate) async fn run<S, D>(
 
                     Apci::I { send_sn, recv_sn } => {
                         tracing::debug!(%apci, "RX I-frame");
-                        if !conn.is_active() {
+                        if !conn.is_active() && !pending_stop && stop_dt_since.is_none() {
                             tracing::warn!("station not active, discarding I-frame");
                             continue;
                         }
@@ -428,18 +439,17 @@ pub(crate) async fn run<S, D>(
                                 {
                                     break;
                                 }
+                                pending_stop = false;
                                 conn.set_active(true);
                                 if let Some(cb) = opts.callbacks.on_activated.as_ref() {
                                     cb(Arc::clone(&conn));
                                 }
                             }
                             (Some(UFunction::StopDtActive), Role::Controlled) => {
-                                if tx_raw
-                                    .send(new_u_frame(UFunction::StopDtConfirm).to_vec())
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
+                                pending_stop = true;
+                                if ack_no_rcv != seq_no_rcv {
+                                    if tx_raw.send(new_s_frame(seq_no_rcv).to_vec()).await.is_err() { break; }
+                                    ack_no_rcv = seq_no_rcv;
                                 }
                                 conn.set_active(false);
                                 if let Some(cb) = opts.callbacks.on_deactivated.as_ref() {

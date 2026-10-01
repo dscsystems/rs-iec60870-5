@@ -23,7 +23,7 @@ use crate::asdu::{
     QualifierCountCall, QualifierOfInterrogation, QualifierOfResetProcessCmd,
 };
 use crate::cs101::config::Config;
-use crate::cs101::frame::{ControlField, Frame, prim_fc, read_frame, sec_fc};
+use crate::cs101::frame::{ControlField, Frame, is_broadcast_addr, prim_fc, read_frame, sec_fc};
 use crate::cs101::handler::{ClientHandler, dispatch_client};
 use crate::cs101::transport::Transporter;
 use crate::error::{Error, Result};
@@ -55,6 +55,7 @@ struct Secondary {
     fcb: bool,
     /// A response set ACD: a class 1 request is due.
     want_class1: bool,
+    dfc: bool,
 }
 
 /// A confirmed frame awaiting an acknowledgement.
@@ -339,7 +340,7 @@ impl<H: ClientHandler> Client<H> {
     /// Run the link procedure over one open stream, returning the error that
     /// ended it (if any).
     async fn run_link(
-        &self,
+        self: &Arc<Self>,
         stream: crate::cs101::transport::LinkStream,
         link_req: &mut mpsc::UnboundedReceiver<u8>,
     ) -> Option<Error> {
@@ -351,6 +352,27 @@ impl<H: ClientHandler> Client<H> {
         let (tx_frame, mut rx_frame) = mpsc::channel::<Frame>(20);
         let (tx_out, mut rx_out) = mpsc::channel::<Vec<u8>>(20);
         let (stop_tx, stop_rx) = watch::channel(false);
+        // Application handlers may wait for outbound queue room. Run them
+        // separately so FT1.2 acknowledgements and polling continue meanwhile.
+        let (tx_pack, mut rx_pack) = mpsc::channel::<Asdu>(20);
+        let dispatch_task = {
+            let endpoint = Arc::clone(self);
+            let mut stop = stop_rx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = stop.changed() => return,
+                        pack = rx_pack.recv() => {
+                            let Some(pack) = pack else { return };
+                            tokio::select! {
+                                _ = stop.changed() => return,
+                                _ = dispatch_client(&*endpoint.handler, endpoint.as_connect(), &pack, endpoint.option.client_number) => {},
+                            }
+                        }
+                    }
+                }
+            })
+        };
 
         let reader_task = {
             let mut stop = stop_rx.clone();
@@ -438,13 +460,7 @@ impl<H: ClientHandler> Client<H> {
                     if let Some(asdu) = frame.asdu() {
                         match Asdu::unmarshal_binary(self.option.params, asdu) {
                             Ok(pack) => {
-                                dispatch_client(
-                                    &*self.handler,
-                                    self.as_connect(),
-                                    &pack,
-                                    self.option.client_number,
-                                )
-                                .await
+                                if tx_pack.send(pack).await.is_err() { break; }
                             }
                             Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
                         }
@@ -482,7 +498,7 @@ impl<H: ClientHandler> Client<H> {
 
         let _ = stop_tx.send(true);
         drop(tx_out);
-        let _ = tokio::join!(reader_task, writer_task);
+        let _ = tokio::join!(reader_task, writer_task, dispatch_task);
         fatal
     }
 
@@ -496,12 +512,15 @@ impl<H: ClientHandler> Client<H> {
 
     /// Queue an ASDU for the secondary station at `link_addr`.
     ///
+    /// Broadcast addresses (255/65535 for 1/2 octet addresses) use
+    /// unconfirmed user data: no secondary may answer a broadcast.
     /// Use this on a multi-drop line; [`Connect::send`] targets the first
     /// configured address.
     pub async fn send_to(&self, a: Asdu, link_addr: u16) -> Result<()> {
         if !self.is_connected() {
             return Err(Error::UseClosedConnection);
         }
+        a.marshal_binary()?;
         let mut q = self.shared.queue.lock().unwrap();
         if q.len() >= self.shared.max_queue {
             return Err(Error::SendQueueFull);
@@ -563,8 +582,13 @@ impl<H: ClientHandler> Client<H> {
         ca: CommonAddr,
         qcc: QualifierCountCall,
     ) -> Result<()> {
-        self.send(Asdu::counter_interrogation_cmd(self.params(), coa, ca, qcc)?)
-            .await
+        self.send(Asdu::counter_interrogation_cmd(
+            self.params(),
+            coa,
+            ca,
+            qcc,
+        )?)
+        .await
     }
 
     /// Send `C_RD_NA_1`: a read command.
@@ -574,7 +598,8 @@ impl<H: ClientHandler> Client<H> {
         ca: CommonAddr,
         ioa: InfoObjAddr,
     ) -> Result<()> {
-        self.send(Asdu::read_cmd(self.params(), coa, ca, ioa)?).await
+        self.send(Asdu::read_cmd(self.params(), coa, ca, ioa)?)
+            .await
     }
 
     /// Send `C_CS_NA_1`: a clock synchronization command.
@@ -648,7 +673,11 @@ struct LinkState {
 
 impl LinkState {
     fn new(option: &ClientOption, out: mpsc::Sender<Vec<u8>>) -> LinkState {
-        let order = option.addresses();
+        let order: Vec<_> = option
+            .addresses()
+            .into_iter()
+            .filter(|addr| !is_broadcast_addr(*addr, option.config.link_addr_size))
+            .collect();
         let secs = order
             .iter()
             .map(|a| {
@@ -658,6 +687,7 @@ impl LinkState {
                         phase: Phase::Status,
                         fcb: false,
                         want_class1: false,
+                        dfc: false,
                     },
                 )
             })
@@ -703,13 +733,7 @@ impl LinkState {
     }
 
     /// Send a confirmed primary frame and arm the t₁ response timer.
-    async fn send_prim_confirmed(
-        &mut self,
-        addr: u16,
-        fun: u8,
-        fcv: bool,
-        t1: Duration,
-    ) -> bool {
+    async fn send_prim_confirmed(&mut self, addr: u16, fun: u8, fcv: bool, t1: Duration) -> bool {
         let fcb = self.secs[&addr].fcb;
         let ctrl = ControlField::primary(fun, fcv, fcb, self.dir);
         let frame = Frame::Fixed {
@@ -787,7 +811,9 @@ impl LinkState {
     /// Abort the outstanding transaction without toggling the FCB and send the
     /// station back to the start of the initialization procedure.
     fn fail_transaction(&mut self, addr: u16) {
-        let Some(p) = self.last_sent.take() else { return };
+        let Some(p) = self.last_sent.take() else {
+            return;
+        };
         if p.addr != addr {
             self.last_sent = Some(p);
             return;
@@ -829,8 +855,8 @@ impl LinkState {
             return active;
         }
 
-        if ctrl.dfc {
-            tracing::warn!(addr, "the station signals data flow control (buffers full)");
+        if let Some(sec) = self.secs.get_mut(&addr) {
+            sec.dfc = ctrl.dfc;
         }
 
         match frame {
@@ -874,7 +900,7 @@ impl LinkState {
             let due = {
                 let sec = self.secs.get_mut(&addr).expect("checked");
                 sec.want_class1 = true;
-                sec.phase == Phase::Active
+                sec.phase == Phase::Active && !sec.dfc
             };
             if due && self.last_sent.is_none() {
                 let t1 = self.t1_duration;
@@ -958,6 +984,11 @@ impl LinkState {
                     if balanced {
                         continue;
                     }
+                    if self.secs[&addr].dfc {
+                        self.send_prim_confirmed(addr, prim_fc::REQ_STATUS, false, t1)
+                            .await;
+                        return;
+                    }
                     let fun = if self.secs[&addr].want_class1 {
                         prim_fc::REQ_DATA1
                     } else {
@@ -978,12 +1009,16 @@ impl LinkState {
             let mut i = 0;
             while i < q.len() {
                 let addr = q[i].addr;
+                if is_broadcast_addr(addr, self.addr_size) {
+                    found = q.remove(i);
+                    break;
+                }
                 match self.secs.get(&addr) {
                     None => {
                         tracing::error!(addr, "dropping a queued ASDU for an unknown station");
                         q.remove(i);
                     }
-                    Some(sec) if sec.phase == Phase::Active => {
+                    Some(sec) if sec.phase == Phase::Active && !sec.dfc => {
                         found = q.remove(i);
                         break;
                     }
@@ -1003,6 +1038,14 @@ impl LinkState {
             }
         };
 
+        if is_broadcast_addr(out.addr, self.addr_size) {
+            let frame = Frame::Variable {
+                control: ControlField::primary(prim_fc::USER_DATA_NO_CONF, false, false, self.dir),
+                link_addr: out.addr,
+                asdu: raw,
+            };
+            return self.write(&frame).await;
+        }
         let fcb = self.secs[&out.addr].fcb;
         let ctrl = ControlField::primary(prim_fc::USER_DATA_CONF, true, fcb, self.dir);
         let frame = Frame::Variable {
@@ -1100,6 +1143,93 @@ impl LinkState {
                     .await;
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use crate::asdu::{Cause, PARAMS_WIDE, SinglePointInfo};
+    struct Handler;
+    #[async_trait::async_trait]
+    impl ClientHandler for Handler {}
+    fn data() -> Asdu {
+        Asdu::single(
+            PARAMS_WIDE,
+            false,
+            CauseOfTransmission::new(Cause::SPONTANEOUS),
+            1,
+            &[SinglePointInfo::new(100, true)],
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn dfc_holds_user_data_until_status_clears_it() {
+        let (tx, mut rx) = mpsc::channel(20);
+        let option = ClientOption::new();
+        let client = Client::new(Handler, option.clone());
+        let mut link = LinkState::new(&option, tx);
+        link.secs.get_mut(&1).unwrap().phase = Phase::Active;
+        link.handle_frame(
+            &Frame::Fixed {
+                control: ControlField {
+                    dfc: true,
+                    ..ControlField::secondary(sec_fc::RESP_STATUS, false, false)
+                },
+                link_addr: 1,
+            },
+            false,
+        )
+        .await;
+        client.shared.queue.lock().unwrap().push_back(Outgoing {
+            asdu: data(),
+            addr: 1,
+        });
+        link.tick(&client.shared, false).await;
+        let raw = rx.recv().await.unwrap();
+        assert_eq!(ControlField::parse(raw[1]).fun, prim_fc::REQ_STATUS);
+        assert_eq!(client.shared.queue.lock().unwrap().len(), 1);
+        link.handle_frame(
+            &Frame::Fixed {
+                control: ControlField::secondary(sec_fc::RESP_STATUS, false, false),
+                link_addr: 1,
+            },
+            false,
+        )
+        .await;
+        link.tick(&client.shared, false).await;
+        let raw = rx.recv().await.unwrap();
+        assert_eq!(ControlField::parse(raw[4]).fun, prim_fc::USER_DATA_CONF);
+        assert!(client.shared.queue.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn broadcasts_are_unconfirmed_and_never_enter_the_station_list() {
+        for (width, addr) in [(1, 255), (2, 65535)] {
+            let option = ClientOption::new()
+                .with_secondary_address(addr)
+                .with_config(Config {
+                    link_addr_size: width,
+                    serial: crate::cs101::SerialConfig::new("unused", 9600),
+                    ..Config::default()
+                })
+                .unwrap();
+            let (tx, mut rx) = mpsc::channel(20);
+            let client = Client::new(Handler, option.clone());
+            let mut link = LinkState::new(&option, tx);
+            assert!(link.order.is_empty());
+            client
+                .shared
+                .queue
+                .lock()
+                .unwrap()
+                .push_back(Outgoing { asdu: data(), addr });
+            link.tick(&client.shared, false).await;
+            let raw = rx.recv().await.unwrap();
+            let ctrl = ControlField::parse(raw[4]);
+            assert_eq!(ctrl.fun, prim_fc::USER_DATA_NO_CONF);
+            assert!(!ctrl.fcv);
+            assert!(link.last_sent.is_none());
         }
     }
 }

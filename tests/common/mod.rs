@@ -37,6 +37,10 @@ pub fn go_bins() -> Option<&'static PathBuf> {
     BINS.get_or_init(|| {
         let dir = interop_dir();
         if !dir.join("go-iecp5/go.mod").exists() {
+            assert!(
+                std::env::var_os("IEC60870_INTEROP_REQUIRED").is_none(),
+                "go-iecp5 checkout required"
+            );
             eprintln!(
                 "SKIP: go-iecp5 checkout missing at {}; see tests/interop/README.md",
                 dir.join("go-iecp5").display()
@@ -50,15 +54,18 @@ pub fn go_bins() -> Option<&'static PathBuf> {
 
         match out {
             Err(e) => {
+                assert!(
+                    std::env::var_os("IEC60870_INTEROP_REQUIRED").is_none(),
+                    "Go toolchain required: {e}"
+                );
                 eprintln!("SKIP: the Go toolchain is unavailable ({e})");
                 None
             }
             Ok(o) if !o.status.success() => {
-                eprintln!(
-                    "SKIP: building the Go peers failed:\n{}",
+                panic!(
+                    "building the Go peers failed:\n{}",
                     String::from_utf8_lossy(&o.stderr)
                 );
-                None
             }
             Ok(_) => Some(dir.join("go/bin")),
         }
@@ -142,7 +149,9 @@ impl GoPeer {
 
     /// Wait for the `ready` event and return the address the peer bound.
     pub async fn wait_ready(&self) -> String {
-        let v = self.wait("the Go peer to bind", |v| v["event"] == "ready").await;
+        let v = self
+            .wait("the Go peer to bind", |v| v["event"] == "ready")
+            .await;
         v["addr"].as_str().expect("addr").to_string()
     }
 
@@ -164,11 +173,7 @@ impl GoPeer {
 }
 
 /// A predicate matching an event of `kind` whose `field` equals `value`.
-pub fn field_is(
-    kind: &'static str,
-    field: &'static str,
-    value: Value,
-) -> impl Fn(&Value) -> bool {
+pub fn field_is(kind: &'static str, field: &'static str, value: Value) -> impl Fn(&Value) -> bool {
     move |v: &Value| v["event"] == kind && v[field] == value
 }
 
