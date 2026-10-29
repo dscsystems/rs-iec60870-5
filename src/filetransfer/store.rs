@@ -196,12 +196,14 @@ mod tests {
 
     #[test]
     fn sections_are_cut_to_the_configured_size() {
-        assert_eq!(split_sections(&[1, 2, 3, 4, 5], 2), vec![
-            vec![1, 2],
-            vec![3, 4],
-            vec![5]
-        ]);
-        assert_eq!(split_sections(&[1, 2, 3, 4], 2), vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(
+            split_sections(&[1, 2, 3, 4, 5], 2),
+            vec![vec![1, 2], vec![3, 4], vec![5]]
+        );
+        assert_eq!(
+            split_sections(&[1, 2, 3, 4], 2),
+            vec![vec![1, 2], vec![3, 4]]
+        );
         assert_eq!(split_sections(&[1, 2, 3], 10), vec![vec![1, 2, 3]]);
     }
 
@@ -300,7 +302,9 @@ mod tests {
 
         let list = s.list().await.unwrap();
         assert_eq!(
-            list.iter().map(|e| (e.ioa, e.nof.0, e.size)).collect::<Vec<_>>(),
+            list.iter()
+                .map(|e| (e.ioa, e.nof.0, e.size))
+                .collect::<Vec<_>>(),
             vec![(100, 2, 7), (100, 3, 5), (200, 1, 10)]
         );
         assert!(list.iter().all(|e| e.time.is_some()));

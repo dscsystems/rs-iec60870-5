@@ -145,7 +145,9 @@ impl Config {
         if self.idle_timeout3.is_zero() {
             self.idle_timeout3 = d.idle_timeout3;
         } else if !(IDLE_TIMEOUT3_MIN..=IDLE_TIMEOUT3_MAX).contains(&self.idle_timeout3) {
-            return Err(Error::Config(r#"IdleTimeout3 "t3" not in [1 second, 48 hours]"#));
+            return Err(Error::Config(
+                r#"IdleTimeout3 "t3" not in [1 second, 48 hours]"#,
+            ));
         }
 
         Ok(())

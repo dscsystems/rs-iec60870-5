@@ -219,38 +219,97 @@ impl TypeId {
     /// Returns `None` for reserved and private identifications.
     pub const fn name(self) -> Option<&'static str> {
         const NAMES_1_21: [&str; 21] = [
-            "M_SP_NA_1", "M_SP_TA_1", "M_DP_NA_1", "M_DP_TA_1", "M_ST_NA_1", "M_ST_TA_1",
-            "M_BO_NA_1", "M_BO_TA_1", "M_ME_NA_1", "M_ME_TA_1", "M_ME_NB_1", "M_ME_TB_1",
-            "M_ME_NC_1", "M_ME_TC_1", "M_IT_NA_1", "M_IT_TA_1", "M_EP_TA_1", "M_EP_TB_1",
-            "M_EP_TC_1", "M_PS_NA_1", "M_ME_ND_1",
+            "M_SP_NA_1",
+            "M_SP_TA_1",
+            "M_DP_NA_1",
+            "M_DP_TA_1",
+            "M_ST_NA_1",
+            "M_ST_TA_1",
+            "M_BO_NA_1",
+            "M_BO_TA_1",
+            "M_ME_NA_1",
+            "M_ME_TA_1",
+            "M_ME_NB_1",
+            "M_ME_TB_1",
+            "M_ME_NC_1",
+            "M_ME_TC_1",
+            "M_IT_NA_1",
+            "M_IT_TA_1",
+            "M_EP_TA_1",
+            "M_EP_TB_1",
+            "M_EP_TC_1",
+            "M_PS_NA_1",
+            "M_ME_ND_1",
         ];
         const NAMES_30_41: [&str; 12] = [
-            "M_SP_TB_1", "M_DP_TB_1", "M_ST_TB_1", "M_BO_TB_1", "M_ME_TD_1", "M_ME_TE_1",
-            "M_ME_TF_1", "M_IT_TB_1", "M_EP_TD_1", "M_EP_TE_1", "M_EP_TF_1", "S_IT_TC_1",
+            "M_SP_TB_1",
+            "M_DP_TB_1",
+            "M_ST_TB_1",
+            "M_BO_TB_1",
+            "M_ME_TD_1",
+            "M_ME_TE_1",
+            "M_ME_TF_1",
+            "M_IT_TB_1",
+            "M_EP_TD_1",
+            "M_EP_TE_1",
+            "M_EP_TF_1",
+            "S_IT_TC_1",
         ];
         const NAMES_45_51: [&str; 7] = [
-            "C_SC_NA_1", "C_DC_NA_1", "C_RC_NA_1", "C_SE_NA_1", "C_SE_NB_1", "C_SE_NC_1",
+            "C_SC_NA_1",
+            "C_DC_NA_1",
+            "C_RC_NA_1",
+            "C_SE_NA_1",
+            "C_SE_NB_1",
+            "C_SE_NC_1",
             "C_BO_NA_1",
         ];
         const NAMES_58_64: [&str; 7] = [
-            "C_SC_TA_1", "C_DC_TA_1", "C_RC_TA_1", "C_SE_TA_1", "C_SE_TB_1", "C_SE_TC_1",
+            "C_SC_TA_1",
+            "C_DC_TA_1",
+            "C_RC_TA_1",
+            "C_SE_TA_1",
+            "C_SE_TB_1",
+            "C_SE_TC_1",
             "C_BO_TA_1",
         ];
         const NAMES_81_87: [&str; 7] = [
-            "S_CH_NA_1", "S_RP_NA_1", "S_AR_NA_1", "S_KR_NA_1", "S_KS_NA_1", "S_KC_NA_1",
+            "S_CH_NA_1",
+            "S_RP_NA_1",
+            "S_AR_NA_1",
+            "S_KR_NA_1",
+            "S_KS_NA_1",
+            "S_KC_NA_1",
             "S_ER_NA_1",
         ];
         const NAMES_90_95: [&str; 6] = [
-            "S_US_NA_1", "S_UQ_NA_1", "S_UR_NA_1", "S_UK_NA_1", "S_UA_NA_1", "S_UC_NA_1",
+            "S_US_NA_1",
+            "S_UQ_NA_1",
+            "S_UR_NA_1",
+            "S_UK_NA_1",
+            "S_UA_NA_1",
+            "S_UC_NA_1",
         ];
         const NAMES_100_107: [&str; 8] = [
-            "C_IC_NA_1", "C_CI_NA_1", "C_RD_NA_1", "C_CS_NA_1", "C_TS_NA_1", "C_RP_NA_1",
-            "C_CD_NA_1", "C_TS_TA_1",
+            "C_IC_NA_1",
+            "C_CI_NA_1",
+            "C_RD_NA_1",
+            "C_CS_NA_1",
+            "C_TS_NA_1",
+            "C_RP_NA_1",
+            "C_CD_NA_1",
+            "C_TS_TA_1",
         ];
         const NAMES_110_113: [&str; 4] = ["P_ME_NA_1", "P_ME_NB_1", "P_ME_NC_1", "P_AC_NA_1"];
         const NAMES_120_127: [&str; 8] = [
-            "F_FR_NA_1", "F_SR_NA_1", "F_SC_NA_1", "F_LS_NA_1", "F_AF_NA_1", "F_SG_NA_1",
-            "F_DR_TA_1", "F_SC_NB_1",
+            "F_FR_NA_1",
+            "F_SR_NA_1",
+            "F_SC_NA_1",
+            "F_LS_NA_1",
+            "F_AF_NA_1",
+            "F_SG_NA_1",
+            "F_DR_TA_1",
+            "F_SC_NB_1",
         ];
 
         let v = self.0;

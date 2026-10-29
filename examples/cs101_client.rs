@@ -47,7 +47,11 @@ impl ClientHandler for Master {
     }
 
     /// Counter-request-caused `M_IT_*`, and the `C_CI_NA_1` confirmations.
-    async fn counter_interrogation(&self, _c: &dyn Connect, pack: &Asdu) -> rs_iec60870_5::Result<()> {
+    async fn counter_interrogation(
+        &self,
+        _c: &dyn Connect,
+        pack: &Asdu,
+    ) -> rs_iec60870_5::Result<()> {
         if pack.type_id() == TypeId::C_CI_NA_1 {
             println!("counter interrogation {}", pack.coa().cause);
         } else {
@@ -143,10 +147,7 @@ fn config_from_args() -> Config {
             println!("IEC 60870-5-101 master over TCP to {address}");
         }
         None => {
-            let baud = args
-                .next()
-                .and_then(|b| b.parse().ok())
-                .unwrap_or(9600);
+            let baud = args.next().and_then(|b| b.parse().ok()).unwrap_or(9600);
             cfg.transport = TransportType::Serial;
             // 8E1 is the framing the standard specifies, and the default.
             cfg.serial = SerialConfig::new(&endpoint, baud);

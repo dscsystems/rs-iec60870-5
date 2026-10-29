@@ -139,7 +139,10 @@ async fn rust_master_interoperates_with_the_go_controlled_station() {
         .await;
     let s = st.get_step_position().unwrap();
     assert_eq!(s[0].ioa, 250);
-    assert_eq!(s[0].value.val, -17, "the 7 bit signed field must sign-extend");
+    assert_eq!(
+        s[0].value.val, -17,
+        "the 7 bit signed field must sign-extend"
+    );
     assert!(s[0].value.has_transient);
 
     let bo = handler
@@ -232,7 +235,10 @@ async fn rust_master_interoperates_with_the_go_controlled_station() {
     .await
     .unwrap();
     let ev = go
-        .wait("the single command", field_is("single_cmd", "ioa", 6000.into()))
+        .wait(
+            "the single command",
+            field_is("single_cmd", "ioa", 6000.into()),
+        )
         .await;
     assert_eq!(ev["value"], true);
     assert_eq!(ev["qual"], 1);
@@ -251,7 +257,10 @@ async fn rust_master_interoperates_with_the_go_controlled_station() {
     .await
     .unwrap();
     let ev = go
-        .wait("the double command", field_is("double_cmd", "ioa", 6001.into()))
+        .wait(
+            "the double command",
+            field_is("double_cmd", "ioa", 6001.into()),
+        )
         .await;
     assert_eq!(ev["value"], 2);
 
@@ -325,8 +334,7 @@ async fn rust_master_interoperates_with_the_go_controlled_station() {
     assert_eq!(ev["request"], 5);
     handler
         .wait_for("the counter response", |a| {
-            a.type_id() == TypeId::M_IT_NA_1
-                && a.coa().cause == Cause::REQUEST_BY_GENERAL_COUNTER
+            a.type_id() == TypeId::M_IT_NA_1 && a.coa().cause == Cause::REQUEST_BY_GENERAL_COUNTER
         })
         .await;
 
@@ -343,8 +351,10 @@ async fn rust_master_interoperates_with_the_go_controlled_station() {
     )
     .await
     .unwrap();
-    go.wait("the reset process command", |v| v["event"] == "reset_process")
-        .await;
+    go.wait("the reset process command", |v| {
+        v["event"] == "reset_process"
+    })
+    .await;
 
     // -- spontaneous data pushed by the Go server -------------------------
     let spont = handler
@@ -355,7 +365,10 @@ async fn rust_master_interoperates_with_the_go_controlled_station() {
     let f = spont.get_measured_value_float().unwrap();
     assert_eq!(f[0].ioa, 700);
     assert_eq!(f[0].value, 3.5);
-    assert!(f[0].time.is_some(), "a spontaneous event carries a time tag");
+    assert!(
+        f[0].time.is_some(),
+        "a spontaneous event carries a time tag"
+    );
 
     cli.close();
     go.kill().await;
@@ -546,7 +559,7 @@ impl ServerHandler for RustOutstation {
                 time: chrono::DateTime::parse_from_rfc3339("2026-08-17T12:34:56.789Z")
                     .ok()
                     .map(|t| t.to_utc()),
-                    time_flags: TimeTagFlags::GOOD,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -590,10 +603,7 @@ impl ServerHandler for RustOutstation {
 
     async fn asdu(&self, c: &dyn Connect, pack: &Asdu) -> rs_iec60870_5::Result<()> {
         match pack.type_id() {
-            TypeId::C_SC_NA_1
-            | TypeId::C_DC_NA_1
-            | TypeId::C_SE_NC_1
-            | TypeId::C_BO_NA_1 => {
+            TypeId::C_SC_NA_1 | TypeId::C_DC_NA_1 | TypeId::C_SE_NC_1 | TypeId::C_BO_NA_1 => {
                 c.send(pack.reply_mirror(Cause::ACTIVATION_CON)).await?;
                 c.send(pack.reply_mirror(Cause::ACTIVATION_TERM)).await
             }
@@ -697,8 +707,10 @@ async fn go_master_interoperates_with_the_rust_controlled_station() {
     assert_eq!(first["carry"], true);
 
     // -- control direction: commands issued by the Go master ---------------
-    go.wait("all Go-side commands to be issued", |v| v["event"] == "done")
-        .await;
+    go.wait("all Go-side commands to be issued", |v| {
+        v["event"] == "done"
+    })
+    .await;
 
     // Each command family was confirmed and, where applicable, terminated.
     let confirmations = go.all_of("asdu").await;

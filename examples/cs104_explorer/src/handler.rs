@@ -51,11 +51,9 @@ impl ClientHandler for TuiHandler {
     // gate the request keys: nothing may be sent before StartDT is confirmed.
 
     async fn on_connect(&self, _c: &dyn Connect) {
-        let _ = self.tx.send(Event::status(
-            true,
-            false,
-            "TCP connected, sending STARTDT",
-        ));
+        let _ = self
+            .tx
+            .send(Event::status(true, false, "TCP connected, sending STARTDT"));
     }
 
     async fn on_activated(&self, _c: &dyn Connect) {
@@ -81,7 +79,9 @@ impl ClientHandler for TuiHandler {
 
 /// Strip the `TID<...>` wrapper from a type identification.
 fn type_name(t: TypeId) -> String {
-    t.name().map(str::to_string).unwrap_or_else(|| t.0.to_string())
+    t.name()
+        .map(str::to_string)
+        .unwrap_or_else(|| t.0.to_string())
 }
 
 /// Render a cause of transmission with its test and negative flags.
@@ -141,7 +141,14 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
             .get_single_point()
             .map(|v| {
                 v.into_iter()
-                    .map(|p| mk(p.ioa, bool_str(p.value).into(), p.qds.to_string(), (p.time, p.time_flags)))
+                    .map(|p| {
+                        mk(
+                            p.ioa,
+                            bool_str(p.value).into(),
+                            p.qds.to_string(),
+                            (p.time, p.time_flags),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -150,7 +157,14 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
             .get_double_point()
             .map(|v| {
                 v.into_iter()
-                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), (p.time, p.time_flags)))
+                    .map(|p| {
+                        mk(
+                            p.ioa,
+                            p.value.to_string(),
+                            p.qds.to_string(),
+                            (p.time, p.time_flags),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -206,7 +220,14 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
             .get_measured_value_scaled()
             .map(|v| {
                 v.into_iter()
-                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), (p.time, p.time_flags)))
+                    .map(|p| {
+                        mk(
+                            p.ioa,
+                            p.value.to_string(),
+                            p.qds.to_string(),
+                            (p.time, p.time_flags),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -215,7 +236,14 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
             .get_measured_value_float()
             .map(|v| {
                 v.into_iter()
-                    .map(|p| mk(p.ioa, p.value.to_string(), p.qds.to_string(), (p.time, p.time_flags)))
+                    .map(|p| {
+                        mk(
+                            p.ioa,
+                            p.value.to_string(),
+                            p.qds.to_string(),
+                            (p.time, p.time_flags),
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default(),
@@ -251,7 +279,11 @@ pub fn extract_points(a: &Asdu) -> Vec<Point> {
                     .map(|p| {
                         mk(
                             p.ioa,
-                            format!("ST 0x{:04X} CD 0x{:04X}", p.scd.status(), p.scd.change_detection()),
+                            format!(
+                                "ST 0x{:04X} CD 0x{:04X}",
+                                p.scd.status(),
+                                p.scd.change_detection()
+                            ),
                             p.qds.to_string(),
                             (None, TimeTagFlags::GOOD),
                         )
@@ -428,7 +460,12 @@ mod tests {
         for (asdu, expected) in cases {
             let points = extract_points(&asdu);
             assert_eq!(points.len(), 1, "no row for {}", asdu.type_id());
-            assert_eq!(points[0].value, expected, "wrong value for {}", asdu.type_id());
+            assert_eq!(
+                points[0].value,
+                expected,
+                "wrong value for {}",
+                asdu.type_id()
+            );
         }
     }
 

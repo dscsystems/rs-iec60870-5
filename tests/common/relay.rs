@@ -126,10 +126,12 @@ impl RelaySim {
             let frame = match read_frame(&mut reader, 1).await {
                 Ok(f) => f,
                 Err(rs_iec60870_5::Error::Frame(_)) => continue, // resynchronise
-                Err(_) => return,                            // peer closed
+                Err(_) => return,                                // peer closed
             };
 
-            let Some(ctrl) = frame.control() else { continue };
+            let Some(ctrl) = frame.control() else {
+                continue;
+            };
             if frame.link_addr() != Some(self.addr as u16) {
                 continue; // addressed to another device on the line
             }

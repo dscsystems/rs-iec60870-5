@@ -236,7 +236,10 @@ impl App {
             KeyCode::Char('v') => {
                 let on = !self.verbose.load(Ordering::Relaxed);
                 self.verbose.store(on, Ordering::Relaxed);
-                self.log(format!("[app] protocol logging {}", if on { "on" } else { "off" }));
+                self.log(format!(
+                    "[app] protocol logging {}",
+                    if on { "on" } else { "off" }
+                ));
             }
 
             KeyCode::Char('s') => self.start_dt(),
@@ -529,7 +532,11 @@ impl App {
             kind.name,
             self.in_ioa.value.trim(),
             self.in_value.value,
-            if self.form_select { "select" } else { "execute" }
+            if self.form_select {
+                "select"
+            } else {
+                "execute"
+            }
         );
 
         let tx = self.tx.clone();
@@ -711,7 +718,10 @@ mod tests {
         }
         assert_eq!(a.logs.len(), MAX_LOG_LINES);
         assert!(
-            a.logs.last().unwrap().ends_with(&format!("line {}", MAX_LOG_LINES + 49)),
+            a.logs
+                .last()
+                .unwrap()
+                .ends_with(&format!("line {}", MAX_LOG_LINES + 49)),
             "the newest line is kept"
         );
         assert!(

@@ -186,7 +186,8 @@ impl Transporter {
         };
 
         #[cfg(feature = "tls")]
-        let stream = crate::net::connect_endpoint(&endpoint, cfg.tls_client.as_ref(), timeout).await?;
+        let stream =
+            crate::net::connect_endpoint(&endpoint, cfg.tls_client.as_ref(), timeout).await?;
         #[cfg(not(feature = "tls"))]
         let stream = crate::net::connect_endpoint(&endpoint, None, timeout).await?;
 

@@ -330,7 +330,6 @@ mod tests {
         TimeZone::Named(tz)
     }
 
-
     #[cfg(feature = "tz")]
     #[test]
     fn cp56_sets_su_exactly_when_the_zone_is_on_summer_time() {
@@ -365,7 +364,10 @@ mod tests {
         // without it the second reading decodes as the first — an hour of skew
         // in the direction that makes an event look like it happened before
         // its cause.
-        let ambiguous = [utc(2026, 10, 25, 0, 30, 0, 0), utc(2026, 10, 25, 1, 30, 0, 0)];
+        let ambiguous = [
+            utc(2026, 10, 25, 0, 30, 0, 0),
+            utc(2026, 10, 25, 1, 30, 0, 0),
+        ];
         let tags: Vec<_> = ambiguous
             .iter()
             .map(|t| cp56time2a(Some(*t), named(Berlin)))
@@ -375,7 +377,11 @@ mod tests {
             tags[1][3] & 0x1f,
             "the two readings share a wall clock hour"
         );
-        assert_ne!(tags[0][3] & 0x80, tags[1][3] & 0x80, "and differ only in SU");
+        assert_ne!(
+            tags[0][3] & 0x80,
+            tags[1][3] & 0x80,
+            "and differ only in SU"
+        );
 
         for (t, tag) in ambiguous.iter().zip(&tags) {
             assert_eq!(parse_cp56time2a(tag, named(Berlin)), Some(*t), "at {t}");
@@ -463,9 +469,18 @@ mod tests {
     fn cp24_carries_the_same_flags_in_its_minutes_octet() {
         for flags in [
             TimeTagFlags::GOOD,
-            TimeTagFlags { invalid: true, substituted: false },
-            TimeTagFlags { invalid: false, substituted: true },
-            TimeTagFlags { invalid: true, substituted: true },
+            TimeTagFlags {
+                invalid: true,
+                substituted: false,
+            },
+            TimeTagFlags {
+                invalid: false,
+                substituted: true,
+            },
+            TimeTagFlags {
+                invalid: true,
+                substituted: true,
+            },
         ] {
             let b = cp24time2a_tag(Some(Utc::now()), flags, TimeZone::Utc);
             let (t, got) = parse_cp24time2a_tag(&b, TimeZone::Utc);

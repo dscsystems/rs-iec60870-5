@@ -742,7 +742,9 @@ impl LinkState {
     /// Abort the outstanding transaction without toggling the FCB, sending the
     /// device back to the start of the initialization procedure.
     fn fail_transaction(&mut self, addr: u8) {
-        let Some(p) = self.last_sent.take() else { return };
+        let Some(p) = self.last_sent.take() else {
+            return;
+        };
         if p.addr != addr {
             self.last_sent = Some(p);
             return;
@@ -1002,7 +1004,10 @@ impl LinkState {
     /// Execute a manual link-layer request from the application API.
     async fn handle_link_request(&mut self, req: LinkRequest) {
         if self.last_sent.is_some() {
-            tracing::debug!(fun = req.fun, "manual link request dropped: the link is busy");
+            tracing::debug!(
+                fun = req.fun,
+                "manual link request dropped: the link is busy"
+            );
             return;
         }
         if !self.devices.contains_key(&req.addr) {
@@ -1052,11 +1057,7 @@ mod tests {
     #[test]
     fn an_invalid_configuration_is_rejected_up_front() {
         // A serial transport with no port name cannot be opened.
-        assert!(
-            ClientOption::new()
-                .with_config(Config::default())
-                .is_err()
-        );
+        assert!(ClientOption::new().with_config(Config::default()).is_err());
         assert!(
             ClientOption::new()
                 .with_config(Config {
@@ -1164,7 +1165,10 @@ mod tests {
         assert_eq!(sent_fun(&f).fun, prim_fc::RESET_LINK);
 
         // The device acknowledges; the link becomes active.
-        assert_eq!(link.handle_frame(&ack(1, false)).await.newly_active, vec![1]);
+        assert_eq!(
+            link.handle_frame(&ack(1, false)).await.newly_active,
+            vec![1]
+        );
         assert!(link.any_active());
 
         // Third tick: class 2 poll, now with FCV=1 and FCB=1.
@@ -1340,6 +1344,10 @@ mod tests {
         link.tick(&shared).await;
         let f = out.recv().await.unwrap();
         assert_ne!(sent_fun(&f).fun, prim_fc::USER_DATA_CONF);
-        assert_eq!(shared.queue.lock().unwrap().len(), 1, "the command stays queued");
+        assert_eq!(
+            shared.queue.lock().unwrap().len(),
+            1,
+            "the command stays queued"
+        );
     }
 }

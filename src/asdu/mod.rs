@@ -75,13 +75,13 @@ pub use identifier::{
     OriginAddr, TypeId, VariableStruct,
 };
 pub use info::{
-    BinaryCounterReading, CauseOfInitial, CoiCause, DoubleCommand, DoublePoint,
+    BinaryCounterReading, CauseOfInitial, CoiCause, DoubleCommand, DoublePoint, FBP_TEST_WORD,
     INFO_OBJ_ADDR_IRRELEVANT, InfoObjAddr, Normalize, OutputCircuitInfo, QccFreeze, QccRequest,
     QocQual, QosQual, QpmCategory, QualifierCountCall, QualifierOfCommand,
     QualifierOfInterrogation, QualifierOfParameterAct, QualifierOfParameterMv,
     QualifierOfResetProcessCmd, QualifierOfSetpointCmd, QualityDescriptor,
-    QualityDescriptorProtection, SingleCommand, SingleEvent, SinglePoint, StartEvent, StepCommand,
-    StepPosition, StatusAndStatusChangeDetection, FBP_TEST_WORD,
+    QualityDescriptorProtection, SingleCommand, SingleEvent, SinglePoint, StartEvent,
+    StatusAndStatusChangeDetection, StepCommand, StepPosition,
 };
 pub use mproc::{
     BinaryCounterReadingInfo, BitString32Info, DoublePointInfo, EventOfProtectionEquipmentInfo,
@@ -89,7 +89,7 @@ pub use mproc::{
     PackedOutputCircuitInfoInfo, PackedSinglePointWithScdInfo,
     PackedStartEventsOfProtectionEquipmentInfo, SinglePointInfo, StepPositionInfo,
 };
-pub use time::TimeTagFlags;
 pub use params::{
     PARAMS_NARROW, PARAMS_STANDARD_101, PARAMS_STANDARD_104, PARAMS_WIDE, Params, TimeZone,
 };
+pub use time::TimeTagFlags;

@@ -404,8 +404,22 @@ mod tests {
 
     #[test]
     fn measurand_scales_to_full_scale_fraction() {
-        assert_eq!(Measurand { val: 4096 / 2, ..Default::default() }.f64(), 0.5);
-        assert_eq!(Measurand { val: -4096, ..Default::default() }.f64(), -1.0);
+        assert_eq!(
+            Measurand {
+                val: 4096 / 2,
+                ..Default::default()
+            }
+            .f64(),
+            0.5
+        );
+        assert_eq!(
+            Measurand {
+                val: -4096,
+                ..Default::default()
+            }
+            .f64(),
+            -1.0
+        );
         assert_eq!(Measurand::default().f64(), 0.0);
     }
 
@@ -422,8 +436,8 @@ mod tests {
 
     #[test]
     fn cp32_encodes_the_time_of_day() {
-        let t = Utc.with_ymd_and_hms(2026, 8, 17, 21, 17, 45).unwrap()
-            + Duration::milliseconds(678);
+        let t =
+            Utc.with_ymd_and_hms(2026, 8, 17, 21, 17, 45).unwrap() + Duration::milliseconds(678);
         let b = cp32time2a(Some(t), TimeZone::Utc);
         let msec = 45 * 1000 + 678u32;
         assert_eq!(b, [msec as u8, (msec >> 8) as u8, 17, 21]);

@@ -710,7 +710,9 @@ mod tests {
 #[cfg(test)]
 mod driver_tests {
     use super::*;
-    use crate::asdu::{Cause, CauseOfTransmission, Identifier, PARAMS_WIDE, TypeId, VariableStruct};
+    use crate::asdu::{
+        Cause, CauseOfTransmission, Identifier, PARAMS_WIDE, TypeId, VariableStruct,
+    };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, DuplexStream};
 
@@ -821,7 +823,11 @@ mod driver_tests {
 
         // No STOPDT con while that I-frame is unacknowledged.
         let early = next_frame(&mut peer, Duration::from_millis(300)).await;
-        assert_ne!(early.as_deref(), Some(&STOPDT_CON[..]), "confirmed too early");
+        assert_ne!(
+            early.as_deref(),
+            Some(&STOPDT_CON[..]),
+            "confirmed too early"
+        );
 
         // Acknowledge it: now the confirmation follows.
         write(&mut peer, &new_s_frame(1)).await;
@@ -969,7 +975,9 @@ mod driver_tests {
                 }
             }
         }
-        assert!(saw_test, "no TESTFR act while the peer was silent for over t3");
+        assert!(
+            saw_test,
+            "no TESTFR act while the peer was silent for over t3"
+        );
     }
-
 }

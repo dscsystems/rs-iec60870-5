@@ -218,7 +218,9 @@ pub(crate) fn parse(apdu: &[u8]) -> Result<(Apci, &[u8])> {
         // exactly one bit is set in a legal frame — a frame with two of them
         // set is not "both", it is malformed.
         let Some(function) = UFunction::from_bits(c1 & 0xfc) else {
-            return Err(Error::Apci("U format function is not one of the six defined"));
+            return Err(Error::Apci(
+                "U format function is not one of the six defined",
+            ));
         };
         Ok((Apci::U { function }, &apdu[6..]))
     }
@@ -275,7 +277,16 @@ mod tests {
     fn i_frame_encodes_both_sequence_numbers() {
         let f = new_i_frame(0, 0, &[1, 2, 3]).unwrap();
         assert_eq!(f, vec![0x68, 7, 0, 0, 0, 0, 1, 2, 3]);
-        assert_eq!(parse(&f).unwrap(), (Apci::I { send_sn: 0, recv_sn: 0 }, &[1u8, 2, 3][..]));
+        assert_eq!(
+            parse(&f).unwrap(),
+            (
+                Apci::I {
+                    send_sn: 0,
+                    recv_sn: 0
+                },
+                &[1u8, 2, 3][..]
+            )
+        );
 
         // 15 bit numbers straddle the two octets: value << 1.
         let f = new_i_frame(0x7fff, 0x1234, &[0x64]).unwrap();
@@ -312,10 +323,7 @@ mod tests {
             UFunction::TestFrConfirm,
         ] {
             let f = new_u_frame(func);
-            assert_eq!(
-                parse(&f).unwrap().0,
-                Apci::U { function: func }
-            );
+            assert_eq!(parse(&f).unwrap().0, Apci::U { function: func });
         }
     }
 
@@ -337,7 +345,9 @@ mod tests {
         let frame = [0x68, 4, 0x0c | 0x03, 0, 0, 0];
         assert_eq!(
             parse(&frame),
-            Err(Error::Apci("U format function is not one of the six defined"))
+            Err(Error::Apci(
+                "U format function is not one of the six defined"
+            ))
         );
     }
 
@@ -420,7 +430,13 @@ mod tests {
         let n = read_apdu(&mut stream, &mut buf).await.unwrap();
         assert_eq!(n, 7);
         let (apci, asdu) = parse(&buf[..n]).unwrap();
-        assert_eq!(apci, Apci::I { send_sn: 0, recv_sn: 0 });
+        assert_eq!(
+            apci,
+            Apci::I {
+                send_sn: 0,
+                recv_sn: 0
+            }
+        );
         assert_eq!(asdu, &[0x64]);
     }
 

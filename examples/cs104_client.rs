@@ -131,7 +131,11 @@ impl ClientHandler for Master {
         Ok(())
     }
 
-    async fn counter_interrogation(&self, _c: &dyn Connect, pack: &Asdu) -> rs_iec60870_5::Result<()> {
+    async fn counter_interrogation(
+        &self,
+        _c: &dyn Connect,
+        pack: &Asdu,
+    ) -> rs_iec60870_5::Result<()> {
         println!("counter interrogation {}", describe(pack));
         Ok(())
     }
@@ -168,7 +172,10 @@ impl ClientHandler for Master {
 /// Render an optional time tag, or nothing when the type carries none.
 fn stamp(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
     match t {
-        Some(t) => format!(" at {}", t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        Some(t) => format!(
+            " at {}",
+            t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        ),
         None => String::new(),
     }
 }

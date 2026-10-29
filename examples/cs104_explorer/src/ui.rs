@@ -7,9 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Tabs, Wrap};
 
 use crate::app::{App, Focus, Tab};
 
@@ -251,7 +249,10 @@ fn draw_form(frame: &mut Frame, app: &App, area: Rect) {
         Line::raw(""),
         Line::styled(format!("value — {}", kind.value_hint), dim()),
         Line::styled(
-            format!("sends to common address {} (change with 'e')", app.common_addr),
+            format!(
+                "sends to common address {} (change with 'e')",
+                app.common_addr
+            ),
             dim(),
         ),
     ];
@@ -294,7 +295,10 @@ fn draw_connection(frame: &mut Frame, app: &App, area: Rect) {
             "tcp://host:port, tls://host:port, or plain host:port",
             dim(),
         ),
-        Line::styled("enter: apply   •   tab: switch field   •   esc: cancel", dim()),
+        Line::styled(
+            "enter: apply   •   tab: switch field   •   esc: cancel",
+            dim(),
+        ),
         Line::styled("then press 'c' to connect", dim()),
     ];
 
@@ -305,9 +309,7 @@ fn draw_connection(frame: &mut Frame, app: &App, area: Rect) {
 pub fn footer_hint(app: &App) -> String {
     match app.focus {
         Focus::Connection => "enter apply • tab next field • esc cancel".into(),
-        Focus::Form => {
-            "↑/↓ or tab: field • ←/→: change option • enter: send • esc: back".into()
-        }
+        Focus::Form => "↑/↓ or tab: field • ←/→: change option • enter: send • esc: back".into(),
         Focus::Main => {
             let mut hint = String::new();
             if app.tab == Tab::Send {
@@ -451,7 +453,10 @@ mod tests {
             .unwrap();
         let screen = render(&a);
         assert!(screen.contains("Setpoint float"));
-        assert!(screen.contains("a number"), "the value hint follows the kind");
+        assert!(
+            screen.contains("a number"),
+            "the value hint follows the kind"
+        );
     }
 
     #[test]

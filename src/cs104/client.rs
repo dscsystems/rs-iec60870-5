@@ -17,8 +17,8 @@ use crate::asdu::{
 use crate::cs104::config::Config;
 use crate::cs104::connection::{Callbacks, Connection, Role, RunOptions, run};
 use crate::cs104::handler::{ClientContext, ClientDispatcher, ClientHandler};
-use crate::net::{Endpoint, TlsClientConfig, connect_endpoint};
 use crate::error::{Error, Result};
+use crate::net::{Endpoint, TlsClientConfig, connect_endpoint};
 
 /// Default interval between reconnection attempts.
 pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(60);
@@ -204,7 +204,11 @@ impl<H: ClientHandler> Client<H> {
 
     /// Whether data transfer is active, i.e. StartDT has been confirmed.
     pub async fn is_active(&self) -> bool {
-        self.conn.read().await.as_ref().is_some_and(|c| c.is_active())
+        self.conn
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|c| c.is_active())
     }
 
     /// The current connection handle, if any.
@@ -378,8 +382,13 @@ impl<H: ClientHandler> Client<H> {
         ca: CommonAddr,
         qcc: QualifierCountCall,
     ) -> Result<()> {
-        self.send(Asdu::counter_interrogation_cmd(self.params(), coa, ca, qcc)?)
-            .await
+        self.send(Asdu::counter_interrogation_cmd(
+            self.params(),
+            coa,
+            ca,
+            qcc,
+        )?)
+        .await
     }
 
     /// Send `C_RD_NA_1`: a read command.
@@ -389,7 +398,8 @@ impl<H: ClientHandler> Client<H> {
         ca: CommonAddr,
         ioa: InfoObjAddr,
     ) -> Result<()> {
-        self.send(Asdu::read_cmd(self.params(), coa, ca, ioa)?).await
+        self.send(Asdu::read_cmd(self.params(), coa, ca, ioa)?)
+            .await
     }
 
     /// Send `C_CS_NA_1`: a clock synchronization command.
@@ -504,9 +514,6 @@ mod tests {
         struct H;
         impl ClientHandler for H {}
         let c = Client::new(H, ClientOption::new());
-        assert_eq!(
-            c.start(),
-            Err(Error::Config("no remote server configured"))
-        );
+        assert_eq!(c.start(), Err(Error::Config("no remote server configured")));
     }
 }

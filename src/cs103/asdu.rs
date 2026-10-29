@@ -456,13 +456,8 @@ impl Asdu {
     /// [`Link::time_sync`](crate::cs103::Link::time_sync) uses unless the
     /// endpoint is configured otherwise.
     pub fn time_sync(common_addr: u8, t: DateTime<Utc>, zone: TimeZone) -> Asdu {
-        let mut a = Asdu::new(
-            TypeId::TIME_SYNC,
-            vsq_one(),
-            Cause::TIME_SYNC,
-            common_addr,
-        )
-        .with_time_zone(zone);
+        let mut a = Asdu::new(TypeId::TIME_SYNC, vsq_one(), Cause::TIME_SYNC, common_addr)
+            .with_time_zone(zone);
         a.append(&[fun::GLOBAL, 0]);
         a.append(&cp56time2a(Some(t), zone));
         a
@@ -670,17 +665,15 @@ mod tests {
 
     #[test]
     fn unmarshal_rejects_a_truncated_identifier() {
-        assert_eq!(Asdu::unmarshal_binary(&[1, 2, 3]), Err(Error::UnexpectedEof));
+        assert_eq!(
+            Asdu::unmarshal_binary(&[1, 2, 3]),
+            Err(Error::UnexpectedEof)
+        );
     }
 
     /// Build an ASDU 1 the way a device would, to decode it back.
     fn time_tagged_frame(dpi: Dpi, sin: u8) -> Asdu {
-        let mut a = Asdu::new(
-            TypeId::TIME_TAGGED,
-            vsq_one(),
-            Cause::SPONTANEOUS,
-            3,
-        );
+        let mut a = Asdu::new(TypeId::TIME_TAGGED, vsq_one(), Cause::SPONTANEOUS, 3);
         a.append(&[fun::OVERCURRENT_PROTECTION, inf::GENERAL_TRIP, dpi.value()]);
         a.append(&cp32time2a(Some(Utc::now()), TimeZone::Utc));
         a.append(&[sin]);
@@ -694,7 +687,10 @@ mod tests {
         assert_eq!(info.fun, fun::OVERCURRENT_PROTECTION);
         assert_eq!(info.inf, inf::GENERAL_TRIP);
         assert_eq!(info.dpi, Dpi::On);
-        assert_eq!(info.sin, 42, "a command acknowledgement carries the RII here");
+        assert_eq!(
+            info.sin, 42,
+            "a command acknowledgement carries the RII here"
+        );
         assert!(info.time.is_some());
     }
 
@@ -862,8 +858,16 @@ mod tests {
             substituted: false,
         };
         let mut a = Asdu::new(TypeId::TIME_TAGGED, vsq_one(), Cause::SPONTANEOUS, 3);
-        a.append(&[fun::OVERCURRENT_PROTECTION, inf::GENERAL_TRIP, Dpi::On.value()]);
-        a.append(&crate::cs103::cp32time2a_tag(Some(Utc::now()), flags, TimeZone::Utc));
+        a.append(&[
+            fun::OVERCURRENT_PROTECTION,
+            inf::GENERAL_TRIP,
+            Dpi::On.value(),
+        ]);
+        a.append(&crate::cs103::cp32time2a_tag(
+            Some(Utc::now()),
+            flags,
+            TimeZone::Utc,
+        ));
         a.append(&[0]);
 
         let got = a.get_time_tagged().unwrap();

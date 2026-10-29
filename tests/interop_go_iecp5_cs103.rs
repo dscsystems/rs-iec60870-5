@@ -105,7 +105,12 @@ impl ClientHandler for Master {
         Ok(())
     }
 
-    async fn gi_termination(&self, _l: &dyn Link, _pack: &Asdu, scn: u8) -> rs_iec60870_5::Result<()> {
+    async fn gi_termination(
+        &self,
+        _l: &dyn Link,
+        _pack: &Asdu,
+        scn: u8,
+    ) -> rs_iec60870_5::Result<()> {
         self.log.gi_terminations.lock().await.push(scn);
         Ok(())
     }
@@ -180,8 +185,10 @@ async fn run_go_master(bins: &std::path::Path) -> (Vec<Event>, GoPeer) {
         v["event"] == "link_active"
     })
     .await;
-    go.wait("the Go master to finish its script", |v| v["event"] == "done")
-        .await;
+    go.wait("the Go master to finish its script", |v| {
+        v["event"] == "done"
+    })
+    .await;
 
     (sim.events().await, go)
 }

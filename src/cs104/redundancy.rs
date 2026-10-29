@@ -291,7 +291,9 @@ mod tests {
         let g = Groups::new(
             ServerMode::MultipleRedundancyGroups(vec![
                 RedundancyGroup::new("rest"),
-                RedundancyGroup::new("control-centre").with_client(ip(1)).with_client(ip(2)),
+                RedundancyGroup::new("control-centre")
+                    .with_client(ip(1))
+                    .with_client(ip(2)),
             ]),
             0,
         );
@@ -322,7 +324,10 @@ mod tests {
         );
         assert_eq!(
             outcome(&[Ok(()), Err(Error::BufferFull)]),
-            Err(Error::PartialBroadcast { failed: 1, total: 2 })
+            Err(Error::PartialBroadcast {
+                failed: 1,
+                total: 2
+            })
         );
     }
 
