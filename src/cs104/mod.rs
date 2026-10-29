@@ -110,6 +110,7 @@ mod handler;
 mod redundancy;
 mod server;
 
+pub use crate::net::{Endpoint, Stream, TlsClientConfig, TlsServerConfig};
 pub use apci::{Apci, UFunction};
 pub use client::{Client, ClientOption, DEFAULT_RECONNECT_INTERVAL};
 pub use config::{
@@ -122,4 +123,3 @@ pub use connection::{Connection, IoStream};
 pub use handler::{ClientContext, ClientHandler, ServerHandler};
 pub use redundancy::{RedundancyGroup, ServerMode};
 pub use server::{Server, ServerSpecial, Waiting, WaitingServer, waiting};
-pub use crate::net::{Endpoint, Stream, TlsClientConfig, TlsServerConfig};

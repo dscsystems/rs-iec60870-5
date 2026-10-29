@@ -390,7 +390,10 @@ mod tests {
             timeout_repeat_t2: Duration::from_secs(5),
             ..serial_cfg()
         };
-        assert_eq!(c.valid(), Err(Error::Config("timeout t2 must be less than t1")));
+        assert_eq!(
+            c.valid(),
+            Err(Error::Config("timeout t2 must be less than t1"))
+        );
     }
 
     #[test]

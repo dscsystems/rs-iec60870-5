@@ -124,7 +124,10 @@ async fn busy_missing_file_and_foreign_file_are_detected() {
         receiver.request_file(&rw, 1, 101, 2).await,
         Err(Error::TransferBusy)
     ));
-    assert_eq!(sender.handle(&sw, &rw.take()[0]).await, Err(Error::FileNotFound));
+    assert_eq!(
+        sender.handle(&sw, &rw.take()[0]).await,
+        Err(Error::FileNotFound)
+    );
     assert!(receiver.handle(&rw, &sw.take()[0]).await.is_err());
     // The service reports the rejected request; the application cancels it.
     receiver.abort();

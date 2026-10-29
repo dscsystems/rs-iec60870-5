@@ -18,8 +18,8 @@ use tokio::sync::Mutex;
 
 use rs_iec60870_5::asdu::*;
 use rs_iec60870_5::cs101::{
-    Client, ClientHandler, ClientOption, Config, Server, ServerHandler, TcpConfig, TransmissionMode,
-    TransportType,
+    Client, ClientHandler, ClientOption, Config, Server, ServerHandler, TcpConfig,
+    TransmissionMode, TransportType,
 };
 
 /// Everything the test asserts on, recorded as it arrives.
@@ -571,7 +571,11 @@ async fn single_character_acknowledgements_carry_a_whole_interrogation() {
             })
         })
         .await;
-        assert_eq!(server_log.interrogations.load(Ordering::SeqCst), 1, "{mode:?}");
+        assert_eq!(
+            server_log.interrogations.load(Ordering::SeqCst),
+            1,
+            "{mode:?}"
+        );
         assert!(
             client_log.first_of(TypeId::M_ME_NC_1).await.is_some(),
             "{mode:?}: the process image did not arrive"

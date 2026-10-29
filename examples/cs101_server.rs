@@ -24,9 +24,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use rs_iec60870_5::asdu::*;
-use rs_iec60870_5::cs101::{
-    Config, SerialConfig, Server, ServerHandler, TcpConfig, TransportType,
-};
+use rs_iec60870_5::cs101::{Config, SerialConfig, Server, ServerHandler, TcpConfig, TransportType};
 
 const LINK_ADDR: u16 = 1;
 const COMMON_ADDR: CommonAddr = 1;

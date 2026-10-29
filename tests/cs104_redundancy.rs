@@ -107,7 +107,10 @@ async fn only_the_started_master_of_a_group_is_sent_data_and_a_switchover_moves_
         .expect("standby did not start");
 
     publish(&srv, 2).await.unwrap();
-    eventually("standby received 2", async || received(&standby_got).await == [2]).await;
+    eventually("standby received 2", async || {
+        received(&standby_got).await == [2]
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         received(&main_got).await,
@@ -141,7 +144,10 @@ async fn events_raised_during_an_outage_are_replayed_when_a_master_starts() {
 
     // And live data follows it.
     publish(&srv, 4).await.unwrap();
-    eventually("live data follows", async || received(&got).await == [1, 2, 3, 4]).await;
+    eventually("live data follows", async || {
+        received(&got).await == [1, 2, 3, 4]
+    })
+    .await;
     cli.close();
 }
 

@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use rs_iec60870_5::asdu::*;
-use rs_iec60870_5::cs104::{Client, ClientOption, Server, ServerHandler, ClientHandler, Config};
+use rs_iec60870_5::cs104::{Client, ClientHandler, ClientOption, Config, Server, ServerHandler};
 
 /// Anything the test wants to assert on, recorded as it arrives.
 #[derive(Default)]
@@ -28,7 +28,12 @@ struct Log {
 
 impl Log {
     async fn types(&self) -> Vec<TypeId> {
-        self.asdus.lock().await.iter().map(|a| a.type_id()).collect()
+        self.asdus
+            .lock()
+            .await
+            .iter()
+            .map(|a| a.type_id())
+            .collect()
     }
 
     async fn first_of(&self, t: TypeId) -> Option<Asdu> {
@@ -642,7 +647,10 @@ async fn many_asdus_flow_through_the_k_and_w_windows() {
         .iter()
         .map(|a| a.get_single_cmd().unwrap().ioa)
         .collect();
-    assert_eq!(received, (0..N as u32).map(|i| 6000 + i).collect::<Vec<_>>());
+    assert_eq!(
+        received,
+        (0..N as u32).map(|i| 6000 + i).collect::<Vec<_>>()
+    );
 
     cli.close();
     srv.close();
@@ -677,10 +685,7 @@ async fn the_client_reconnects_after_the_server_restarts() {
 
     // Drop the server; the client must notice and keep retrying.
     srv1.close();
-    eventually("client notices the drop", async || {
-        !cli.is_active().await
-    })
-    .await;
+    eventually("client notices the drop", async || !cli.is_active().await).await;
 
     // Bring a new server up on the same port.
     let listener = TcpListener::bind(addr).await.unwrap();

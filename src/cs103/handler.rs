@@ -236,7 +236,12 @@ mod tests {
             self.seen.lock().unwrap().push("measurands");
             Ok(())
         }
-        async fn identification(&self, _: &dyn Link, _: &Asdu, _: IdentificationInfo) -> Result<()> {
+        async fn identification(
+            &self,
+            _: &dyn Link,
+            _: &Asdu,
+            _: IdentificationInfo,
+        ) -> Result<()> {
             self.seen.lock().unwrap().push("identification");
             Ok(())
         }

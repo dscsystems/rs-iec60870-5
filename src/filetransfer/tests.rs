@@ -105,7 +105,10 @@ async fn a_file_survives_a_whole_transfer() {
             "a {size} octet file did not arrive intact"
         );
         assert!(!sender.in_progress(), "{size}: the sender is still busy");
-        assert!(!receiver.in_progress(), "{size}: the receiver is still busy");
+        assert!(
+            !receiver.in_progress(),
+            "{size}: the receiver is still busy"
+        );
     }
 }
 
@@ -192,7 +195,9 @@ async fn a_directory_call_lists_what_the_store_holds() {
 
     let dir = listing.lock().unwrap().clone();
     assert_eq!(
-        dir.iter().map(|e| (e.ioa, e.length_of_file)).collect::<Vec<_>>(),
+        dir.iter()
+            .map(|e| (e.ioa, e.length_of_file))
+            .collect::<Vec<_>>(),
         vec![(100, 10), (200, 20)]
     );
     assert!(
@@ -299,7 +304,10 @@ async fn a_corrupted_section_is_rejected_and_served_again() {
         }
     }
 
-    assert!(corrupted, "no segment was corrupted, the test proved nothing");
+    assert!(
+        corrupted,
+        "no segment was corrupted, the test proved nothing"
+    );
     assert_eq!(
         dst.read(IOA, NOF).await.unwrap(),
         data,
@@ -343,7 +351,10 @@ async fn a_checksum_mismatch_is_reported_and_negatively_acknowledged() {
         },
     )
     .unwrap();
-    assert_eq!(receiver.handle(&r_link, &ls).await, Err(Error::FileChecksum));
+    assert_eq!(
+        receiver.handle(&r_link, &ls).await,
+        Err(Error::FileChecksum)
+    );
 
     let sent = r_link.take();
     assert_eq!(sent.len(), 1);
@@ -400,7 +411,10 @@ async fn a_negative_file_ready_is_reported() {
         },
     )
     .unwrap();
-    assert_eq!(receiver.handle(&r_link, &fr).await, Err(Error::FileNotFound));
+    assert_eq!(
+        receiver.handle(&r_link, &fr).await,
+        Err(Error::FileNotFound)
+    );
     assert!(!receiver.in_progress());
 }
 
@@ -418,8 +432,7 @@ async fn each_side_refuses_the_other_side_types() {
         Err(Error::FileServiceUnsupported)
     );
 
-    let control =
-        Asdu::ack_file_or_section(PARAMS_WIDE, coa, CA, Default::default()).unwrap();
+    let control = Asdu::ack_file_or_section(PARAMS_WIDE, coa, CA, Default::default()).unwrap();
     assert_eq!(
         receiver.handle(&r_link, &control).await,
         Err(Error::FileServiceUnsupported)
@@ -516,7 +529,10 @@ async fn deactivating_a_file_ends_the_transfer() {
         .unwrap();
     assert!(!sender.in_progress());
     assert!(
-        s_link.take().iter().all(|a| a.type_id() != TypeId::F_SG_NA_1),
+        s_link
+            .take()
+            .iter()
+            .all(|a| a.type_id() != TypeId::F_SG_NA_1),
         "nothing more may be served after a deactivation"
     );
 }

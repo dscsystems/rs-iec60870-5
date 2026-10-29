@@ -296,10 +296,7 @@ impl Frame {
         match self {
             Frame::SingleCharAck => Ok(vec![SINGLE_CHAR_ACK]),
 
-            Frame::Fixed {
-                control,
-                link_addr,
-            } => {
+            Frame::Fixed { control, link_addr } => {
                 let addr = encode_link_addr(*link_addr, link_addr_size);
                 let mut buf = Vec::with_capacity(4 + addr.len());
                 buf.push(START_FIXED);
@@ -618,7 +615,10 @@ mod tests {
         let mut stream: &[u8] = &[0xaa, 0xbb, 0xe5];
         assert!(read_frame(&mut stream, 1).await.is_err());
         assert!(read_frame(&mut stream, 1).await.is_err());
-        assert_eq!(read_frame(&mut stream, 1).await.unwrap(), Frame::SingleCharAck);
+        assert_eq!(
+            read_frame(&mut stream, 1).await.unwrap(),
+            Frame::SingleCharAck
+        );
     }
 
     #[tokio::test]

@@ -179,7 +179,12 @@ async fn connecting_and_interrogating_fills_the_points_table() {
     assert_eq!(measured.value, "21.5");
 
     // Both the request and the received ASDUs are in the log.
-    assert!(h.app.logs.iter().any(|l| l.contains("[tx] general interrogation -> sent")));
+    assert!(
+        h.app
+            .logs
+            .iter()
+            .any(|l| l.contains("[tx] general interrogation -> sent"))
+    );
     assert!(h.app.logs.iter().any(|l| l.contains("[rx] TID<M_SP_NA_1>")));
 
     h.stop();
@@ -253,7 +258,11 @@ async fn disconnecting_clears_the_status_and_stops_the_client() {
     // Requests are refused again once disconnected.
     let before = h.app.logs.len();
     h.press(KeyCode::Char('g'));
-    assert!(h.app.logs[before..].iter().any(|l| l.contains("not active")));
+    assert!(
+        h.app.logs[before..]
+            .iter()
+            .any(|l| l.contains("not active"))
+    );
 
     h.server.close();
 }

@@ -46,7 +46,11 @@ fn qds(q: QualityDescriptor) -> String {
 }
 
 /// Format a list of items as ` items=N [a, b, c]`.
-fn list<T>(f: &mut fmt::Formatter<'_>, items: &[T], mut one: impl FnMut(&mut fmt::Formatter<'_>, &T) -> fmt::Result) -> fmt::Result {
+fn list<T>(
+    f: &mut fmt::Formatter<'_>,
+    items: &[T],
+    mut one: impl FnMut(&mut fmt::Formatter<'_>, &T) -> fmt::Result,
+) -> fmt::Result {
     write!(f, " items={}", items.len())?;
     for (i, it) in items.iter().enumerate() {
         f.write_str(if i == 0 { " [" } else { ", " })?;
@@ -63,9 +67,7 @@ impl fmt::Display for Asdu {
         write!(
             f,
             "{} {} IOA-Width={}",
-            self.identifier,
-            self.identifier.variable,
-            self.params.info_obj_addr_size
+            self.identifier, self.identifier.variable, self.params.info_obj_addr_size
         )?;
 
         if self.info_obj.is_empty() {
@@ -78,7 +80,14 @@ impl fmt::Display for Asdu {
             TypeId::M_SP_NA_1 | TypeId::M_SP_TA_1 | TypeId::M_SP_TB_1 => {
                 self.get_single_point().map(|v| {
                     list(f, &v, |f, it| {
-                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), tsf(it.time, it.time_flags))
+                        write!(
+                            f,
+                            "{}={}{}{}",
+                            it.ioa,
+                            it.value,
+                            qds(it.qds),
+                            tsf(it.time, it.time_flags)
+                        )
                     })
                 })
             }
@@ -138,14 +147,28 @@ impl fmt::Display for Asdu {
             TypeId::M_ME_NB_1 | TypeId::M_ME_TB_1 | TypeId::M_ME_TE_1 => {
                 self.get_measured_value_scaled().map(|v| {
                     list(f, &v, |f, it| {
-                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), tsf(it.time, it.time_flags))
+                        write!(
+                            f,
+                            "{}={}{}{}",
+                            it.ioa,
+                            it.value,
+                            qds(it.qds),
+                            tsf(it.time, it.time_flags)
+                        )
                     })
                 })
             }
             TypeId::M_ME_NC_1 | TypeId::M_ME_TC_1 | TypeId::M_ME_TF_1 => {
                 self.get_measured_value_float().map(|v| {
                     list(f, &v, |f, it| {
-                        write!(f, "{}={}{}{}", it.ioa, it.value, qds(it.qds), tsf(it.time, it.time_flags))
+                        write!(
+                            f,
+                            "{}={}{}{}",
+                            it.ioa,
+                            it.value,
+                            qds(it.qds),
+                            tsf(it.time, it.time_flags)
+                        )
                     })
                 })
             }
@@ -287,7 +310,13 @@ impl fmt::Display for Asdu {
                 )
             }),
             TypeId::C_BO_NA_1 | TypeId::C_BO_TA_1 => self.get_bits_string32_cmd().map(|c| {
-                write!(f, " IOA={} bits=0x{:08x}{}", c.ioa, c.value, tsf(c.time, c.time_flags))
+                write!(
+                    f,
+                    " IOA={} bits=0x{:08x}{}",
+                    c.ioa,
+                    c.value,
+                    tsf(c.time, c.time_flags)
+                )
             }),
             TypeId::P_ME_NA_1 => self.get_parameter_normal().map(|p| {
                 write!(
@@ -417,11 +446,11 @@ impl fmt::Display for Asdu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asdu::time::TimeTagFlags;
     use crate::asdu::identifier::{Cause, CauseOfTransmission};
     use crate::asdu::info::*;
     use crate::asdu::mproc::*;
     use crate::asdu::params::PARAMS_WIDE;
+    use crate::asdu::time::TimeTagFlags;
 
     #[test]
     fn single_point_dump_lists_every_object() {

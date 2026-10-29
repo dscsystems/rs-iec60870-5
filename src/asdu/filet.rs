@@ -418,12 +418,7 @@ fn check_file_cause(params: &Params, coa: CauseOfTransmission, allowed: &[Cause]
 }
 
 /// Start a file transfer ASDU carrying a single information object.
-fn start_file(
-    params: Params,
-    type_id: TypeId,
-    coa: CauseOfTransmission,
-    ca: CommonAddr,
-) -> Asdu {
+fn start_file(params: Params, type_id: TypeId, coa: CauseOfTransmission, ca: CommonAddr) -> Asdu {
     Asdu::new(
         params,
         Identifier::new(type_id, VariableStruct::single(), coa, ca),
@@ -868,11 +863,17 @@ mod tests {
         // FRQ and SRQ are a 7 bit qualifier plus one flag in bit 7.
         assert_eq!(
             FileReadyQualifier::parse(0x81),
-            FileReadyQualifier { qual: 1, is_negative: true }
+            FileReadyQualifier {
+                qual: 1,
+                is_negative: true
+            }
         );
         assert_eq!(
             SectionReadyQualifier::parse(0x02),
-            SectionReadyQualifier { qual: 2, is_not_ready: false }
+            SectionReadyQualifier {
+                qual: 2,
+                is_not_ready: false
+            }
         );
 
         // SOF is a 5 bit status plus LFD, FOR and FA.
@@ -896,7 +897,10 @@ mod tests {
                 ioa,
                 nof: NameOfFile::DISTURBANCE_DATA,
                 length_of_file: 0x01_2345,
-                frq: FileReadyQualifier { qual: 1, is_negative: false },
+                frq: FileReadyQualifier {
+                    qual: 1,
+                    is_negative: false,
+                },
             };
             let a = Asdu::file_ready(params, transfer(), 1, fr).unwrap();
             assert_eq!(round_trip(&a).get_file_ready().unwrap(), fr);
@@ -906,7 +910,10 @@ mod tests {
                 nof: NameOfFile::DISTURBANCE_DATA,
                 nos: 2,
                 length_of_section: 4096,
-                srq: SectionReadyQualifier { qual: 0, is_not_ready: false },
+                srq: SectionReadyQualifier {
+                    qual: 0,
+                    is_not_ready: false,
+                },
             };
             let a = Asdu::section_ready(params, transfer(), 1, sr).unwrap();
             assert_eq!(round_trip(&a).get_section_ready().unwrap(), sr);
@@ -960,7 +967,10 @@ mod tests {
                     ioa,
                     nof: NameOfFile::DISTURBANCE_DATA,
                     length_of_file: 1024,
-                    sof: StatusOfFile { status: 1, ..Default::default() },
+                    sof: StatusOfFile {
+                        status: 1,
+                        ..Default::default()
+                    },
                     time: Some(t),
                     time_flags: TimeTagFlags::GOOD,
                 },
@@ -994,7 +1004,10 @@ mod tests {
                 nof: NameOfFile::DISTURBANCE_DATA,
                 // LOF is 3 octets, little endian.
                 length_of_file: 0x00_03_02_01,
-                frq: FileReadyQualifier { qual: 0x7f, is_negative: true },
+                frq: FileReadyQualifier {
+                    qual: 0x7f,
+                    is_negative: true,
+                },
             },
         )
         .unwrap();
@@ -1099,11 +1112,27 @@ mod tests {
     fn the_causes_the_standard_permits_are_enforced() {
         let bad = coa(Cause::PERIODIC);
         assert_eq!(
-            Asdu::file_ready(PARAMS_WIDE, bad, 1, FileReadyInfo { ioa: 1, ..Default::default() }),
+            Asdu::file_ready(
+                PARAMS_WIDE,
+                bad,
+                1,
+                FileReadyInfo {
+                    ioa: 1,
+                    ..Default::default()
+                }
+            ),
             Err(Error::CmdCause)
         );
         assert_eq!(
-            Asdu::section_ready(PARAMS_WIDE, bad, 1, SectionReadyInfo { ioa: 1, ..Default::default() }),
+            Asdu::section_ready(
+                PARAMS_WIDE,
+                bad,
+                1,
+                SectionReadyInfo {
+                    ioa: 1,
+                    ..Default::default()
+                }
+            ),
             Err(Error::CmdCause)
         );
         assert_eq!(
@@ -1111,7 +1140,10 @@ mod tests {
                 PARAMS_WIDE,
                 bad,
                 1,
-                AckFileOrSectionInfo { ioa: 1, ..Default::default() }
+                AckFileOrSectionInfo {
+                    ioa: 1,
+                    ..Default::default()
+                }
             ),
             Err(Error::CmdCause)
         );
@@ -1120,7 +1152,10 @@ mod tests {
                 PARAMS_WIDE,
                 coa(Cause::FILE_TRANSFER),
                 1,
-                &[DirectoryInfo { ioa: 1, ..Default::default() }]
+                &[DirectoryInfo {
+                    ioa: 1,
+                    ..Default::default()
+                }]
             ),
             Err(Error::CmdCause),
             "a directory is spontaneous or requested, never a file transfer"
@@ -1133,7 +1168,10 @@ mod tests {
                     PARAMS_WIDE,
                     coa(c),
                     1,
-                    CallOrSelectFileInfo { ioa: 1, ..Default::default() }
+                    CallOrSelectFileInfo {
+                        ioa: 1,
+                        ..Default::default()
+                    }
                 )
                 .is_ok(),
                 "{c:?}"
@@ -1156,7 +1194,10 @@ mod tests {
             PARAMS_WIDE,
             transfer(),
             1,
-            FileReadyInfo { ioa: 1, ..Default::default() },
+            FileReadyInfo {
+                ioa: 1,
+                ..Default::default()
+            },
         )
         .unwrap();
         let mut short = a.clone();

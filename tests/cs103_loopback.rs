@@ -72,7 +72,12 @@ impl ClientHandler for Master {
         Ok(())
     }
 
-    async fn gi_termination(&self, _l: &dyn Link, _pack: &Asdu, scn: u8) -> rs_iec60870_5::Result<()> {
+    async fn gi_termination(
+        &self,
+        _l: &dyn Link,
+        _pack: &Asdu,
+        scn: u8,
+    ) -> rs_iec60870_5::Result<()> {
         self.log.gi_terminations.lock().await.push(scn);
         Ok(())
     }
@@ -228,7 +233,10 @@ async fn auto_init_sends_a_time_sync_and_a_general_interrogation() {
         .iter()
         .position(|t| *t == TypeId::GENERAL_INTERROGATION)
         .unwrap();
-    assert!(ts < gi, "the time synchronization precedes the interrogation");
+    assert!(
+        ts < gi,
+        "the time synchronization precedes the interrogation"
+    );
 
     // The interrogation reply and its termination both come back.
     eventually("the interrogation terminates", async || {
@@ -261,9 +269,9 @@ async fn a_general_command_is_acknowledged_with_its_rii() {
     .unwrap();
 
     sim.wait("the device to receive the command", |events| {
-        events.iter().any(|e| {
-            matches!(e, Event::UserData(a) if a.type_id == TypeId::GENERAL_COMMAND)
-        })
+        events
+            .iter()
+            .any(|e| matches!(e, Event::UserData(a) if a.type_id == TypeId::GENERAL_COMMAND))
     })
     .await;
 

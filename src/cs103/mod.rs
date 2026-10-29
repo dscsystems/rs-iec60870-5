@@ -91,12 +91,11 @@ mod config;
 mod elements;
 mod handler;
 
-pub use client::{Client, ClientOption, DEFAULT_RECONNECT_INTERVAL, PRIM_FC_RESET_FCB};
-pub use handler::{ClientHandler, Link};
 pub use asdu::{
     ASDU_SIZE_MAX, Asdu, Cause, GLOBAL_COMMON_ADDR, GeneralCommandInfo, IDENTIFIER_SIZE,
     IdentificationInfo, MeasurandsInfo, TimeTaggedInfo, TimeTaggedMeasurandsInfo, TypeId,
 };
+pub use client::{Client, ClientOption, DEFAULT_RECONNECT_INTERVAL, PRIM_FC_RESET_FCB};
 pub use config::{
     Config, DEFAULT_MAX_SEND_QUEUE_SIZE, DEFAULT_TIMEOUT_REPEAT_T2, DEFAULT_TIMEOUT_RESPONSE_T1,
     DEFAULT_TIMEOUT_SEND_LINK_MSG, DEFAULT_TIMEOUT_TEST_T3, LINK_ADDR_SIZE,
@@ -105,6 +104,7 @@ pub use elements::{
     CP32TIME2A_SIZE, Dco, Dpi, Measurand, cp32time2a, cp32time2a_tag, fun, inf, parse_cp32time2a,
     parse_cp32time2a_tag,
 };
+pub use handler::{ClientHandler, Link};
 
 // The 103 link layer is the FT1.2 procedure of 101, so its transport and
 // serial settings are shared rather than duplicated.

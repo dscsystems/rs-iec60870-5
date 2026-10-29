@@ -57,8 +57,13 @@ impl RecordingMaster {
                 return a;
             }
             if tokio::time::Instant::now() >= deadline {
-                let seen: Vec<String> =
-                    self.asdus.lock().await.iter().map(|a| a.to_string()).collect();
+                let seen: Vec<String> = self
+                    .asdus
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect();
                 panic!("timed out waiting for {what}; received: {seen:#?}");
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -71,7 +76,12 @@ struct SharedMaster(Arc<RecordingMaster>);
 
 #[async_trait::async_trait]
 impl ClientHandler for SharedMaster {
-    async fn asdu_all(&self, _c: &dyn Connect, pack: &Asdu, _n: usize) -> rs_iec60870_5::Result<()> {
+    async fn asdu_all(
+        &self,
+        _c: &dyn Connect,
+        pack: &Asdu,
+        _n: usize,
+    ) -> rs_iec60870_5::Result<()> {
         self.0.asdus.lock().await.push(pack.clone());
         Ok(())
     }
@@ -184,7 +194,10 @@ async fn rust_primary_interoperates_with_the_go_secondary() {
     .await
     .unwrap();
     let ev = go
-        .wait("the single command", field_is("single_cmd", "ioa", 6000.into()))
+        .wait(
+            "the single command",
+            field_is("single_cmd", "ioa", 6000.into()),
+        )
         .await;
     assert_eq!(ev["value"], true);
     assert_eq!(ev["qual"], 1);
@@ -243,8 +256,7 @@ async fn rust_primary_interoperates_with_the_go_secondary() {
     .await;
     handler
         .wait_for("the counter response", |a| {
-            a.type_id() == TypeId::M_IT_NA_1
-                && a.coa().cause == Cause::REQUEST_BY_GENERAL_COUNTER
+            a.type_id() == TypeId::M_IT_NA_1 && a.coa().cause == Cause::REQUEST_BY_GENERAL_COUNTER
         })
         .await;
 
@@ -342,7 +354,7 @@ impl ServerHandler for RustOutstation {
                 time: chrono::DateTime::parse_from_rfc3339("2026-08-17T12:34:56.789Z")
                     .ok()
                     .map(|t| t.to_utc()),
-                    time_flags: TimeTagFlags::GOOD,
+                time_flags: TimeTagFlags::GOOD,
             }],
         )
         .await?;
@@ -432,8 +444,10 @@ async fn go_primary_interoperates_with_the_rust_secondary() {
     );
 
     // -- control direction: commands issued by the Go primary --------------
-    go.wait("all Go-side commands to be issued", |v| v["event"] == "done")
-        .await;
+    go.wait("all Go-side commands to be issued", |v| {
+        v["event"] == "done"
+    })
+    .await;
 
     let confirmations = go.all_of("asdu").await;
     let has = |t: &str, cause: u64| {
@@ -441,16 +455,16 @@ async fn go_primary_interoperates_with_the_rust_secondary() {
             .iter()
             .any(|v| v["type"] == t && v["cause"] == cause)
     };
-    assert!(has("C_SC_NA_1", 7), "single command confirmed: {confirmations:#?}");
+    assert!(
+        has("C_SC_NA_1", 7),
+        "single command confirmed: {confirmations:#?}"
+    );
     assert!(has("C_SC_NA_1", 10), "single command terminated");
     assert!(has("C_SE_NC_1", 7), "float setpoint confirmed");
     assert!(has("C_CS_NA_1", 7), "clock synchronization confirmed");
 
     // The class buffers drained, so nothing is stuck.
-    eventually("the class buffers drain", async || {
-        srv.buffered() == (0, 0)
-    })
-    .await;
+    eventually("the class buffers drain", async || srv.buffered() == (0, 0)).await;
 
     go.kill().await;
     srv.close();

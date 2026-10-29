@@ -63,9 +63,7 @@ impl Endpoint {
             .unwrap_or_default()
             .to_string();
         if host.is_empty() || !host.contains(':') {
-            return Err(Error::InvalidAddress(format!(
-                "{host:?} is not host:port"
-            )));
+            return Err(Error::InvalidAddress(format!("{host:?} is not host:port")));
         }
         Ok(Endpoint { host, tls })
     }
@@ -83,7 +81,12 @@ impl Endpoint {
 
 impl fmt::Display for Endpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}://{}", if self.tls { "tls" } else { "tcp" }, self.host)
+        write!(
+            f,
+            "{}://{}",
+            if self.tls { "tls" } else { "tcp" },
+            self.host
+        )
     }
 }
 
@@ -328,10 +331,7 @@ mod tests {
 
     #[test]
     fn a_leading_colon_means_loopback() {
-        assert_eq!(
-            Endpoint::parse(":2404").unwrap().host,
-            "127.0.0.1:2404"
-        );
+        assert_eq!(Endpoint::parse(":2404").unwrap().host, "127.0.0.1:2404");
     }
 
     #[test]

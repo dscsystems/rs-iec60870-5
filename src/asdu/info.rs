@@ -47,11 +47,7 @@ impl SinglePoint {
 
 impl From<bool> for SinglePoint {
     fn from(v: bool) -> Self {
-        if v {
-            SinglePoint::On
-        } else {
-            SinglePoint::Off
-        }
+        if v { SinglePoint::On } else { SinglePoint::Off }
     }
 }
 
@@ -308,7 +304,11 @@ impl Normalize {
 
     /// Build from a fraction in `[-1, 1)`, saturating at the representable range.
     pub fn from_f64(v: f64) -> Self {
-        Normalize((v * 32768.0).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16)
+        Normalize(
+            (v * 32768.0)
+                .round()
+                .clamp(i16::MIN as f64, i16::MAX as f64) as i16,
+        )
     }
 }
 

@@ -10,7 +10,9 @@
 use chrono::{DateTime, Utc};
 
 use crate::asdu::codec::{Asdu, check_valid};
-use crate::asdu::identifier::{Cause, CauseOfTransmission, CommonAddr, Identifier, TypeId, VariableStruct};
+use crate::asdu::identifier::{
+    Cause, CauseOfTransmission, CommonAddr, Identifier, TypeId, VariableStruct,
+};
 use crate::asdu::info::*;
 use crate::asdu::params::Params;
 use crate::asdu::time::TimeTagFlags;
@@ -1189,11 +1191,11 @@ impl Asdu {
                 _ => return Err(Error::TypeIdNotMatch),
             };
             out.push(BinaryCounterReadingInfo {
-            ioa,
-            value,
-            time,
-            time_flags: r.time_flags(),
-        });
+                ioa,
+                value,
+                time,
+                time_flags: r.time_flags(),
+            });
         }
         Ok(out)
     }
@@ -1218,7 +1220,8 @@ impl Asdu {
         for v in infos {
             let mut e = u.encoder();
             e.info_obj_addr(v.ioa)?;
-            e.byte(v.event.value() | (v.qdp.0 & 0xf8)).cp16time2a(v.msec);
+            e.byte(v.event.value() | (v.qdp.0 & 0xf8))
+                .cp16time2a(v.msec);
             match type_id {
                 TypeId::M_EP_TA_1 => {
                     e.cp24time2a_tag(v.time, v.time_flags);
@@ -1253,9 +1256,7 @@ impl Asdu {
     }
 
     /// Decode `M_EP_TA_1` or `M_EP_TD_1`.
-    pub fn get_event_of_protection_equipment(
-        &self,
-    ) -> Result<Vec<EventOfProtectionEquipmentInfo>> {
+    pub fn get_event_of_protection_equipment(&self) -> Result<Vec<EventOfProtectionEquipmentInfo>> {
         let seq = self.variable().is_sequence;
         let n = self.variable().number as usize;
         let mut r = self.reader();
@@ -1335,9 +1336,7 @@ impl Asdu {
     }
 
     /// Decode `M_EP_TB_1` or `M_EP_TE_1`.
-    pub fn get_packed_start_events(
-        &self,
-    ) -> Result<PackedStartEventsOfProtectionEquipmentInfo> {
+    pub fn get_packed_start_events(&self) -> Result<PackedStartEventsOfProtectionEquipmentInfo> {
         if self.variable().is_sequence || self.variable().number != 1 {
             return Err(Error::InfoObjIndexFit);
         }
@@ -1452,14 +1451,7 @@ impl Asdu {
         infos: &[PackedSinglePointWithScdInfo],
     ) -> Result<Asdu> {
         check_untagged_cause(coa)?;
-        let mut u = start(
-            params,
-            TypeId::M_PS_NA_1,
-            is_sequence,
-            coa,
-            ca,
-            infos.len(),
-        )?;
+        let mut u = start(params, TypeId::M_PS_NA_1, is_sequence, coa, ca, infos.len())?;
         for (i, v) in infos.iter().enumerate() {
             let mut e = u.encoder();
             if writes_addr(is_sequence, i) {
@@ -1498,7 +1490,10 @@ mod tests {
     }
 
     fn t() -> Option<DateTime<Utc>> {
-        Some(Utc.with_ymd_and_hms(2019, 6, 5, 21, 17, 45).unwrap() + chrono::Duration::milliseconds(678))
+        Some(
+            Utc.with_ymd_and_hms(2019, 6, 5, 21, 17, 45).unwrap()
+                + chrono::Duration::milliseconds(678),
+        )
     }
 
     #[test]
@@ -1648,9 +1643,14 @@ mod tests {
             time: None,
             time_flags: TimeTagFlags::GOOD,
         }];
-        let a =
-            Asdu::measured_value_normal_no_quality(PARAMS_WIDE, false, coa(Cause::PERIODIC), 1, &infos)
-                .unwrap();
+        let a = Asdu::measured_value_normal_no_quality(
+            PARAMS_WIDE,
+            false,
+            coa(Cause::PERIODIC),
+            1,
+            &infos,
+        )
+        .unwrap();
         // 3 address + 2 value octets only.
         assert_eq!(a.info_obj.len(), 5);
         let got = a.get_measured_value_normal().unwrap();
@@ -1686,8 +1686,8 @@ mod tests {
             Asdu::integrated_totals(PARAMS_WIDE, false, coa(Cause::PERIODIC), 1, &[info]),
             Err(Error::CmdCause)
         );
-        let a =
-            Asdu::integrated_totals(PARAMS_WIDE, false, coa(Cause::SPONTANEOUS), 1, &[info]).unwrap();
+        let a = Asdu::integrated_totals(PARAMS_WIDE, false, coa(Cause::SPONTANEOUS), 1, &[info])
+            .unwrap();
         assert_eq!(a.get_integrated_totals().unwrap()[0], info);
     }
 
@@ -1730,9 +1730,8 @@ mod tests {
             time: t(),
             time_flags: TimeTagFlags::GOOD,
         };
-        let a =
-            Asdu::packed_start_events_cp56time2a(PARAMS_WIDE, coa(Cause::SPONTANEOUS), 1, info)
-                .unwrap();
+        let a = Asdu::packed_start_events_cp56time2a(PARAMS_WIDE, coa(Cause::SPONTANEOUS), 1, info)
+            .unwrap();
         assert_eq!(a.get_packed_start_events().unwrap(), info);
     }
 
@@ -1787,8 +1786,14 @@ mod tests {
     fn every_family_survives_a_wire_round_trip() {
         let p = PARAMS_WIDE;
         let asdus = [
-            Asdu::single(p, false, coa(Cause::SPONTANEOUS), 1, &[SinglePointInfo::new(1, true)])
-                .unwrap(),
+            Asdu::single(
+                p,
+                false,
+                coa(Cause::SPONTANEOUS),
+                1,
+                &[SinglePointInfo::new(1, true)],
+            )
+            .unwrap(),
             Asdu::double(
                 p,
                 false,
@@ -1801,8 +1806,14 @@ mod tests {
                 }],
             )
             .unwrap(),
-            Asdu::step(p, false, coa(Cause::SPONTANEOUS), 1, &[StepPositionInfo::default()])
-                .unwrap(),
+            Asdu::step(
+                p,
+                false,
+                coa(Cause::SPONTANEOUS),
+                1,
+                &[StepPositionInfo::default()],
+            )
+            .unwrap(),
             Asdu::bitstring32(
                 p,
                 false,
@@ -1961,7 +1972,10 @@ mod tests {
         assert_eq!(got.time, Some(t));
         assert!(got.time_flags.invalid);
         assert!(!got.time_flags.is_valid());
-        assert!(a.to_string().contains("(IV)"), "the log line must show it: {a}");
+        assert!(
+            a.to_string().contains("(IV)"),
+            "the log line must show it: {a}"
+        );
     }
 
     #[test]
@@ -1974,6 +1988,9 @@ mod tests {
             &[SinglePointInfo::new(1, true)],
         )
         .unwrap();
-        assert_eq!(a.get_single_point().unwrap()[0].time_flags, TimeTagFlags::GOOD);
+        assert_eq!(
+            a.get_single_point().unwrap()[0].time_flags,
+            TimeTagFlags::GOOD
+        );
     }
 }

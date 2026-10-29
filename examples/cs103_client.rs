@@ -59,12 +59,7 @@ impl ClientHandler for Relays {
 
         println!(
             "device {:<3} {:<22} FUN={:<3} INF={:<3} {}{}",
-            pack.common_addr,
-            what,
-            info.fun,
-            info.inf,
-            info.dpi,
-            time
+            pack.common_addr, what, info.fun, info.inf, info.dpi, time
         );
         Ok(())
     }
