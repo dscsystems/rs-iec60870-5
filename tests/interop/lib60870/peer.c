@@ -104,7 +104,8 @@ static bool client_asdu(void* p,int address,CS101_ASDU a) {
     if(type<120)return true;
     InformationObject io=CS101_ASDU_getElement(a,0);if(!io)exit(6);
     if(type==F_FR_NA_1) {
-        queue_send(c,(InformationObject)FileCallOrSelect_create(NULL,100,2,0,1),13);
+        /* File ready confirms the select: call the file (SCQ 2). */
+        queue_send(c,(InformationObject)FileCallOrSelect_create(NULL,100,2,0,2),13);
     } else if(type==F_SR_NA_1) {
         queue_send(c,(InformationObject)FileCallOrSelect_create(NULL,100,2,SectionReady_getNameOfSection((SectionReady)io),6),13);
     } else if(type==F_SG_NA_1) {

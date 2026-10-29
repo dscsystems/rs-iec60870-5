@@ -246,20 +246,117 @@ async fn a_request_for_a_file_that_is_not_there_is_refused_on_the_wire() {
     )
     .unwrap();
 
-    // The peer is told, and the caller is told.
-    assert_eq!(
-        sender.handle(&s_link, &select).await,
-        Err(Error::FileNotFound)
-    );
+    // The peer is told, with the mirrored select (cause 47, P/N set). The
+    // request was handled, so the caller gets no error to turn into a second
+    // refusal.
+    assert_eq!(sender.handle(&s_link, &select).await, Ok(true));
     let sent = s_link.take();
     assert_eq!(sent.len(), 1);
-    let ack = sent[0].get_ack_file_or_section().unwrap();
-    assert_eq!(ack.afq.action, crate::asdu::AfqAction::NEG_ACK_FILE);
-    assert_eq!(
-        ack.afq.error,
-        crate::asdu::FileError::UNEXPECTED_NAME_OF_FILE
-    );
+    assert_eq!(sent[0].type_id(), TypeId::F_SC_NA_1);
+    assert_eq!(sent[0].coa().cause, Cause::UNKNOWN_IOA);
+    assert!(sent[0].coa().is_negative);
+    assert_eq!(sent[0].info_obj, select.info_obj);
     assert!(!sender.in_progress());
+}
+
+#[tokio::test]
+async fn a_refused_select_ends_the_transfer_at_the_receiver() {
+    let (sender, s_link, receiver, r_link, _) = pair(Vec::new());
+    receiver
+        .request_file(&r_link, CA, IOA + 1, NOF)
+        .await
+        .unwrap();
+    let select = r_link.take().remove(0);
+    let _ = sender.handle(&s_link, &select).await;
+    let refusal = s_link.take().remove(0);
+    assert_eq!(
+        receiver.handle(&r_link, &refusal).await,
+        Err(Error::FileNotFound)
+    );
+    assert!(!receiver.in_progress());
+    assert!(r_link.take().is_empty());
+}
+
+/// The type and SCQ/AFQ/LSQ of each ASDU, for comparing a procedure.
+fn steps(asdus: &[Asdu]) -> Vec<String> {
+    asdus
+        .iter()
+        .map(|a| match a.type_id() {
+            TypeId::F_SC_NA_1 => format!("SC{}", a.get_call_or_select_file().unwrap().scq.action.0),
+            TypeId::F_AF_NA_1 => format!("AF{}", a.get_ack_file_or_section().unwrap().afq.action.0),
+            TypeId::F_LS_NA_1 => format!("LS{}", a.get_last_section_or_segment().unwrap().lsq.0),
+            TypeId::F_FR_NA_1 => "FR".into(),
+            TypeId::F_SR_NA_1 => "SR".into(),
+            TypeId::F_SG_NA_1 => "SG".into(),
+            t => format!("{t:?}"),
+        })
+        .collect()
+}
+
+/// Shuttle like [`pump`], recording every ASDU in the order it was sent.
+async fn trace(
+    sender: &Sender,
+    s_link: &Recorder,
+    receiver: &Receiver,
+    r_link: &Recorder,
+) -> Vec<Asdu> {
+    let mut all = Vec::new();
+    for _ in 0..100 {
+        let to_receiver = s_link.take();
+        let to_sender = r_link.take();
+        if to_receiver.is_empty() && to_sender.is_empty() {
+            return all;
+        }
+        for a in to_sender {
+            all.push(a.clone());
+            sender.handle(s_link, &a).await.expect("sender");
+        }
+        for a in to_receiver {
+            all.push(a.clone());
+            receiver.handle(r_link, &a).await.expect("receiver");
+        }
+    }
+    panic!("the transfer did not settle");
+}
+
+#[tokio::test]
+async fn the_procedure_is_the_one_of_101_7_4_11() {
+    // Two sections, the second shorter.
+    let data = parts(300);
+    let (sender, s_link, receiver, r_link, dst) = pair(data.clone());
+    sender.set_section_size(200);
+    receiver.request_file(&r_link, CA, IOA, NOF).await.unwrap();
+    let all = trace(&sender, &s_link, &receiver, &r_link).await;
+    assert_eq!(
+        steps(&all),
+        [
+            "SC1", "FR", "SC2", "SR", "SC6", "SG", "LS3", "AF3", "SR", "SC6", "SG", "LS3", "AF3",
+            "LS1", "AF1"
+        ]
+    );
+    // The last-section marker carries the checksum of the whole file.
+    let last = all[all.len() - 2].get_last_section_or_segment().unwrap();
+    assert_eq!(last.chs, crate::asdu::file_checksum(&data));
+    let ready = all[1].get_file_ready().unwrap();
+    assert_eq!(ready.length_of_file, 300);
+    assert_eq!(dst.read(IOA, NOF).await.unwrap(), data);
+}
+
+#[tokio::test]
+async fn a_sender_skipping_file_ready_is_followed() {
+    // A station that answers the select with section ready, as go-iecp5 did
+    // before it followed 7.4.11: the call of the file it answers the same way.
+    let data = parts(300);
+    let (sender, s_link, receiver, r_link, dst) = pair(data.clone());
+    receiver.request_file(&r_link, CA, IOA, NOF).await.unwrap();
+    let mut select = r_link.take().remove(0);
+    let mut info = select.get_call_or_select_file().unwrap();
+    info.scq.action = crate::asdu::ScqAction::REQUEST_FILE;
+    select = Asdu::call_or_select_file(PARAMS_WIDE, select.coa(), CA, info).unwrap();
+    sender.handle(&s_link, &select).await.unwrap();
+    let all = trace(&sender, &s_link, &receiver, &r_link).await;
+    assert_eq!(steps(&all)[..2], ["SR", "SC6"]);
+    assert_eq!(dst.read(IOA, NOF).await.unwrap(), data);
 }
 
 #[tokio::test]
@@ -569,7 +666,7 @@ async fn a_section_number_that_names_nothing_is_refused() {
         sender
             .handle(&s_link, &call(crate::asdu::ScqAction::SELECT_SECTION, 9))
             .await,
-        Err(Error::NoTransfer)
+        Ok(true)
     );
     let sent = s_link.take();
     assert_eq!(sent.len(), 1);

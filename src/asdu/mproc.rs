@@ -297,13 +297,19 @@ fn check_tagged_cause(coa: CauseOfTransmission) -> Result<()> {
     }
 }
 
-/// Causes permitted for untagged measured values (adds `Periodic`, drops return info).
+/// Causes permitted for untagged measured values (adds `Periodic`).
+///
+/// Return information (11, 12) is accepted too: a station reports the value a
+/// set-point command wrote with it, as lib60870, j60870, go-iecp5 and
+/// cB-Sigma/iec60870 all do.
 fn check_measured_cause(coa: CauseOfTransmission) -> Result<()> {
     let c = coa.cause;
     if c == Cause::PERIODIC
         || c == Cause::BACKGROUND
         || c == Cause::SPONTANEOUS
         || c == Cause::REQUEST
+        || c == Cause::RETURN_INFO_REMOTE
+        || c == Cause::RETURN_INFO_LOCAL
         || c.is_interrogation()
     {
         Ok(())
@@ -312,18 +318,13 @@ fn check_measured_cause(coa: CauseOfTransmission) -> Result<()> {
     }
 }
 
-/// Causes permitted for time-tagged measured values and bit strings.
-fn check_spontaneous_or_request(coa: CauseOfTransmission) -> Result<()> {
-    if coa.cause == Cause::SPONTANEOUS || coa.cause == Cause::REQUEST {
-        Ok(())
-    } else {
-        Err(Error::CmdCause)
-    }
-}
-
-/// Causes permitted for integrated totals.
+/// Causes permitted for integrated totals: the answer to a read command
+/// (`Request`) included.
 fn check_counter_cause(coa: CauseOfTransmission) -> Result<()> {
-    if coa.cause == Cause::SPONTANEOUS || coa.cause.is_counter_request() {
+    if coa.cause == Cause::SPONTANEOUS
+        || coa.cause == Cause::REQUEST
+        || coa.cause.is_counter_request()
+    {
         Ok(())
     } else {
         Err(Error::CmdCause)
@@ -720,7 +721,7 @@ impl Asdu {
         ca: CommonAddr,
         infos: &[BitString32Info],
     ) -> Result<Asdu> {
-        check_spontaneous_or_request(coa)?;
+        check_tagged_cause(coa)?;
         Self::bitstring32_with_type(params, TypeId::M_BO_TA_1, false, coa, ca, infos)
     }
 
@@ -731,7 +732,7 @@ impl Asdu {
         ca: CommonAddr,
         infos: &[BitString32Info],
     ) -> Result<Asdu> {
-        check_spontaneous_or_request(coa)?;
+        check_tagged_cause(coa)?;
         Self::bitstring32_with_type(params, TypeId::M_BO_TB_1, false, coa, ca, infos)
     }
 
@@ -832,7 +833,7 @@ impl Asdu {
         ca: CommonAddr,
         infos: &[MeasuredValueNormalInfo],
     ) -> Result<Asdu> {
-        check_spontaneous_or_request(coa)?;
+        check_tagged_cause(coa)?;
         Self::measured_value_normal_with_type(params, TypeId::M_ME_TA_1, false, coa, ca, infos)
     }
 
@@ -843,7 +844,7 @@ impl Asdu {
         ca: CommonAddr,
         infos: &[MeasuredValueNormalInfo],
     ) -> Result<Asdu> {
-        check_spontaneous_or_request(coa)?;
+        check_tagged_cause(coa)?;
         Self::measured_value_normal_with_type(params, TypeId::M_ME_TD_1, false, coa, ca, infos)
     }
 
@@ -962,7 +963,7 @@ impl Asdu {
         ca: CommonAddr,
         infos: &[MeasuredValueScaledInfo],
     ) -> Result<Asdu> {
-        check_spontaneous_or_request(coa)?;
+        check_tagged_cause(coa)?;
         Self::measured_value_scaled_with_type(params, TypeId::M_ME_TB_1, false, coa, ca, infos)
     }
 
@@ -973,7 +974,7 @@ impl Asdu {
         ca: CommonAddr,
         infos: &[MeasuredValueScaledInfo],
     ) -> Result<Asdu> {
-        check_spontaneous_or_request(coa)?;
+        check_tagged_cause(coa)?;
         Self::measured_value_scaled_with_type(params, TypeId::M_ME_TE_1, false, coa, ca, infos)
     }
 
@@ -1061,7 +1062,7 @@ impl Asdu {
         ca: CommonAddr,
         infos: &[MeasuredValueFloatInfo],
     ) -> Result<Asdu> {
-        check_spontaneous_or_request(coa)?;
+        check_tagged_cause(coa)?;
         Self::measured_value_float_with_type(params, TypeId::M_ME_TC_1, false, coa, ca, infos)
     }
 
@@ -1072,7 +1073,7 @@ impl Asdu {
         ca: CommonAddr,
         infos: &[MeasuredValueFloatInfo],
     ) -> Result<Asdu> {
-        check_spontaneous_or_request(coa)?;
+        check_tagged_cause(coa)?;
         Self::measured_value_float_with_type(params, TypeId::M_ME_TF_1, false, coa, ca, infos)
     }
 

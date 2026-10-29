@@ -22,15 +22,18 @@ fn transfer() -> CauseOfTransmission {
 }
 
 /// What one state transition produced: the ASDUs to transmit, and the error to
-/// report to the caller.
+/// report.
 ///
-/// The two are independent. A request for a file the store does not have is
-/// answered on the wire with a negative acknowledgement *and* reported to the
-/// application — the peer needs to be told, and so does the caller.
+/// A request the sender refuses — a file the store does not have, a section
+/// that names nothing — is answered on the wire, and the error is then only
+/// logged (`answered`): the request was handled, and returning it to a
+/// [`ServerHandler`](crate::cs104::ServerHandler) would make the session send a
+/// second, unknown-type refusal.
 #[derive(Default)]
 struct Reply {
     send: Vec<Asdu>,
     error: Option<Error>,
+    answered: bool,
 }
 
 impl Reply {
@@ -41,22 +44,23 @@ impl Reply {
     fn send(asdus: Vec<Asdu>) -> Reply {
         Reply {
             send: asdus,
-            error: None,
+            ..Default::default()
         }
     }
 
     fn failed(e: Error) -> Reply {
         Reply {
-            send: Vec::new(),
             error: Some(e),
+            ..Default::default()
         }
     }
 
-    /// Transmit `asdus`, and still report `e`.
+    /// Refuse the request with `asdus`, and log why.
     fn send_and_fail(asdus: Vec<Asdu>, e: Error) -> Reply {
         Reply {
             send: asdus,
             error: Some(e),
+            answered: true,
         }
     }
 }
@@ -88,6 +92,14 @@ struct Active {
 ///
 /// One transfer runs at a time, which is what the standard's procedure allows
 /// per common address.
+///
+/// The procedure is the one of IEC 60870-5-101 7.4.11: a select is answered
+/// with file ready (`F_FR_NA_1`), the call of the file with section ready
+/// (`F_SR_NA_1`), the call of a section with its segments and the last-segment
+/// marker, and the acknowledgement of the last section with the last-section
+/// marker carrying the checksum of the file. A select of a file the store does
+/// not have is refused with the mirrored `F_SC_NA_1`, cause 47 (unknown
+/// information object address) and P/N set.
 ///
 /// Feed it every ASDU your handler receives; it reports whether the ASDU
 /// belonged to the file transfer service, and you continue with your own
@@ -179,6 +191,11 @@ impl Sender {
     ///
     /// Returns `true` when the ASDU belonged to the file transfer service. A
     /// `false` return means the caller should continue with its own dispatch.
+    ///
+    /// A request the sender refuses on the wire (an unknown file or section)
+    /// returns `Ok(true)` as well, and the reason is logged at `warn`. An
+    /// error is returned only for what was not answered: a monitor-direction
+    /// file type, a store failure, or a failed send.
     pub async fn handle(&self, conn: &dyn Connect, a: &Asdu) -> Result<bool> {
         if !is_file_asdu(a.type_id()) {
             return Ok(false);
@@ -201,6 +218,10 @@ impl Sender {
             }
         }
         match reply.error {
+            Some(e) if reply.answered => {
+                tracing::warn!(asdu = %a, error = %e, "file transfer request refused");
+                Ok(true)
+            }
             Some(e) => Err(e),
             None => Ok(true),
         }
@@ -217,29 +238,42 @@ impl Sender {
             ScqAction::DEFAULT => self.directory(params, ca).await,
 
             ScqAction::SELECT_FILE | ScqAction::REQUEST_FILE => {
+                let select = req.scq.action == ScqAction::SELECT_FILE;
+                // The call of the file that was just selected starts on its
+                // first section.
+                if !select {
+                    let mut active = self.active.lock().unwrap();
+                    if let Some(t) = active
+                        .as_mut()
+                        .filter(|t| t.ca == ca && t.ioa == req.ioa && t.nof == req.nof)
+                    {
+                        t.cur = 0;
+                        return Self::section_ready(params, t).into();
+                    }
+                }
                 let data = match self.store.read(req.ioa, req.nof).await {
                     Ok(d) => d,
                     Err(e) => {
-                        return self.neg_ack_reply(
-                            params,
-                            ca,
-                            &req,
-                            AfqAction::NEG_ACK_FILE,
-                            FileError::UNEXPECTED_NAME_OF_FILE,
+                        return Reply::send_and_fail(
+                            vec![a.reply_mirror(Cause::UNKNOWN_IOA).negated()],
                             e,
                         );
                     }
                 };
                 let section_size = *self.section_size.lock().unwrap();
                 let mut active = self.active.lock().unwrap();
-                *active = Some(Active {
+                let t = active.insert(Active {
                     ca,
                     ioa: req.ioa,
                     nof: req.nof,
                     sections: split_sections(&data, section_size),
                     cur: 0,
                 });
-                Self::section_ready(params, active.as_ref().expect("just set")).into()
+                if select {
+                    Self::file_ready(params, t, data.len()).into()
+                } else {
+                    Self::section_ready(params, t).into()
+                }
             }
 
             ScqAction::SELECT_SECTION | ScqAction::REQUEST_SECTION => {
@@ -385,6 +419,21 @@ impl Sender {
             .into()
     }
 
+    /// Confirm the selection of a file, `F_FR_NA_1` with its length.
+    fn file_ready(params: Params, t: &Active, len: usize) -> Result<Vec<Asdu>> {
+        Ok(vec![Asdu::file_ready(
+            params,
+            transfer(),
+            t.ca,
+            FileReadyInfo {
+                ioa: t.ioa,
+                nof: t.nof,
+                length_of_file: len as u32,
+                frq: Default::default(),
+            },
+        )?])
+    }
+
     /// Announce the current section, `F_SR_NA_1`.
     fn section_ready(params: Params, t: &Active) -> Result<Vec<Asdu>> {
         Ok(vec![Asdu::section_ready(
@@ -442,7 +491,8 @@ impl Sender {
         Ok(out)
     }
 
-    /// Close the file: `F_LS_NA_1` with an end-of-file qualifier.
+    /// Close the file: `F_LS_NA_1` with an end-of-file qualifier and the
+    /// checksum of the whole file.
     fn last_section(params: Params, t: &Active) -> Result<Vec<Asdu>> {
         Ok(vec![Asdu::last_section_or_segment(
             params,
@@ -453,7 +503,11 @@ impl Sender {
                 nof: t.nof,
                 nos: t.sections.len() as u8,
                 lsq: LastSectionQualifier::FILE_WITHOUT_DEACTIVATE,
-                chs: 0,
+                // The sum modulo 256 of the file is that of its sections.
+                chs: t
+                    .sections
+                    .iter()
+                    .fold(0u8, |sum, s| sum.wrapping_add(file_checksum(s))),
             },
         )?])
     }

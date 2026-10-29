@@ -29,6 +29,8 @@ struct Active {
     ioa: InfoObjAddr,
     nof: NameOfFile,
     nos: u8,
+    /// The file was called (SCQ 2) after its file ready.
+    called: bool,
     section_buf: Vec<u8>,
     file_buf: Vec<u8>,
 }
@@ -183,8 +185,10 @@ impl Receiver {
 
     /// Select a file for transfer: `F_SC_NA_1` with the select-file qualifier.
     ///
-    /// The outstation answers with the first section, and the transfer then
-    /// runs on its own until the file is complete.
+    /// The outstation answers with file ready, which is answered with the call
+    /// of the file, and the transfer then runs on its own until the file is
+    /// complete. An outstation that answers the select with section ready
+    /// directly is followed as well.
     pub async fn request_file(
         &self,
         conn: &dyn Connect,
@@ -202,6 +206,7 @@ impl Receiver {
                 ioa,
                 nof,
                 nos: 0,
+                called: false,
                 section_buf: Vec::new(),
                 file_buf: Vec::new(),
             });
@@ -286,6 +291,7 @@ impl Receiver {
             TypeId::F_LS_NA_1 => self.on_last_section_or_segment(params, a),
             // Control-direction ASDUs: this component produces them, a
             // controlling station does not receive them.
+            TypeId::F_SC_NA_1 if a.coa().is_negative => self.on_refused(a),
             TypeId::F_AF_NA_1 | TypeId::F_SC_NA_1 => Reply::failed(Error::FileServiceUnsupported),
             _ => Reply::nothing(),
         }
@@ -303,7 +309,30 @@ impl Receiver {
         }
 
         let mut active = self.active.lock().unwrap();
-        if !*self.auto_accept.lock().unwrap() || active.is_some() {
+        if let Some(t) = active.as_mut() {
+            // The confirmation of our own select: call the file.
+            if t.ca != a.common_addr() || t.ioa != info.ioa || t.nof != info.nof || t.called {
+                return Reply::nothing();
+            }
+            t.called = true;
+            return Asdu::call_or_select_file(
+                params,
+                transfer(),
+                t.ca,
+                CallOrSelectFileInfo {
+                    ioa: t.ioa,
+                    nof: t.nof,
+                    nos: 0,
+                    scq: SelectAndCallQualifier {
+                        action: ScqAction::REQUEST_FILE,
+                        error: FileError::NONE,
+                    },
+                },
+            )
+            .map(|a| vec![a])
+            .into();
+        }
+        if !*self.auto_accept.lock().unwrap() {
             return Reply::nothing();
         }
         *active = Some(Active {
@@ -311,6 +340,7 @@ impl Receiver {
             ioa: info.ioa,
             nof: info.nof,
             nos: 0,
+            called: false,
             section_buf: Vec::new(),
             file_buf: Vec::new(),
         });
@@ -333,6 +363,23 @@ impl Receiver {
         .into()
     }
 
+    /// The outstation refused our select or call: the mirrored `F_SC_NA_1`
+    /// with P/N set, typically cause 47 for a file it does not have.
+    fn on_refused(&self, a: &Asdu) -> Reply {
+        let Ok(info) = a.get_call_or_select_file() else {
+            return Reply::failed(Error::FileNotFound);
+        };
+        let mut active = self.active.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|t| t.ioa == info.ioa && t.nof == info.nof)
+        {
+            *active = None;
+            return Reply::failed(Error::FileNotFound);
+        }
+        Reply::nothing()
+    }
+
     fn on_section_ready(&self, params: Params, a: &Asdu) -> Reply {
         let info = match a.get_section_ready() {
             Ok(i) => i,
@@ -350,6 +397,7 @@ impl Receiver {
             return Reply::failed(Error::NoTransfer);
         }
         t.nos = info.nos;
+        t.called = true;
         t.section_buf.clear();
 
         Asdu::call_or_select_file(

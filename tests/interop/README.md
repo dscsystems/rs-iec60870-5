@@ -22,7 +22,7 @@ a test failure. Set `IEC60870_INTEROP_REQUIRED=1` to make missing dependencies
 fail as well; CI does this. The checkout and binaries are git-ignored.
 
 The current parity baseline is go-iecp5 commit
-`778fe38466157a0acf7a5db39949ced1b2bfa68b` (2026-09-29). The file peers require
+`fbe6719d9acc9b5d90eed3b9468e7937b8ed4711` (2026-10-29). The file peers require
 that revision or newer. The CI workflow pins it for reproducibility.
 
 ## What is covered
@@ -44,6 +44,8 @@ protection device, each master is driven against it in turn, and the two runs
 are compared: the device must observe the same link procedure and the same
 control-direction ASDUs, and both masters must decode the device's replies to
 the same values.
+
+| `interop_iec104` | 104 client against, and 104 controlled station driven by, the four reference stacks of [otfabric/iec104-interop](https://github.com/otfabric/iec104-interop) (lib60870-C, OpenMUC j60870, wendy512/go-iecp5, cB-Sigma/iec60870), run as Docker images |
 
 ## Running them
 
@@ -112,3 +114,38 @@ broadcast handling, DFC backpressure, and local DST ambiguity.
 Coverage is interoperability evidence for these exchanges, not IEC 60870-5-604
 conformance certification or a hardware test. IEC 103 uses the Go/relay harness;
 lib60870-C supplies IEC 101/104 rather than an IEC 103 reference.
+
+## otfabric/iec104-interop
+
+`interop_iec104` uses the prebuilt Docker images of
+[otfabric/iec104-interop](https://github.com/otfabric/iec104-interop), pinned
+to `v0.3.1`. Nothing is cloned or built; it needs only Docker.
+
+```sh
+cargo test --test interop_iec104
+IEC104_INTEROP_VERSION=v0.3.1 IEC104_INTEROP_REGISTRY=ghcr.io/otfabric cargo test --test interop_iec104
+```
+
+Without Docker (or when an image cannot be pulled) the tests print `SKIP:`;
+`IEC60870_INTEROP_REQUIRED=1` makes that a failure. `IEC104_INTEROP_KEEP=1`
+leaves the reference station containers behind for inspection.
+
+* `rust_master_with_<stack>_station`: this crate's `Client` against the
+  reference station serving the `baseline` fixture: general and counter
+  interrogation (every point, value and quality), read, clock
+  synchronization, direct and select-before-operate commands, refusals.
+* `<stack>_master_with_rust_station`: this crate's `Server` serves the same
+  fixture (`Baseline` in the test) and each reference client runs every case
+  of `iec104/cases.tsv` (copied from iec104-interop, MIT) against it. The
+  result document of each case must match, including the type and cause of
+  every ASDU received.
+
+Known deviations, none hidden:
+
+* OpenMUC j60870 1.8.0 cannot decode a read command (an upstream bug listed
+  in iec104-interop); read cases are skipped for it while it reports that
+  version.
+
+File transfer follows 60870-5-101 7.4.11 in both directions (select, file
+ready, call file, section ready, ..., last section with the file checksum),
+and downloads are checked against the fixture's content (SHA-256).
