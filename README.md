@@ -9,7 +9,7 @@ Async throughout, built on Tokio. Verified for wire compatibility against
 
 ```toml
 [dependencies]
-rs-iec60870-5 = "0.1"
+rs-iec60870-5 = "0.4"
 ```
 
 ## Modules

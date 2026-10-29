@@ -8,7 +8,7 @@ default-members = ["."]
 
 [package]
 name = "rs-iec60870-5"
-version = "0.2.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Ricardo Olsen"]

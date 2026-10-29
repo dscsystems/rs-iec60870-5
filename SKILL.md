@@ -13,7 +13,7 @@ Detailed docs: `docs/asdu.md`, `docs/cs104.md`, `docs/cs101.md`,
 
 ```toml
 [dependencies]
-rs-iec60870-5 = "0.1"
+rs-iec60870-5 = "0.4"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 chrono = "0.4"

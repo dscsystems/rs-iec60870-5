@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "cs104-explorer"
-version = "0.2.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1380,7 +1380,7 @@ dependencies = [
 
 [[package]]
 name = "rs-iec60870-5"
-version = "0.2.2"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",
