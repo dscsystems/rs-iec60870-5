@@ -172,7 +172,7 @@ only through the file handler.
 | `FileNotFound` | the store has no such file, or the outstation refused it with a negative FRQ |
 | `NoTransfer` | an ASDU arrived for a transfer that is not running, or naming a section that does not exist |
 | `TransferBusy` | a second transfer was requested while one is running |
-| `FileChecksum` | a section's checksum did not match; it is negatively acknowledged and served again |
+| `FileChecksum` | a section or file checksum did not match. The receiver sends a negative acknowledgement |
 | `FileServiceUnsupported` | an ASDU of the other direction, or `F_SC_NB_1` |
 
 An error from `handle` is a report, not a reason to tear down the link: the
@@ -186,9 +186,11 @@ component has already told the peer whatever the procedure requires.
   section it has already had — a transfer that never finishes.
 * **Segments are sized from the connection's parameters**, so a transfer over a
   narrow 101 link automatically uses smaller segments than one over 104.
-* **A checksum mismatch costs one section, not the file.** The receiver
+* **A section checksum mismatch retries that section.** The receiver
   discards the section, negatively acknowledges it, and the sender serves it
   again.
+* **The closing file checksum covers all sections.** A mismatch ends the
+  transfer with a negative file acknowledgement before storage or callback.
 * **An empty file is still a transfer**: one empty section, no segments, and
   the closing markers. It completes rather than hanging.
 * **Bulk data fills the send queue.** The transfer components retry queue-full

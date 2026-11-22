@@ -4,7 +4,7 @@ Pure Rust implementation of the IEC 60870-5 telecontrol protocols: **-104**
 (TCP/IP), **-101** (serial FT1.2) and **-103** (protection equipment), with both
 client and server sides for 101 and 104.
 
-Async throughout, built on Tokio. Verified for wire compatibility against
+Async throughout, built on Tokio. Requires Rust 1.88 or later. Verified for wire compatibility against
 [`go-iecp5`](https://github.com/riclolsen/go-iecp5) in every direction.
 
 ```toml
@@ -21,6 +21,8 @@ rs-iec60870-5 = "0.4"
 | [`cs101`] | IEC 60870-5-101 primary and secondary station over serial FT1.2, unbalanced (multi-drop) and balanced |
 | [`cs103`] | IEC 60870-5-103 master for protection equipment |
 | [`filetransfer`] | The file transfer procedures (types 120–126) on any endpoint: fetching disturbance records and the like |
+| [`secevent`] | Structured security events, asynchronous sinks, and opt-in endpoint policy |
+| [`netpeer`] | On-link MAC resolution and shared peer identity history |
 
 Vocabulary: *master* = controlling station = client; *outstation* = RTU = slave
 = controlled station = server. *Monitor direction* is data flowing to the master
@@ -172,6 +174,41 @@ cfg.tcp = TcpConfig { address: "10.0.0.9:2400".into(), ..Default::default() };
 The serial transport needs the `serial` feature. TCP encapsulation is still
 101/103 framing inside a pipe — not IEC 104 — so keep t₁ and t₂ generous enough
 for the added network latency.
+
+## Security events
+
+IEC 101, 103 and 104 endpoints can report structured events to a bounded
+dispatcher. Install a sink before starting the endpoint. Event kinds use
+the same dotted identifiers as go-iecp5, such as `access.unknown_ioa` and
+`tls.cert_rejected`.
+
+```rust
+# #[cfg(feature = "cs104")]
+# mod example {
+# use rs_iec60870_5::cs104::{Server, ServerHandler};
+# struct MyHandler;
+# #[async_trait::async_trait]
+# impl ServerHandler for MyHandler {}
+# fn configure() -> std::io::Result<()> {
+use rs_iec60870_5::secevent::{FunctionPolicy, Policy, tracing_sink};
+
+let server = Server::new(MyHandler);
+server.set_security_sink(tracing_sink)?;
+server.set_security_policy(Policy {
+    functions: FunctionPolicy {
+        read_only: true,
+        ..FunctionPolicy::default()
+    },
+    ..Policy::default()
+});
+# Ok(())
+# }
+# }
+```
+
+The default policy observes traffic. Explicit policies apply even when the
+dispatcher is disabled. See [security events and policy](docs/cs104.md#security-events-and-policy)
+for peer identity, rates, and sink configuration.
 
 ## Examples
 
@@ -355,3 +392,6 @@ Contact: <https://www.linkedin.com/in/ricardo-olsen/>
 [`cs101`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/cs101/
 [`cs103`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/cs103/
 [`cs104`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/cs104/
+[`filetransfer`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/filetransfer/
+[`netpeer`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/netpeer/
+[`secevent`]: https://docs.rs/rs-iec60870-5/latest/rs_iec60870_5/secevent/

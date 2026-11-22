@@ -89,7 +89,7 @@ static bool server_asdu(void* p,IMasterConnection c,CS101_ASDU a) {
         }
     } else if(type==F_AF_NA_1) {
         int action=FileACK_getAFQ((FileACK)io)&15;
-        if(action==3)server_send(c,(InformationObject)FileLastSegmentOrSection_create(NULL,100,2,1,1,0),13);
+        if(action==3)server_send(c,(InformationObject)FileLastSegmentOrSection_create(NULL,100,2,1,1,checksum(file_data,600)),13);
         if(action==1)printf("{\"event\":\"file_ack\"}\n");
     }
     InformationObject_destroy(io);return true;
@@ -124,7 +124,8 @@ static bool client_asdu(void* p,int address,CS101_ASDU a) {
             if(checksum(received+start,n)!=FileLastSegmentOrSection_getCHS(last))exit(8);
             queue_send(c,(InformationObject)FileACK_create(NULL,100,2,nos,3),13);
         } else {
-            if(received_size!=600 || memcmp(received,file_data,600))exit(9);
+            if(received_size!=600 || memcmp(received,file_data,600) ||
+               checksum(received,received_size)!=FileLastSegmentOrSection_getCHS(last))exit(9);
             printf("{\"event\":\"file\",\"size\":%d}\n",received_size);
             queue_send(c,(InformationObject)FileACK_create(NULL,100,2,nos,1),13);
         }

@@ -96,8 +96,8 @@ pub enum Error {
     #[error("filetransfer: a transfer is already in progress")]
     TransferBusy,
 
-    /// A section's checksum did not match the one its sender reported.
-    #[error("filetransfer: section checksum mismatch")]
+    /// A file or section's checksum did not match the one its sender reported.
+    #[error("filetransfer: checksum mismatch")]
     FileChecksum,
 
     /// A file transfer service this implementation does not provide, or one

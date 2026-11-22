@@ -20,6 +20,7 @@ const NOF: NameOfFile = NameOfFile::DISTURBANCE_DATA;
 #[derive(Default)]
 struct Recorder {
     sent: Mutex<Vec<Asdu>>,
+    events: Mutex<Vec<crate::secevent::Event>>,
     /// When set, every send fails with this error.
     fail: Mutex<Option<Error>>,
 }
@@ -29,6 +30,10 @@ impl Connect for Recorder {
     fn params(&self) -> Params {
         PARAMS_WIDE
     }
+    fn report_security_event(&self, event: crate::secevent::Event) {
+        self.events.lock().unwrap().push(event);
+    }
+
     async fn send(&self, a: Asdu) -> Result<()> {
         if let Some(e) = self.fail.lock().unwrap().clone() {
             return Err(e);
@@ -458,6 +463,54 @@ async fn a_checksum_mismatch_is_reported_and_negatively_acknowledged() {
     let ack = sent[0].get_ack_file_or_section().unwrap();
     assert_eq!(ack.afq.action, crate::asdu::AfqAction::NEG_ACK_SECTION);
     assert_eq!(ack.afq.error, crate::asdu::FileError::CHECKSUM_FAILED);
+}
+
+#[tokio::test]
+async fn a_bad_file_checksum_is_negatively_acknowledged_before_delivery() {
+    use crate::asdu::{AfqAction, LastSectionOrSegmentInfo};
+    use crate::secevent::Kind;
+
+    let (sender, s_link, receiver, r_link, destination) = pair(parts(100));
+    receiver.request_file(&r_link, CA, IOA, NOF).await.unwrap();
+
+    for _ in 0..30 {
+        for a in r_link.take() {
+            sender.handle(&s_link, &a).await.unwrap();
+        }
+        for a in s_link.take() {
+            if let Ok(end) = a.get_last_section_or_segment()
+                && end.lsq.is_end_of_file()
+            {
+                let incorrect = Asdu::last_section_or_segment(
+                    PARAMS_WIDE,
+                    a.coa(),
+                    CA,
+                    LastSectionOrSegmentInfo {
+                        chs: end.chs ^ 1,
+                        ..end
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    receiver.handle(&r_link, &incorrect).await,
+                    Err(Error::FileChecksum)
+                );
+                let response = r_link.take().pop().unwrap();
+                assert_eq!(
+                    response.get_ack_file_or_section().unwrap().afq.action,
+                    AfqAction::NEG_ACK_FILE
+                );
+                assert!(!receiver.in_progress());
+                assert_eq!(destination.read(IOA, NOF).await, Err(Error::FileNotFound));
+                let events = r_link.events.lock().unwrap();
+                assert_eq!(events[0].kind, Kind::FileChecksum);
+                assert_eq!(events[0].ioa, Some(IOA));
+                return;
+            }
+            receiver.handle(&r_link, &a).await.unwrap();
+        }
+    }
+    panic!("sender did not finish the transfer");
 }
 
 #[tokio::test]

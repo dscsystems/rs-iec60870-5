@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{Notify, RwLock, watch};
+use std::sync::RwLock;
+use tokio::sync::{Notify, watch};
 
 use crate::asdu::{
     Asdu, CauseOfTransmission, CommonAddr, Connect, InfoObjAddr, PARAMS_WIDE, Params,
@@ -19,6 +20,7 @@ use crate::cs104::connection::{Callbacks, Connection, Role, RunOptions, run};
 use crate::cs104::handler::{ClientContext, ClientDispatcher, ClientHandler};
 use crate::error::{Error, Result};
 use crate::net::{Endpoint, TlsClientConfig, connect_endpoint};
+use crate::secevent::{Action, Event, PeerInfo, Security, Session, endpoint_security};
 
 /// Default interval between reconnection attempts.
 pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(60);
@@ -162,6 +164,7 @@ impl ClientOption {
 /// [`ConnectExt`](crate::asdu::ConnectExt) helper works against it and is
 /// routed to the current connection.
 pub struct Client<H: ClientHandler> {
+    security: Arc<Security>,
     option: ClientOption,
     handler: Arc<H>,
     conn: RwLock<Option<Arc<Connection>>>,
@@ -171,9 +174,12 @@ pub struct Client<H: ClientHandler> {
 }
 
 impl<H: ClientHandler> Client<H> {
+    endpoint_security!();
+
     /// Build a master. Call [`Client::start`] to bring the connection up.
     pub fn new(handler: H, option: ClientOption) -> Arc<Self> {
         Arc::new(Client {
+            security: Arc::new(Security::default()),
             option,
             handler: Arc::new(handler),
             conn: RwLock::new(None),
@@ -197,7 +203,7 @@ impl<H: ClientHandler> Client<H> {
     pub async fn is_connected(&self) -> bool {
         self.conn
             .read()
-            .await
+            .unwrap()
             .as_ref()
             .is_some_and(|c| c.is_connected())
     }
@@ -206,14 +212,14 @@ impl<H: ClientHandler> Client<H> {
     pub async fn is_active(&self) -> bool {
         self.conn
             .read()
-            .await
+            .unwrap()
             .as_ref()
             .is_some_and(|c| c.is_active())
     }
 
     /// The current connection handle, if any.
     pub async fn connection(&self) -> Option<Arc<Connection>> {
-        self.conn.read().await.clone()
+        self.conn.read().unwrap().clone()
     }
 
     /// Start connecting in the background; returns immediately.
@@ -233,7 +239,7 @@ impl<H: ClientHandler> Client<H> {
 
     /// Stop the client and close the connection.
     pub fn close(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     /// Wait until data transfer is active.
@@ -272,6 +278,17 @@ impl<H: ClientHandler> Client<H> {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
+                    self.security.emit(|| {
+                        let mut event = Event::new(
+                            crate::net::dial_failure_kind(&e),
+                            Action::Observed,
+                            format!("{endpoint}: {e}"),
+                        );
+                        event.protocol = "iec104";
+                        event.role = "client";
+                        event.endpoint = self.option.client_number;
+                        event
+                    });
                     tracing::warn!(%endpoint, error = %e, "connect failed");
                     if !self.option.auto_reconnect {
                         return;
@@ -284,7 +301,17 @@ impl<H: ClientHandler> Client<H> {
             };
             tracing::debug!(%endpoint, "connected");
 
-            let peer = stream.peer_addr();
+            let session = Session::new(
+                self.security.clone(),
+                "iec104",
+                "client",
+                self.option.client_number,
+                stream.peer_info(),
+            );
+            if !session.identify().await {
+                return;
+            }
+            session.observe_tls();
             let dispatcher = Arc::new(ClientDispatcher {
                 handler: Arc::clone(&self.handler),
                 ctx: ClientContext {
@@ -296,28 +323,18 @@ impl<H: ClientHandler> Client<H> {
                 config: self.option.config,
                 params: self.option.params,
                 role: Role::Master,
-                peer,
+                session,
                 auto_start_dt: self.option.auto_start_dt,
                 callbacks: self.callbacks(),
             };
 
             let this = Arc::clone(&self);
-            run(
-                stream,
-                opts,
-                dispatcher,
-                self.shutdown.subscribe(),
-                move |c| {
-                    // Publishing is synchronous inside `run`; the write lock is
-                    // never contended here because no connection is live yet.
-                    if let Ok(mut guard) = this.conn.try_write() {
-                        *guard = Some(c);
-                    }
-                },
-            )
+            run(stream, opts, dispatcher, shutdown.clone(), move |c| {
+                *this.conn.write().unwrap() = Some(c);
+            })
             .await;
 
-            *self.conn.write().await = None;
+            *self.conn.write().unwrap() = None;
             tracing::debug!(%endpoint, "disconnected");
 
             if *shutdown.borrow() {
@@ -461,11 +478,31 @@ impl<H: ClientHandler> Connect for Client<H> {
         self.option.params
     }
 
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.peer_info().addr
+    }
+
+    fn peer_info(&self) -> PeerInfo {
+        self.conn
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or_else(PeerInfo::default, |connection| connection.peer_info())
+    }
+
+    fn report_security_event(&self, event: Event) {
+        if let Some(conn) = self.conn.read().unwrap().as_ref() {
+            conn.report_security_event(event);
+        } else {
+            self.security.emit(|| event);
+        }
+    }
+
     async fn send(&self, a: Asdu) -> Result<()> {
         let conn = self
             .conn
             .read()
-            .await
+            .unwrap()
             .clone()
             .ok_or(Error::UseClosedConnection)?;
         conn.send(a).await

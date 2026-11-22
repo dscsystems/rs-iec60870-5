@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: riclolsen/go-iecp5
-          ref: fbe6719d9acc9b5d90eed3b9468e7937b8ed4711
+          ref: fce279b3c32d9d9399bf4db2bcff31e4c0762d43
           path: tests/interop/go-iecp5
       - uses: actions/checkout@v4
         with:

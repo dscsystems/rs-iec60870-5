@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use tokio::time::Instant;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc, watch};
@@ -29,6 +29,10 @@ use crate::cs104::apci::{
 };
 use crate::cs104::config::{Config, TIMEOUT_RESOLUTION};
 use crate::error::{Error, Result};
+use crate::secevent::{
+    Action, Buckets, Decision, Event, Inspector, Kind, PeerInfo, Rate, Requests, Session,
+    over_limit,
+};
 
 /// Any bidirectional byte stream a 104 connection can run over: a plain
 /// `TcpStream`, a TLS stream, or an in-memory duplex pipe in tests.
@@ -62,14 +66,14 @@ pub struct Connection {
     connected: AtomicBool,
     active: AtomicBool,
     activated: Notify,
-    peer: Option<SocketAddr>,
+    session: Session,
     role: Role,
 }
 
 impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection")
-            .field("peer", &self.peer)
+            .field("peer", &self.peer_addr())
             .field("role", &self.role)
             .field("connected", &self.is_connected())
             .field("active", &self.is_active())
@@ -95,7 +99,12 @@ impl Connection {
 
     /// The remote address, when known.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
-        self.peer
+        self.session.peer().addr
+    }
+
+    /// The transport identity of this session.
+    pub fn peer_info(&self) -> PeerInfo {
+        self.session.peer()
     }
 
     /// Request start of data transfer (`STARTDT act`).
@@ -179,7 +188,15 @@ impl Connect for Connection {
     }
 
     fn peer_addr(&self) -> Option<SocketAddr> {
-        self.peer
+        self.peer_addr()
+    }
+
+    fn peer_info(&self) -> PeerInfo {
+        self.peer_info()
+    }
+
+    fn report_security_event(&self, event: Event) {
+        self.session.emit(|| event);
     }
 }
 
@@ -203,7 +220,7 @@ pub(crate) struct RunOptions {
     pub config: Config,
     pub params: Params,
     pub role: Role,
-    pub peer: Option<SocketAddr>,
+    pub session: Session,
     /// Send `STARTDT act` as soon as the connection comes up (masters only).
     pub auto_start_dt: bool,
     pub callbacks: Callbacks,
@@ -240,9 +257,15 @@ pub(crate) async fn run<S, D>(
         connected: AtomicBool::new(true),
         active: AtomicBool::new(false),
         activated: Notify::new(),
-        peer: opts.peer,
+        session: opts.session.clone(),
         role: opts.role,
     });
+    let session = &opts.session;
+    session.note(
+        Kind::ConnAccepted,
+        Action::Observed,
+        "transport established",
+    );
     publish(Arc::clone(&conn));
 
     // `local` signals the reader, writer and dispatcher to stop as soon as the
@@ -251,20 +274,35 @@ pub(crate) async fn run<S, D>(
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let reader_task = {
+        let session = session.clone();
         let mut stop = rx_local.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; APDU_SIZE_MAX];
+            let mut reader = tokio::io::BufReader::new(&mut reader);
             loop {
                 tokio::select! {
                     _ = stop.changed() => return,
-                    r = read_apdu(&mut reader, &mut buf) => match r {
+                    r = read_apdu(&mut reader, &mut buf, cfg.send_unack_timeout1, |bad_length, raw| {
+                        let kind = if bad_length { Kind::ProtoBadLength } else { Kind::ProtoGarbage };
+                        session.emit(|| {
+                            let mut event = Event::new(kind, Action::Ignored, "discarded while resynchronising");
+                            event.raw = raw.to_vec();
+                            event
+                        });
+                    }) => match r {
                         Ok(n) => {
                             tracing::trace!(apdu = ?&buf[..n], "RX raw");
-                            if tx_frame.send(buf[..n].to_vec()).await.is_err() {
+                            if let Err(error) = tx_frame.try_send(buf[..n].to_vec()) {
+                                if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                                    session.note(Kind::DosRxBacklog, Action::Disconnected, "frame queue is full");
+                                }
                                 return;
                             }
                         }
                         Err(e) => {
+                            if matches!(e, Error::TimeoutT1) {
+                                session.note(Kind::DosSlowFrame, Action::Disconnected, "APDU assembly deadline expired");
+                            }
                             tracing::debug!(error = %e, "receive stopped");
                             return;
                         }
@@ -275,6 +313,7 @@ pub(crate) async fn run<S, D>(
     };
 
     let writer_task = {
+        let session = session.clone();
         let mut stop = rx_local.clone();
         tokio::spawn(async move {
             loop {
@@ -283,14 +322,21 @@ pub(crate) async fn run<S, D>(
                     frame = rx_raw.recv() => {
                         let Some(frame) = frame else { break };
                         tracing::trace!(apdu = ?frame, "TX raw");
-                        if let Err(e) = writer.write_all(&frame).await {
-                            tracing::debug!(error = %e, "send failed");
-                            break;
+                        let result = tokio::select! {
+                            _ = stop.changed() => return,
+                            result = tokio::time::timeout(cfg.send_unack_timeout1, writer.write_all(&frame)) => result,
+                        };
+                        if !matches!(result, Ok(Ok(()))) {
+                            if result.is_err() {
+                                session.note(Kind::DosWriteStall, Action::Disconnected, "socket write deadline expired");
+                            }
+                            tracing::debug!(?result, "send failed");
+                            return;
                         }
                     }
                 }
             }
-            let _ = writer.shutdown().await;
+            let _ = tokio::time::timeout(cfg.send_unack_timeout1, writer.shutdown()).await;
         })
     };
 
@@ -304,7 +350,10 @@ pub(crate) async fn run<S, D>(
                     _ = stop.changed() => return,
                     pack = rx_pack.recv() => {
                         let Some(pack) = pack else { return };
-                        dispatcher.dispatch(&conn, pack).await;
+                        tokio::select! {
+                            _ = stop.changed() => return,
+                            _ = dispatcher.dispatch(&conn, pack) => {}
+                        }
                     }
                 }
             }
@@ -340,6 +389,15 @@ pub(crate) async fn run<S, D>(
     // may never have received.
     let mut stop_con_pending = false;
 
+    let mut inspector = Inspector::default();
+    let mut requests = Requests::default();
+    let mut frame_rates = Buckets::new();
+    let connected_at = Instant::now();
+    let mut activated_once = false;
+    let mut received_frame = false;
+    let mac_watch = session.watch_mac();
+    tokio::pin!(mac_watch);
+
     let mut ticker = tokio::time::interval(TIMEOUT_RESOLUTION);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -349,12 +407,13 @@ pub(crate) async fn run<S, D>(
         let may_send = conn.is_active() && !stopping && window_open;
 
         tokio::select! {
-            biased;
-
             _ = shutdown.changed() => {
                 tracing::debug!("connection shutdown requested");
                 break;
             }
+
+            _ = tx_raw.closed() => break,
+            _ = &mut mac_watch => break,
 
             asdu = rx_asdu.recv(), if may_send => {
                 let Some(asdu) = asdu else { break };
@@ -369,8 +428,16 @@ pub(crate) async fn run<S, D>(
                 // Transmitting does not restart t3: it measures how long the
                 // peer has been silent, and a station that only talks can
                 // still have lost its peer.
-                if tx_raw.send(frame).await.is_err() {
+                if !queue_frame(&tx_raw, frame, session) {
                     break;
+                }
+                if session.security.enabled()
+                    && let Ok(pack) = Asdu::unmarshal_binary(opts.params, &asdu)
+                {
+                    match opts.role {
+                        Role::Controlled => inspector.outbound(session, &pack),
+                        Role::Master => requests.sent(&pack),
+                    }
                 }
             }
 
@@ -388,7 +455,7 @@ pub(crate) async fn run<S, D>(
                 };
                 *since = Some(Instant::now());
                 tracing::debug!(%func, "TX U-frame");
-                if tx_raw.send(new_u_frame(func).to_vec()).await.is_err() {
+                if !queue_frame(&tx_raw, new_u_frame(func).to_vec(), session) {
                     break;
                 }
             }
@@ -398,6 +465,9 @@ pub(crate) async fn run<S, D>(
                     tracing::debug!("peer closed the connection");
                     break;
                 };
+                if frame_flood(session, &mut frame_rates, Kind::FloodFrames, session.policy.limits.frames) {
+                    break;
+                }
                 // Any I, S or U frame restarts the t3 idle timer.
                 idle_since = Instant::now();
                 // A malformed control field is not acted on. Ignoring it
@@ -407,18 +477,25 @@ pub(crate) async fn run<S, D>(
                 let (apci, raw_asdu) = match parse(&frame) {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::error!(error = %e, apdu = ?frame, "frame ignored");
+                        tracing::warn!(error = %e, "ignoring an invalid APCI");
+                        session.emit(|| {
+                            let mut event = Event::new(Kind::ProtoBadApci, Action::Ignored, e.to_string());
+                            event.raw = frame;
+                            event
+                        });
                         continue;
                     }
                 };
 
+                received_frame = true;
                 match apci {
                     Apci::S { recv_sn } => {
                         tracing::debug!(%apci, "RX S-frame");
+                        if recv_sn == ack_no_send && frame_flood(session, &mut frame_rates, Kind::FloodSFrames, session.policy.limits.s_frames) {
+                            break;
+                        }
                         if !update_ack_no_out(recv_sn, &mut ack_no_send, seq_no_send, &mut pending) {
-                            tracing::error!(
-                                "acknowledge is either earlier than the previous one or ahead of what was sent"
-                            );
+                            bad_ack(session, recv_sn, ack_no_send, seq_no_send);
                             break;
                         }
                     }
@@ -426,6 +503,13 @@ pub(crate) async fn run<S, D>(
                     Apci::I { send_sn, recv_sn } => {
                         tracing::debug!(%apci, "RX I-frame");
                         if !conn.is_active() {
+                            let action = if opts.role == Role::Controlled { Action::Disconnected } else { Action::Observed };
+                            session.emit(|| {
+                                let mut e = Event::new(Kind::ProtoIWhileStopped, action, "I-frame received while stopped");
+                                e.ns = Some(send_sn);
+                                e.nr = Some(recv_sn);
+                                e
+                            });
                             // Discarding the frame is not an option: its send
                             // sequence number has been used, so the next one
                             // would be out of sequence and close the link
@@ -445,24 +529,59 @@ pub(crate) async fn run<S, D>(
                                 }
                             }
                         }
-                        if !update_ack_no_out(recv_sn, &mut ack_no_send, seq_no_send, &mut pending)
-                            || send_sn != seq_no_rcv
-                        {
-                            tracing::error!(
-                                expected = seq_no_rcv,
-                                got = send_sn,
-                                "out of sequence I-frame, closing"
-                            );
+                        if !update_ack_no_out(recv_sn, &mut ack_no_send, seq_no_send, &mut pending) {
+                            bad_ack(session, recv_sn, ack_no_send, seq_no_send);
+                            break;
+                        }
+                        if send_sn != seq_no_rcv {
+                            tracing::warn!(got = send_sn, expected = seq_no_rcv, "out-of-sequence I-frame");
+                            let behind = seq_no_count(send_sn, seq_no_rcv);
+                            let kind = match behind {
+                                1 => Kind::SeqNsDuplicate,
+                                2..=16383 => Kind::SeqNsBehind,
+                                _ => Kind::SeqNsGap,
+                            };
+                            session.emit(|| {
+                                let mut e = Event::new(kind, Action::Disconnected, "unexpected send sequence");
+                                e.ns = Some(send_sn);
+                                e.nr = Some(recv_sn);
+                                e.expected = Some(seq_no_rcv);
+                                e
+                            });
                             break;
                         }
 
                         match Asdu::unmarshal_binary(opts.params, raw_asdu) {
                             Ok(pack) => {
-                                if tx_pack.send(pack).await.is_err() {
-                                    break;
+                                let decision = match opts.role {
+                                    Role::Controlled => inspector.inspect(session, &pack, raw_asdu),
+                                    Role::Master => {
+                                        requests.inspect(session, &pack, raw_asdu);
+                                        Decision::Deliver
+                                    }
+                                };
+                                match decision {
+                                    Decision::Disconnect => break,
+                                    Decision::Reply(cause) => {
+                                        if conn.try_enqueue(&Decision::reply(&pack, cause)).is_err() {
+                                            session.note(Kind::DosTxBacklog, Action::Disconnected, "cannot queue a policy rejection");
+                                            break;
+                                        }
+                                    }
+                                    Decision::Deliver => {
+                                        if let Err(error) = tx_pack.try_send(pack) {
+                                            if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                                                session.note(Kind::DosRxBacklog, Action::Disconnected, "ASDU queue is full");
+                                            }
+                                            break;
+                                        }
+                                    }
                                 }
                             }
-                            Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "discarding undecodable ASDU");
+                                session.invalid_asdu(&e, raw_asdu, None);
+                            }
                         }
 
                         if ack_no_rcv == seq_no_rcv {
@@ -472,7 +591,7 @@ pub(crate) async fn run<S, D>(
                         seq_no_rcv = (seq_no_rcv + 1) & SEQ_MASK;
                         if seq_no_count(ack_no_rcv, seq_no_rcv) >= cfg.recv_unack_limit_w {
                             tracing::debug!(seq_no_rcv, "TX S-frame (w reached)");
-                            if tx_raw.send(new_s_frame(seq_no_rcv).to_vec()).await.is_err() {
+                            if !queue_frame(&tx_raw, new_s_frame(seq_no_rcv).to_vec(), session) {
                                 break;
                             }
                             ack_no_rcv = seq_no_rcv;
@@ -483,27 +602,37 @@ pub(crate) async fn run<S, D>(
                         tracing::debug!(%apci, "RX U-frame");
                         match (function, opts.role) {
                             (UFunction::StartDtActive, Role::Controlled) => {
+                                if frame_flood(session, &mut frame_rates, Kind::FloodUToggle, session.policy.limits.u_toggle) {
+                                    break;
+                                }
+                                if !session.policy.disable_audit {
+                                    session.note(Kind::CtrlStartDt, Action::Observed, "STARTDT activation received");
+                                }
                                 stop_con_pending = false;
-                                if tx_raw
-                                    .send(new_u_frame(UFunction::StartDtConfirm).to_vec())
-                                    .await
-                                    .is_err()
+                                if !queue_frame(&tx_raw, new_u_frame(UFunction::StartDtConfirm).to_vec(), session)
                                 {
                                     break;
                                 }
+                                activated_once = true;
                                 conn.set_active(true);
                                 if let Some(cb) = opts.callbacks.on_activated.as_ref() {
                                     cb(Arc::clone(&conn));
                                 }
                             }
                             (UFunction::StopDtActive, Role::Controlled) => {
+                                if frame_flood(session, &mut frame_rates, Kind::FloodUToggle, session.policy.limits.u_toggle) {
+                                    break;
+                                }
+                                if !session.policy.disable_audit {
+                                    session.note(Kind::CtrlStopDt, Action::Observed, "STOPDT activation received");
+                                }
                                 // Stop transmitting, and acknowledge everything
                                 // received so far, so the master is not left
                                 // waiting for confirmations it will never get.
                                 let was_active = conn.is_active();
                                 conn.set_active(false);
                                 if ack_no_rcv != seq_no_rcv {
-                                    if tx_raw.send(new_s_frame(seq_no_rcv).to_vec()).await.is_err() {
+                                    if !queue_frame(&tx_raw, new_s_frame(seq_no_rcv).to_vec(), session) {
                                         break;
                                     }
                                     ack_no_rcv = seq_no_rcv;
@@ -518,6 +647,10 @@ pub(crate) async fn run<S, D>(
                                 }
                             }
                             (UFunction::StartDtConfirm, Role::Master) => {
+                                if start_dt_since.is_none() && unsolicited(session, "unsolicited STARTDT confirmation") {
+                                    continue;
+                                }
+                                activated_once = true;
                                 conn.set_active(true);
                                 start_dt_since = None;
                                 if let Some(cb) = opts.callbacks.on_activated.as_ref() {
@@ -525,6 +658,9 @@ pub(crate) async fn run<S, D>(
                                 }
                             }
                             (UFunction::StopDtConfirm, Role::Master) => {
+                                if stop_dt_since.is_none() && unsolicited(session, "unsolicited STOPDT confirmation") {
+                                    continue;
+                                }
                                 conn.set_active(false);
                                 stopping = false;
                                 stop_dt_since = None;
@@ -533,17 +669,21 @@ pub(crate) async fn run<S, D>(
                                 }
                             }
                             (UFunction::TestFrActive, _) => {
-                                if tx_raw
-                                    .send(new_u_frame(UFunction::TestFrConfirm).to_vec())
-                                    .await
-                                    .is_err()
+                                if frame_flood(session, &mut frame_rates, Kind::FloodTestFr, session.policy.limits.test_fr) {
+                                    break;
+                                }
+                                if !queue_frame(&tx_raw, new_u_frame(UFunction::TestFrConfirm).to_vec(), session)
                                 {
                                     break;
                                 }
                             }
-                            (UFunction::TestFrConfirm, _) => test_fr_since = None,
+                            (UFunction::TestFrConfirm, _) => {
+                                if test_fr_since.take().is_none() {
+                                    session.note(Kind::UnsolUConfirm, Action::Ignored, "unsolicited TESTFR confirmation");
+                                }
+                            }
                             (f, role) => {
-                                tracing::warn!(%f, ?role, "U-frame function not valid for this role");
+                                session.emit(|| Event::new(Kind::ProtoUWrongDir, Action::Ignored, format!("{f} is not valid for {role:?}")));
                             }
                         }
                     }
@@ -552,10 +692,7 @@ pub(crate) async fn run<S, D>(
                 if stop_con_pending && ack_no_send == seq_no_send {
                     stop_con_pending = false;
                     tracing::debug!("TX U-frame StopDtConfirm");
-                    if tx_raw
-                        .send(new_u_frame(UFunction::StopDtConfirm).to_vec())
-                        .await
-                        .is_err()
+                    if !queue_frame(&tx_raw, new_u_frame(UFunction::StopDtConfirm).to_vec(), session)
                     {
                         break;
                     }
@@ -563,7 +700,12 @@ pub(crate) async fn run<S, D>(
             }
 
             now = ticker.tick() => {
-                let now = now.into_std();
+                if !activated_once && !session.policy.inactive_timeout.is_zero()
+                    && now.saturating_duration_since(connected_at) >= session.policy.inactive_timeout
+                {
+                    session.note(Kind::ConnNeverStarted, Action::Disconnected, "data transfer never activated");
+                    break;
+                }
 
                 // t1: an outstanding TestFR, StartDT or StopDT was never confirmed.
                 let waiting_since = [test_fr_since, start_dt_since, stop_dt_since];
@@ -572,7 +714,8 @@ pub(crate) async fn run<S, D>(
                     .flatten()
                     .any(|t| now.saturating_duration_since(*t) >= cfg.send_unack_timeout1)
                 {
-                    tracing::error!("t1 expired waiting for a U-frame confirmation");
+                    tracing::warn!("t1 expired waiting for a U-frame confirmation");
+                    session.note(Kind::ConnT1Timeout, Action::Disconnected, "U-frame confirmation deadline expired");
                     break;
                 }
 
@@ -582,7 +725,9 @@ pub(crate) async fn run<S, D>(
                         now.saturating_duration_since(*t) >= cfg.send_unack_timeout1
                     })
                 {
-                    tracing::error!("t1 expired, fatal transmission timeout");
+                    tracing::warn!("t1 expired waiting for an I-frame acknowledgement");
+                    session.note(Kind::ConnT1Timeout, Action::Disconnected, "I-frame confirmation deadline expired");
+                    session.note(Kind::DosWindowStall, Action::Disconnected, "send window was never acknowledged");
                     break;
                 }
 
@@ -595,19 +740,16 @@ pub(crate) async fn run<S, D>(
                         || now.saturating_duration_since(idle_since) >= TIMEOUT_RESOLUTION)
                 {
                     tracing::debug!(seq_no_rcv, "TX S-frame (t2)");
-                    if tx_raw.send(new_s_frame(seq_no_rcv).to_vec()).await.is_err() {
+                    if !queue_frame(&tx_raw, new_s_frame(seq_no_rcv).to_vec(), session) {
                         break;
                     }
                     ack_no_rcv = seq_no_rcv;
                 }
 
                 // t3: the line has been idle, send a keep-alive.
-                if now.saturating_duration_since(idle_since) >= cfg.idle_timeout3 {
+                if test_fr_since.is_none() && now.saturating_duration_since(idle_since) >= cfg.idle_timeout3 {
                     tracing::debug!("TX U-frame TestFrActive (t3)");
-                    if tx_raw
-                        .send(new_u_frame(UFunction::TestFrActive).to_vec())
-                        .await
-                        .is_err()
+                    if !queue_frame(&tx_raw, new_u_frame(UFunction::TestFrActive).to_vec(), session)
                     {
                         break;
                     }
@@ -630,7 +772,74 @@ pub(crate) async fn run<S, D>(
     if let Some(cb) = opts.callbacks.on_connection_lost.as_ref() {
         cb(Arc::clone(&conn));
     }
+    if !received_frame && session.role == "server" {
+        session.note(
+            Kind::ConnNoData,
+            Action::Observed,
+            "transport closed without a valid APDU",
+        );
+    }
+    session.note(Kind::ConnClosed, Action::Observed, "transport closed");
     tracing::debug!("connection stopped");
+}
+
+fn queue_frame(sender: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>, session: &Session) -> bool {
+    match sender.try_send(frame) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            session.note(
+                Kind::DosTxBacklog,
+                Action::Disconnected,
+                "wire send queue is full",
+            );
+            false
+        }
+    }
+}
+
+fn frame_flood(session: &Session, buckets: &mut Buckets, kind: Kind, rate: Rate) -> bool {
+    let disconnect = session.policy.flood_action() == Action::Disconnected;
+    if (disconnect || session.security.enabled()) && over_limit(buckets, kind, rate) {
+        let action = if disconnect {
+            Action::Disconnected
+        } else {
+            Action::Observed
+        };
+        session.note(kind, action, "frame rate exceeded");
+        return disconnect;
+    }
+    false
+}
+
+fn unsolicited(session: &Session, detail: &str) -> bool {
+    let ignore = session.policy.ignore_unsolicited_u;
+    let action = if ignore {
+        Action::Ignored
+    } else {
+        Action::Observed
+    };
+    session.note(Kind::UnsolUConfirm, action, detail);
+    ignore
+}
+
+fn bad_ack(session: &Session, nr: u16, ack: u16, next: u16) {
+    tracing::warn!(nr, ack, next, "acknowledgement outside the send window");
+    session.emit(|| {
+        let kind = if seq_no_count(next, nr) <= 16384 {
+            Kind::SeqNrAhead
+        } else {
+            Kind::SeqNrRegressed
+        };
+        let mut event = Event::new(
+            kind,
+            Action::Disconnected,
+            "acknowledgement outside the send window",
+        );
+        event.nr = Some(nr);
+        event.expected = Some(ack);
+        event
+    });
 }
 
 /// Apply a received acknowledgement to the outbound window.
@@ -753,7 +962,7 @@ mod driver_tests {
             config,
             params: PARAMS_WIDE,
             role,
-            peer: None,
+            session: Session::new(Default::default(), "iec104", "test", 0, PeerInfo::default()),
             auto_start_dt: false,
             callbacks: Callbacks::default(),
         };

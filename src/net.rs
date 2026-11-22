@@ -11,6 +11,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+#[cfg(any(feature = "cs101", feature = "cs104"))]
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -169,6 +170,32 @@ impl Stream {
         self.peer
     }
 
+    /// Remote identity and any negotiated TLS information.
+    #[cfg(any(feature = "cs101", feature = "cs104"))]
+    pub(crate) fn peer_info(&self) -> crate::secevent::PeerInfo {
+        let (tcp, tls) = match &self.inner {
+            Inner::Tcp(tcp) => (tcp, None),
+            #[cfg(feature = "tls")]
+            Inner::TlsClient(stream) => {
+                let (tcp, connection) = stream.get_ref();
+                (tcp, Some(tls_peer(connection)))
+            }
+            #[cfg(feature = "tls")]
+            Inner::TlsServer(stream) => {
+                let (tcp, connection) = stream.get_ref();
+                (tcp, Some(tls_peer(connection)))
+            }
+        };
+        crate::secevent::PeerInfo {
+            network: "tcp",
+            addr: self.peer,
+            local_addr: tcp.local_addr().ok(),
+            connected_at: Some(chrono::Utc::now()),
+            tls,
+            ..Default::default()
+        }
+    }
+
     /// Adopt an already established TCP connection.
     pub fn from_tcp(s: TcpStream) -> Stream {
         let peer = s.peer_addr().ok();
@@ -177,6 +204,101 @@ impl Stream {
             peer,
         }
     }
+}
+
+#[cfg(all(feature = "tls", any(feature = "cs101", feature = "cs104")))]
+fn tls_peer(connection: &tokio_rustls::rustls::CommonState) -> crate::secevent::TlsPeer {
+    use sha2::{Digest, Sha256};
+
+    let mut peer = crate::secevent::TlsPeer {
+        version: connection
+            .protocol_version()
+            .map(|version| format!("{version:?}"))
+            .unwrap_or_default(),
+        cipher_suite: connection
+            .negotiated_cipher_suite()
+            .map(|suite| format!("{:?}", suite.suite()))
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    if let Some(cert) = connection
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+    {
+        peer.fingerprint_sha256 = Some(format!("{:x}", Sha256::digest(cert.as_ref())));
+        if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+            peer.subject = Some(cert.subject().to_string());
+            peer.issuer = Some(cert.issuer().to_string());
+            peer.serial = Some(cert.raw_serial_as_string());
+            peer.not_after =
+                chrono::DateTime::from_timestamp(cert.validity().not_after.timestamp(), 0);
+        }
+    }
+    peer
+}
+
+#[cfg(any(feature = "cs101", feature = "cs104"))]
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+struct TlsTransportError {
+    kind: crate::secevent::Kind,
+    #[source]
+    source: Error,
+}
+
+#[cfg(any(feature = "cs101", feature = "cs104"))]
+pub(crate) fn tls_transport_error(kind: crate::secevent::Kind, source: Error) -> Error {
+    let io_kind = match &source {
+        Error::Io(error) => error.kind(),
+        _ => return source,
+    };
+    io::Error::new(io_kind, TlsTransportError { kind, source }).into()
+}
+
+#[cfg(any(feature = "cs101", feature = "cs104"))]
+pub(crate) fn dial_failure_kind(error: &Error) -> crate::secevent::Kind {
+    use crate::secevent::Kind;
+    if let Error::Io(error) = error
+        && let Some(error) = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<TlsTransportError>())
+    {
+        return error.kind;
+    }
+    Kind::ConnDialFailed
+}
+
+#[cfg(any(feature = "cs101", feature = "cs104"))]
+pub(crate) fn tls_failure_kind(error: &Error) -> crate::secevent::Kind {
+    use crate::secevent::Kind;
+    #[cfg(feature = "tls")]
+    if let Error::Io(error) = error {
+        use tokio_rustls::rustls::{AlertDescription, Error as TlsError, InvalidMessage};
+        if let Some(error) = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<TlsError>())
+        {
+            return match error {
+                TlsError::InvalidCertificate(_) => Kind::TlsCertRejected,
+                TlsError::NoCertificatesPresented => Kind::TlsNoClientCert,
+                TlsError::AlertReceived(
+                    AlertDescription::BadCertificate
+                    | AlertDescription::UnknownCA
+                    | AlertDescription::CertificateExpired
+                    | AlertDescription::CertificateRevoked
+                    | AlertDescription::CertificateUnknown
+                    | AlertDescription::UnsupportedCertificate,
+                ) => Kind::TlsLocalCertRejected,
+                TlsError::InvalidMessage(InvalidMessage::InvalidContentType) => Kind::TlsPlaintext,
+                TlsError::InvalidMessage(InvalidMessage::UnknownProtocolVersion) => {
+                    Kind::TlsNonTlsProbe
+                }
+                _ => Kind::TlsHandshakeFailed,
+            };
+        }
+    }
+    let _ = error;
+    Kind::TlsHandshakeFailed
 }
 
 impl AsyncRead for Stream {
@@ -232,30 +354,44 @@ impl AsyncWrite for Stream {
 }
 
 /// Dial `endpoint`, giving up after `timeout` (t₀).
+#[cfg(any(feature = "cs101", feature = "cs104"))]
 pub(crate) async fn connect_endpoint(
     endpoint: &Endpoint,
     tls: Option<&TlsClientConfig>,
     timeout: Duration,
 ) -> Result<Stream> {
+    use crate::secevent::Kind;
+
+    let mut handshaking = false;
     let connect = async {
         let tcp = TcpStream::connect(&endpoint.host).await?;
         tcp.set_nodelay(true)?;
         if !endpoint.tls {
             return Ok(Stream::from_tcp(tcp));
         }
-        upgrade_client_tls(tcp, endpoint, tls).await
+        handshaking = true;
+        upgrade_client_tls(tcp, endpoint, tls)
+            .await
+            .map_err(|error| tls_transport_error(tls_failure_kind(&error), error))
     };
 
     match tokio::time::timeout(timeout, connect).await {
-        Ok(r) => r,
-        Err(_) => Err(Error::from(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "t0 connection timeout",
-        ))),
+        Ok(result) => result,
+        Err(_) => {
+            let error = Error::from(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "t0 connection timeout",
+            ));
+            if handshaking {
+                Err(tls_transport_error(Kind::TlsHandshakeTo, error))
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "tls", any(feature = "cs101", feature = "cs104")))]
 async fn upgrade_client_tls(
     tcp: TcpStream,
     endpoint: &Endpoint,
@@ -278,7 +414,7 @@ async fn upgrade_client_tls(
     })
 }
 
-#[cfg(not(feature = "tls"))]
+#[cfg(all(not(feature = "tls"), any(feature = "cs101", feature = "cs104")))]
 async fn upgrade_client_tls(
     _tcp: TcpStream,
     _endpoint: &Endpoint,
@@ -290,6 +426,7 @@ async fn upgrade_client_tls(
 }
 
 /// Wrap an accepted TCP connection, upgrading it to TLS when configured.
+#[cfg(any(feature = "cs101", feature = "cs104"))]
 pub(crate) async fn accept_stream(tcp: TcpStream, tls: Option<&TlsServerConfig>) -> Result<Stream> {
     tcp.set_nodelay(true)?;
     match tls {
@@ -298,7 +435,7 @@ pub(crate) async fn accept_stream(tcp: TcpStream, tls: Option<&TlsServerConfig>)
     }
 }
 
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "tls", any(feature = "cs101", feature = "cs104")))]
 async fn upgrade_server_tls(tcp: TcpStream, tls: &TlsServerConfig) -> Result<Stream> {
     use tokio_rustls::TlsAcceptor;
 
@@ -310,7 +447,7 @@ async fn upgrade_server_tls(tcp: TcpStream, tls: &TlsServerConfig) -> Result<Str
     })
 }
 
-#[cfg(not(feature = "tls"))]
+#[cfg(all(not(feature = "tls"), any(feature = "cs101", feature = "cs104")))]
 async fn upgrade_server_tls(_tcp: TcpStream, _tls: &TlsServerConfig) -> Result<Stream> {
     Err(Error::Config(
         "TLS listeners require the \"tls\" feature to be enabled",

@@ -10,7 +10,7 @@ default-members = ["."]
 name = "rs-iec60870-5"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Ricardo Olsen"]
 description = "Pure Rust IEC 60870-5-101/-103/-104 telecontrol protocol library (client and server)"
 documentation = "https://docs.rs/rs-iec60870-5"
@@ -24,6 +24,9 @@ exclude = ["/tests/interop/**", "/examples/cs104_explorer/**", "/.github/**"]
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ipnet = "2"
+sha2 = { version = "0.10", optional = true }
+x509-parser = { version = "0.18", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = [
     "rt",
@@ -66,7 +69,7 @@ cs103 = ["cs101"]
 filetransfer = []
 serial = ["dep:tokio-serial", "cs101"]
 
-tls = ["dep:tokio-rustls"]
+tls = ["dep:tokio-rustls", "dep:sha2", "dep:x509-parser"]
 serde = ["dep:serde", "dep:serde_json", "chrono/serde"]
 # Named IANA time zones (`TimeZone::Named`) for time tag interpretation, for a
 # device whose profile fixes a zone that is not the host's.
@@ -76,6 +79,7 @@ tz = ["dep:chrono-tz"]
 chrono-tz = { version = "0.10", default-features = false }
 serde_json = "1"
 sha2 = "0.10"
+rcgen = "0.13"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

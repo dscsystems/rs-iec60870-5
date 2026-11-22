@@ -94,3 +94,21 @@ async fn send(conn: &dyn crate::asdu::Connect, asdu: crate::asdu::Asdu) -> crate
     )
     .await
 }
+
+fn report_failure(conn: &dyn crate::asdu::Connect, a: &crate::asdu::Asdu, error: &crate::Error) {
+    use crate::Error;
+    use crate::secevent::{Action, Event, Kind};
+
+    let kind = match error {
+        Error::FileChecksum => Kind::FileChecksum,
+        Error::FileServiceUnsupported => Kind::FileUnsupported,
+        Error::NoTransfer => Kind::UnsolFile,
+        Error::FileNotFound | Error::TransferBusy => Kind::FileRejected,
+        Error::LengthOutOfRange => Kind::FileOversized,
+        _ => Kind::FileRejected,
+    };
+    crate::secevent::report(
+        conn,
+        Event::new(kind, Action::Rejected, error.to_string()).with_asdu(a),
+    );
+}

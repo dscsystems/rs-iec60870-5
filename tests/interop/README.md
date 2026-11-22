@@ -22,7 +22,7 @@ a test failure. Set `IEC60870_INTEROP_REQUIRED=1` to make missing dependencies
 fail as well; CI does this. The checkout and binaries are git-ignored.
 
 The current parity baseline is go-iecp5 commit
-`fbe6719d9acc9b5d90eed3b9468e7937b8ed4711` (2026-10-29). The file peers require
+`fce279b3c32d9d9399bf4db2bcff31e4c0762d43` (2026-11-21). The file peers require
 that revision or newer. The CI workflow pins it for reproducibility.
 
 ## What is covered

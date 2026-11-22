@@ -20,6 +20,7 @@ use crate::cs104::handler::{ServerDispatcher, ServerHandler};
 use crate::cs104::redundancy::{Groups, Route, ServerMode, outcome};
 use crate::error::{Error, Result};
 use crate::net::{TlsServerConfig, accept_stream, connect_endpoint};
+use crate::secevent::{Action, Event, Kind, PeerInfo, Security, Session, endpoint_security};
 
 /// Tracks the live sessions of a controlled station.
 #[derive(Default)]
@@ -55,6 +56,7 @@ impl Sessions {
 /// argument is the single session the request came from, so replies go only
 /// to that master.
 pub struct Server<H: ServerHandler> {
+    security: Arc<Security>,
     config: Config,
     params: Params,
     handler: Arc<H>,
@@ -64,19 +66,19 @@ pub struct Server<H: ServerHandler> {
     event_buffer: usize,
     groups: Arc<Mutex<Groups>>,
     max_connections: Option<usize>,
-    /// Connections accepted and not yet closed, counted from the accept so a
-    /// burst of connections cannot slip past the limit.
-    open: Arc<AtomicUsize>,
     shutdown: watch::Sender<bool>,
     server_number: usize,
     serving: AtomicBool,
 }
 
 impl<H: ServerHandler> Server<H> {
+    endpoint_security!();
+
     /// Build a controlled station with the default configuration and
     /// [`PARAMS_WIDE`] parameters.
     pub fn new(handler: H) -> Arc<Self> {
         Arc::new(Server {
+            security: Arc::new(Security::default()),
             config: Config::default(),
             params: PARAMS_WIDE,
             handler: Arc::new(handler),
@@ -86,7 +88,6 @@ impl<H: ServerHandler> Server<H> {
             event_buffer: 0,
             groups: Arc::new(Mutex::new(Groups::new(ServerMode::default(), 0))),
             max_connections: None,
-            open: Arc::new(AtomicUsize::new(0)),
             shutdown: watch::channel(false).0,
             server_number: 0,
             serving: AtomicBool::new(false),
@@ -187,8 +188,7 @@ impl<H: ServerHandler> Server<H> {
         self.sessions.len()
     }
 
-    /// Bind `addr` and serve until [`Server::close`] is called or the listener
-    /// fails.
+    /// Bind `addr` and serve until [`Server::close`] is called.
     ///
     /// The usual address is `"0.0.0.0:2404"`.
     pub async fn listen_and_serve<A: ToSocketAddrs>(self: &Arc<Self>, addr: A) -> Result<()> {
@@ -205,39 +205,72 @@ impl<H: ServerHandler> Server<H> {
         let mut shutdown = self.shutdown.subscribe();
         tracing::debug!(local = ?listener.local_addr().ok(), "server listening");
 
-        loop {
+        let initial_backoff = std::time::Duration::from_millis(5);
+        let mut backoff = initial_backoff;
+        while !*shutdown.borrow() {
             let accepted = tokio::select! {
                 _ = shutdown.changed() => break,
                 r = listener.accept() => r,
             };
 
             let (tcp, peer) = match accepted {
-                Ok(v) => v,
+                Ok(v) => {
+                    backoff = initial_backoff;
+                    v
+                }
                 Err(e) => {
-                    tracing::error!(error = %e, "accept failed");
-                    self.serving.store(false, Ordering::Release);
-                    return Err(e.into());
+                    tracing::warn!(error = %e, "accept failed");
+                    self.security.emit(|| {
+                        let mut event =
+                            Event::new(Kind::ConnAcceptError, Action::Observed, e.to_string());
+                        event.protocol = "iec104";
+                        event.role = "server";
+                        event.endpoint = self.server_number;
+                        event
+                    });
+                    tokio::select! {
+                        _ = shutdown.changed() => break,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
+                    continue;
                 }
             };
 
-            if self
-                .max_connections
-                .is_some_and(|max| self.open.load(Ordering::Acquire) >= max)
-            {
-                tracing::warn!(%peer, "connection limit reached, refusing the master");
-                continue;
-            }
+            let session = Session::new(
+                self.security.clone(),
+                "iec104",
+                "server",
+                self.server_number,
+                PeerInfo {
+                    network: "tcp",
+                    addr: Some(peer),
+                    local_addr: tcp.local_addr().ok(),
+                    ..PeerInfo::default()
+                },
+            );
             let Some(group) = self.groups.lock().unwrap().admit(peer.ip()) else {
+                session.note(
+                    Kind::ConnUnexpected,
+                    Action::Rejected,
+                    "peer has no redundancy group",
+                );
                 tracing::warn!(%peer, "the master belongs to no redundancy group, refused");
                 continue;
             };
 
-            self.open.fetch_add(1, Ordering::AcqRel);
+            let Some(admission) = self.security.admit(
+                peer,
+                &session.policy,
+                self.max_connections,
+                |kind, action, detail| session.note(kind, action, detail),
+            ) else {
+                continue;
+            };
             let this = Arc::clone(self);
-            let open = Arc::clone(&self.open);
             tokio::spawn(async move {
-                this.serve_one(tcp, peer, group).await;
-                open.fetch_sub(1, Ordering::AcqRel);
+                let _admission = admission;
+                this.serve_one(tcp, peer, group, session).await;
             });
         }
 
@@ -251,14 +284,40 @@ impl<H: ServerHandler> Server<H> {
         tcp: tokio::net::TcpStream,
         peer: SocketAddr,
         group: usize,
+        session: Session,
     ) {
-        let stream = match accept_stream(tcp, self.tls.as_ref()).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(%peer, error = %e, "rejecting connection");
-                return;
-            }
+        let mut shutdown = self.shutdown.subscribe();
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        let identified = tokio::select! {
+            _ = shutdown.changed() => return,
+            allowed = session.identify() => allowed,
         };
+        if !identified {
+            return;
+        }
+        let handshake = tokio::time::timeout(
+            self.config.connect_timeout0,
+            accept_stream(tcp, self.tls.as_ref()),
+        );
+        let stream = tokio::select! {
+            _ = shutdown.changed() => return,
+            result = handshake => match result {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    let kind = if self.tls.is_some() { crate::net::tls_failure_kind(&error) } else { Kind::ConnClosed };
+                    session.note(kind, Action::Rejected, error.to_string());
+                    return;
+                }
+                Err(_) => {
+                    session.note(Kind::TlsHandshakeTo, Action::Rejected, "TLS handshake exceeded t0");
+                    return;
+                }
+            },
+        };
+        session.set_transport(stream.peer_info());
+        session.observe_tls();
         tracing::debug!(%peer, "master connected");
 
         let dispatcher = Arc::new(ServerDispatcher {
@@ -269,7 +328,7 @@ impl<H: ServerHandler> Server<H> {
             config: self.config,
             params: self.params,
             role: Role::Controlled,
-            peer: Some(peer),
+            session,
             auto_start_dt: false,
             callbacks: server_callbacks(&self.handler, Some(&self.groups)),
         };
@@ -277,7 +336,7 @@ impl<H: ServerHandler> Server<H> {
         let sessions = Arc::clone(&self.sessions);
         let groups = Arc::clone(&self.groups);
         let mut joined: Option<(usize, Arc<Connection>)> = None;
-        run(stream, opts, dispatcher, self.shutdown.subscribe(), |c| {
+        run(stream, opts, dispatcher, shutdown, |c| {
             groups.lock().unwrap().join(group, Arc::clone(&c));
             joined = Some((sessions.insert(Arc::clone(&c)), c));
         })
@@ -292,7 +351,7 @@ impl<H: ServerHandler> Server<H> {
 
     /// Stop serving and close every session.
     pub fn close(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 }
 
@@ -332,6 +391,10 @@ fn server_callbacks<H: ServerHandler>(
 
 #[async_trait::async_trait]
 impl<H: ServerHandler> Connect for Server<H> {
+    fn report_security_event(&self, event: Event) {
+        self.security.emit(|| event);
+    }
+
     fn params(&self) -> Params {
         self.params
     }
@@ -528,6 +591,14 @@ impl Connect for Waiting<'_> {
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.conn.peer_addr()
     }
+
+    fn peer_info(&self) -> PeerInfo {
+        self.conn.peer_info()
+    }
+
+    fn report_security_event(&self, event: Event) {
+        self.conn.report_security_event(event);
+    }
 }
 
 /// A [`Server`] viewed as a [`Connect`] whose `send` waits for buffer room.
@@ -540,6 +611,10 @@ pub struct WaitingServer<H: ServerHandler> {
 
 #[async_trait::async_trait]
 impl<H: ServerHandler> Connect for WaitingServer<H> {
+    fn report_security_event(&self, event: Event) {
+        self.server.report_security_event(event);
+    }
+
     fn params(&self) -> Params {
         self.server.params
     }
@@ -555,6 +630,7 @@ impl<H: ServerHandler> Connect for WaitingServer<H> {
 /// StartDT exactly like a [`Server`] session, but initiates the TCP connection
 /// and reconnects on its own.
 pub struct ServerSpecial<H: ServerHandler> {
+    security: Arc<Security>,
     option: ClientOption,
     handler: Arc<H>,
     conn: Mutex<Option<Arc<Connection>>>,
@@ -564,12 +640,15 @@ pub struct ServerSpecial<H: ServerHandler> {
 }
 
 impl<H: ServerHandler> ServerSpecial<H> {
+    endpoint_security!();
+
     /// Build a reverse-connection controlled station.
     ///
     /// The endpoint, timing and parameters come from a [`ClientOption`],
     /// since this end initiates the connection.
     pub fn new(handler: H, option: ClientOption) -> Arc<Self> {
         Arc::new(ServerSpecial {
+            security: Arc::new(Security::default()),
             option,
             handler: Arc::new(handler),
             conn: Mutex::new(None),
@@ -617,7 +696,7 @@ impl<H: ServerHandler> ServerSpecial<H> {
 
     /// Stop and close the connection.
     pub fn close(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     async fn run_forever(self: Arc<Self>) {
@@ -642,6 +721,17 @@ impl<H: ServerHandler> ServerSpecial<H> {
             let stream = match stream {
                 Ok(s) => s,
                 Err(e) => {
+                    self.security.emit(|| {
+                        let mut event = Event::new(
+                            crate::net::dial_failure_kind(&e),
+                            Action::Observed,
+                            format!("{endpoint}: {e}"),
+                        );
+                        event.protocol = "iec104";
+                        event.role = "server-special";
+                        event.endpoint = self.server_number;
+                        event
+                    });
                     tracing::warn!(%endpoint, error = %e, "connect failed");
                     if !self.option.auto_reconnect() {
                         return;
@@ -653,7 +743,17 @@ impl<H: ServerHandler> ServerSpecial<H> {
                 }
             };
 
-            let peer = stream.peer_addr();
+            let session = Session::new(
+                self.security.clone(),
+                "iec104",
+                "server-special",
+                self.server_number,
+                stream.peer_info(),
+            );
+            if !session.identify().await {
+                return;
+            }
+            session.observe_tls();
             let dispatcher = Arc::new(ServerDispatcher {
                 handler: Arc::clone(&self.handler),
                 server_number: self.server_number,
@@ -662,19 +762,15 @@ impl<H: ServerHandler> ServerSpecial<H> {
                 config: self.option.config(),
                 params: self.option.params(),
                 role: Role::Controlled,
-                peer,
+                session,
                 auto_start_dt: false,
                 callbacks: server_callbacks(&self.handler, None),
             };
 
             let this = Arc::clone(&self);
-            run(
-                stream,
-                opts,
-                dispatcher,
-                self.shutdown.subscribe(),
-                move |c| *this.conn.lock().unwrap() = Some(c),
-            )
+            run(stream, opts, dispatcher, shutdown.clone(), move |c| {
+                *this.conn.lock().unwrap() = Some(c)
+            })
             .await;
 
             *self.conn.lock().unwrap() = None;
@@ -691,6 +787,26 @@ impl<H: ServerHandler> ServerSpecial<H> {
 
 #[async_trait::async_trait]
 impl<H: ServerHandler> Connect for ServerSpecial<H> {
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_info().addr
+    }
+
+    fn peer_info(&self) -> PeerInfo {
+        self.conn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(PeerInfo::default, |conn| conn.peer_info())
+    }
+
+    fn report_security_event(&self, event: Event) {
+        if let Some(conn) = self.conn.lock().unwrap().as_ref() {
+            conn.report_security_event(event);
+        } else {
+            self.security.emit(|| event);
+        }
+    }
+
     fn params(&self) -> Params {
         self.option.params()
     }

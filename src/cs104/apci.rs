@@ -231,30 +231,51 @@ pub(crate) fn parse(apdu: &[u8]) -> Result<(Apci, &[u8])> {
 /// Resynchronises on the start character: octets before a `0x68` are dropped,
 /// as are frames whose length octet is out of range. Returns
 /// [`Error::Io`] with kind `UnexpectedEof` when the peer closes the connection.
-pub(crate) async fn read_apdu<R>(r: &mut R, buf: &mut [u8; APDU_SIZE_MAX]) -> Result<usize>
+pub(crate) async fn read_apdu<R>(
+    r: &mut R,
+    buf: &mut [u8; APDU_SIZE_MAX],
+    assemble: std::time::Duration,
+    mut discarded: impl FnMut(bool, &[u8]),
+) -> Result<usize>
 where
     R: AsyncRead + Unpin,
 {
     loop {
-        // Resynchronise: skip everything until a start character.
+        let mut sample = [0; 16];
+        let mut skipped = 0;
         loop {
-            r.read_exact(&mut buf[..1]).await?;
-            if buf[0] == START_FRAME {
-                break;
+            let result = r.read_exact(&mut buf[..1]).await;
+            if result.is_err() || buf[0] == START_FRAME || skipped == sample.len() {
+                if skipped != 0 {
+                    discarded(false, &sample[..skipped]);
+                    skipped = 0;
+                }
+                result?;
+                if buf[0] == START_FRAME {
+                    break;
+                }
             }
-            tracing::trace!(octet = buf[0], "discarding octet while resynchronising");
+            sample[skipped] = buf[0];
+            skipped += 1;
         }
 
-        r.read_exact(&mut buf[1..2]).await?;
-        let field_len = buf[1] as usize;
-        if !(APCI_CTL_FIELD_SIZE..=APDU_FIELD_SIZE_MAX).contains(&field_len) {
-            tracing::warn!(field_len, "APDU length out of range, resynchronising");
-            continue;
+        // Idle reads have no deadline. The length and body share one budget.
+        let frame = async {
+            r.read_exact(&mut buf[1..2]).await?;
+            let field_len = buf[1] as usize;
+            if !(APCI_CTL_FIELD_SIZE..=APDU_FIELD_SIZE_MAX).contains(&field_len) {
+                return Ok::<_, std::io::Error>(None);
+            }
+            let total = field_len + 2;
+            r.read_exact(&mut buf[2..total]).await?;
+            Ok(Some(total))
+        };
+        match tokio::time::timeout(assemble, frame).await {
+            Ok(Ok(Some(total))) => return Ok(total),
+            Ok(Ok(None)) => discarded(true, &buf[..2]),
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) => return Err(Error::TimeoutT1),
         }
-
-        let total = field_len + 2;
-        r.read_exact(&mut buf[2..total]).await?;
-        return Ok(total);
     }
 }
 
@@ -272,6 +293,33 @@ pub(crate) fn seq_no_count(next_ack_no: u16, next_seq_no: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_assembly_deadline_starts_after_the_first_octet() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut sender, mut receiver) = tokio::io::duplex(32);
+        let assemble = Duration::from_millis(30);
+        let receive = tokio::spawn(async move {
+            let mut buf = [0; APDU_SIZE_MAX];
+            read_apdu(&mut receiver, &mut buf, assemble, |_, _| {}).await
+        });
+
+        tokio::time::sleep(assemble * 2).await;
+        assert!(
+            !receive.is_finished(),
+            "an idle stream has no assembly deadline"
+        );
+        sender.write_u8(START_FRAME).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), receive)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(Error::TimeoutT1)
+        ));
+    }
 
     #[test]
     fn i_frame_encodes_both_sequence_numbers() {
@@ -418,7 +466,14 @@ mod tests {
         ];
         let mut buf = [0u8; APDU_SIZE_MAX];
 
-        let n = read_apdu(&mut stream, &mut buf).await.unwrap();
+        let n = read_apdu(
+            &mut stream,
+            &mut buf,
+            std::time::Duration::from_secs(1),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(n, 6);
         assert_eq!(
             parse(&buf[..n]).unwrap().0,
@@ -427,7 +482,14 @@ mod tests {
             }
         );
 
-        let n = read_apdu(&mut stream, &mut buf).await.unwrap();
+        let n = read_apdu(
+            &mut stream,
+            &mut buf,
+            std::time::Duration::from_secs(1),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(n, 7);
         let (apci, asdu) = parse(&buf[..n]).unwrap();
         assert_eq!(
@@ -448,7 +510,14 @@ mod tests {
         ];
         let mut buf = [0u8; APDU_SIZE_MAX];
         // The bad header is dropped and the following valid frame is returned.
-        let n = read_apdu(&mut stream, &mut buf).await.unwrap();
+        let n = read_apdu(
+            &mut stream,
+            &mut buf,
+            std::time::Duration::from_secs(1),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(n, 6);
         assert!(matches!(parse(&buf[..n]).unwrap().0, Apci::U { .. }));
     }
@@ -457,6 +526,15 @@ mod tests {
     async fn read_apdu_reports_eof() {
         let mut stream: &[u8] = &[0x68, 0x04, 0x07];
         let mut buf = [0u8; APDU_SIZE_MAX];
-        assert!(read_apdu(&mut stream, &mut buf).await.is_err());
+        assert!(
+            read_apdu(
+                &mut stream,
+                &mut buf,
+                std::time::Duration::from_secs(1),
+                |_, _| {}
+            )
+            .await
+            .is_err()
+        );
     }
 }

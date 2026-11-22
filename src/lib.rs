@@ -59,6 +59,8 @@
 pub mod asdu;
 mod error;
 pub mod net;
+pub mod netpeer;
+pub mod secevent;
 
 #[cfg(feature = "cs101")]
 pub mod cs101;

@@ -42,6 +42,8 @@
 //! # }
 //! ```
 
+mod classify;
+pub use classify::RequestError;
 mod codec;
 mod connect;
 mod cpara;

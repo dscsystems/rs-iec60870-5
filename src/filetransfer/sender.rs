@@ -211,6 +211,30 @@ impl Sender {
         // The ASDUs go out with the lock released, so that a transport whose
         // send is synchronous cannot re-enter this state machine while it is
         // held.
+        if let Some(error) = &reply.error {
+            super::report_failure(conn, a, error);
+        } else if a.type_id() == TypeId::F_AF_NA_1
+            && let Ok(ack) = a.get_ack_file_or_section()
+            && matches!(
+                ack.afq.action,
+                AfqAction::NEG_ACK_FILE | AfqAction::NEG_ACK_SECTION
+            )
+        {
+            let kind = if ack.afq.error == FileError::CHECKSUM_FAILED {
+                crate::secevent::Kind::FileChecksum
+            } else {
+                crate::secevent::Kind::FileRejected
+            };
+            crate::secevent::report(
+                conn,
+                crate::secevent::Event::new(
+                    kind,
+                    crate::secevent::Action::Observed,
+                    "peer negatively acknowledged file transfer",
+                )
+                .with_asdu(a),
+            );
+        }
         for asdu in reply.send {
             if let Err(e) = super::send(conn, asdu).await {
                 self.abort();

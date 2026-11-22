@@ -246,14 +246,24 @@ impl Receiver {
         }
         let reply = self.step(conn.params(), a);
 
-        // Storing, the callbacks and the sends all run with the lock released.
+        if let Some(error) = &reply.error {
+            super::report_failure(conn, a, error);
+        }
+        for asdu in reply.send {
+            if let Err(error) = super::send(conn, asdu).await {
+                self.abort();
+                return Err(error);
+            }
+        }
+
+        // A completed file is delivered only after the acknowledgement was queued.
         let mut err = reply.error;
         if let Some((entry, data)) = reply.file {
             if let Some(store) = &self.store
-                && let Err(e) = store.write(entry.ioa, entry.nof, data.clone()).await
+                && let Err(error) = store.write(entry.ioa, entry.nof, data.clone()).await
                 && err.is_none()
             {
-                err = Some(e);
+                err = Some(error);
             }
             if let Some(cb) = self.on_file.lock().unwrap().as_ref() {
                 cb(entry, data);
@@ -263,12 +273,6 @@ impl Receiver {
             && let Some(cb) = self.on_directory.lock().unwrap().as_ref()
         {
             cb(ca, dir);
-        }
-        for asdu in reply.send {
-            if let Err(e) = super::send(conn, asdu).await {
-                self.abort();
-                return Err(e);
-            }
         }
         match err {
             Some(e) => Err(e),
@@ -447,7 +451,7 @@ impl Receiver {
         };
         let (ca, ioa, nof) = (t.ca, t.ioa, t.nof);
 
-        let ack = |nos, action| {
+        let ack = |nos, action, error| {
             Asdu::ack_file_or_section(
                 params,
                 transfer(),
@@ -456,17 +460,29 @@ impl Receiver {
                     ioa,
                     nof,
                     nos,
-                    afq: AckFileOrSectionQualifier {
-                        action,
-                        error: FileError::NONE,
-                    },
+                    afq: AckFileOrSectionQualifier { action, error },
                 },
             )
         };
 
         if info.lsq.is_end_of_file() {
-            // End of the file: acknowledge and deliver.
+            // Either answer completes this transfer. No corrupt data reaches the store.
             let data = std::mem::take(&mut t.file_buf);
+            *active = None;
+            if file_checksum(&data) != info.chs {
+                return match ack(
+                    info.nos,
+                    AfqAction::NEG_ACK_FILE,
+                    FileError::CHECKSUM_FAILED,
+                ) {
+                    Ok(a) => Reply {
+                        send: vec![a],
+                        error: Some(Error::FileChecksum),
+                        ..Default::default()
+                    },
+                    Err(error) => Reply::failed(error),
+                };
+            }
             let entry = Entry {
                 ioa,
                 nof,
@@ -474,8 +490,7 @@ impl Receiver {
                 time: None,
                 is_directory: false,
             };
-            *active = None;
-            return match ack(info.nos, AfqAction::POS_ACK_FILE) {
+            return match ack(info.nos, AfqAction::POS_ACK_FILE, FileError::NONE) {
                 Ok(a) => Reply {
                     send: vec![a],
                     file: Some((entry, data)),
@@ -494,20 +509,7 @@ impl Receiver {
                 if file_checksum(&t.section_buf) != info.chs {
                     let nos = t.nos;
                     t.section_buf.clear();
-                    let neg = Asdu::ack_file_or_section(
-                        params,
-                        transfer(),
-                        ca,
-                        AckFileOrSectionInfo {
-                            ioa,
-                            nof,
-                            nos,
-                            afq: AckFileOrSectionQualifier {
-                                action: AfqAction::NEG_ACK_SECTION,
-                                error: FileError::CHECKSUM_FAILED,
-                            },
-                        },
-                    );
+                    let neg = ack(nos, AfqAction::NEG_ACK_SECTION, FileError::CHECKSUM_FAILED);
                     return match neg {
                         Ok(a) => Reply {
                             send: vec![a],
@@ -520,7 +522,9 @@ impl Receiver {
                 let section = std::mem::take(&mut t.section_buf);
                 t.file_buf.extend_from_slice(&section);
                 let nos = t.nos;
-                ack(nos, AfqAction::POS_ACK_SECTION).map(|a| vec![a]).into()
+                ack(nos, AfqAction::POS_ACK_SECTION, FileError::NONE)
+                    .map(|a| vec![a])
+                    .into()
             }
             _ => Reply::nothing(),
         }

@@ -21,14 +21,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, mpsc, watch};
 
-use crate::cs101::{ControlField, Frame, LinkStream, Transporter, prim_fc, read_frame, sec_fc};
+use crate::cs101::{ControlField, Frame, LinkStream, Transporter, prim_fc, sec_fc};
 use crate::cs103::asdu::Asdu;
 use crate::cs103::config::{Config, LINK_ADDR_SIZE};
 use crate::cs103::handler::{ClientHandler, Link, dispatch};
 use crate::error::{Error, Result};
+use crate::secevent::{Action, Event, Kind, PeerInfo, Security, Session, endpoint_security};
 
 /// Default interval between attempts to reopen the line.
 pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(60);
@@ -227,6 +227,8 @@ impl Shared {
 
 /// An IEC 60870-5-103 primary station.
 pub struct Client<H: ClientHandler> {
+    security: Arc<Security>,
+    security_session: Mutex<Option<Session>>,
     option: ClientOption,
     handler: Arc<H>,
     shared: Arc<Shared>,
@@ -237,10 +239,35 @@ pub struct Client<H: ClientHandler> {
 }
 
 impl<H: ClientHandler> Client<H> {
+    endpoint_security!();
+
+    /// Transport identity for the currently open link.
+    pub fn peer_info(&self) -> PeerInfo {
+        self.security_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or_else(PeerInfo::default, Session::peer)
+    }
+
+    /// Report a security observation from an application handler.
+    pub fn report_security_event(&self, mut event: Event) {
+        if let Some(session) = self.security_session.lock().unwrap().as_ref() {
+            session.emit(|| event);
+        } else {
+            event.protocol = "iec103";
+            event.role = "client";
+            event.endpoint = 0;
+            self.security.emit(|| event);
+        }
+    }
+
     /// Build a primary station. Call [`Client::start`] to open the line.
     pub fn new(handler: H, option: ClientOption) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
         Arc::new(Client {
+            security: Arc::new(Security::default()),
+            security_session: Mutex::new(None),
             shared: Arc::new(Shared {
                 max_queue: option.config.max_send_queue_size,
                 default_addr: option.default_addr(),
@@ -299,7 +326,14 @@ impl<H: ClientHandler> Client<H> {
         let transporter = {
             let mut guard = self.transporter.lock().unwrap();
             if guard.is_none() {
-                *guard = Some(Arc::new(Transporter::new(self.option.config.link_config())));
+                *guard = Some(Arc::new(
+                    Transporter::new(self.option.config.link_config()).with_security(
+                        self.security.clone(),
+                        "iec103",
+                        "client",
+                        0,
+                    ),
+                ));
             }
             Arc::clone(guard.as_ref().expect("just set"))
         };
@@ -315,7 +349,14 @@ impl<H: ClientHandler> Client<H> {
         let t = {
             let mut guard = self.transporter.lock().unwrap();
             if guard.is_none() {
-                *guard = Some(Arc::new(Transporter::new(self.option.config.link_config())));
+                *guard = Some(Arc::new(
+                    Transporter::new(self.option.config.link_config()).with_security(
+                        self.security.clone(),
+                        "iec103",
+                        "client",
+                        0,
+                    ),
+                ));
             }
             Arc::clone(guard.as_ref().expect("just set"))
         };
@@ -324,7 +365,7 @@ impl<H: ClientHandler> Client<H> {
 
     /// Stop the client and close the line.
     pub fn close(&self) {
-        let _ = self.shutdown.send(true);
+        self.shutdown.send_replace(true);
     }
 
     async fn run_forever(
@@ -352,6 +393,11 @@ impl<H: ClientHandler> Client<H> {
             let (stream, desc) = match opened {
                 Ok(v) => v,
                 Err(e) => {
+                    self.report_security_event(Event::new(
+                        crate::net::dial_failure_kind(&e),
+                        Action::Observed,
+                        e.to_string(),
+                    ));
                     tracing::error!(error = %e, "failed to open the line");
                     if !self.option.auto_reconnect {
                         return;
@@ -363,14 +409,37 @@ impl<H: ClientHandler> Client<H> {
                 }
             };
             tracing::debug!(%desc, "line open");
+            let session = Session::new(
+                self.security.clone(),
+                "iec103",
+                "client",
+                0,
+                stream.peer_info(&self.option.config.serial.address),
+            );
+            let allowed = tokio::select! {
+                _ = shutdown.changed() => return,
+                allowed = session.identify() => allowed,
+            };
+            if !allowed {
+                return;
+            }
+            session.observe_tls();
+            session.note(
+                Kind::ConnAccepted,
+                Action::Observed,
+                "FT1.2 transport opened",
+            );
+            *self.security_session.lock().unwrap() = Some(session.clone());
 
             self.shared.connected.store(true, Ordering::Release);
-            let err = self.run_link(stream, &mut link_req).await;
+            let err = self.run_link(stream, &mut link_req, &session).await;
             self.shared.connected.store(false, Ordering::Release);
             self.shared.link_active.store(false, Ordering::Release);
             // A new connection starts from an empty queue.
             self.shared.queue.lock().unwrap().clear();
 
+            session.note(Kind::ConnClosed, Action::Observed, "FT1.2 transport closed");
+            *self.security_session.lock().unwrap() = None;
             match err {
                 Some(e) => tracing::warn!(error = %e, "link stopped"),
                 None => tracing::debug!("link stopped"),
@@ -397,62 +466,34 @@ impl<H: ClientHandler> Client<H> {
         &self,
         stream: LinkStream,
         link_req: &mut mpsc::UnboundedReceiver<LinkRequest>,
+        session: &Session,
     ) -> Option<Error> {
         let cfg = &self.option.config;
 
-        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (reader, writer) = tokio::io::split(stream);
         let (tx_frame, mut rx_frame) = mpsc::channel::<Frame>(20);
-        let (tx_out, mut rx_out) = mpsc::channel::<Vec<u8>>(20);
+        let (tx_out, rx_out) = mpsc::channel::<Vec<u8>>(20);
         let (stop_tx, stop_rx) = watch::channel(false);
 
-        let reader_task = {
-            let mut stop = stop_rx.clone();
-            tokio::spawn(async move {
-                loop {
-                    let r = tokio::select! {
-                        _ = stop.changed() => return,
-                        r = read_frame(&mut reader, LINK_ADDR_SIZE) => r,
-                    };
-                    match r {
-                        Ok(frame) => {
-                            if tx_frame.send(frame).await.is_err() {
-                                return;
-                            }
-                        }
-                        // Line noise: log it and resynchronise on the next octet.
-                        Err(Error::Frame(what)) => {
-                            tracing::warn!(reason = what, "discarding malformed frame")
-                        }
-                        Err(e) => {
-                            tracing::debug!(error = %e, "receive stopped");
-                            return;
-                        }
-                    }
-                }
-            })
-        };
-
-        let writer_task = {
-            let mut stop = stop_rx.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = stop.changed() => break,
-                        raw = rx_out.recv() => {
-                            let Some(raw) = raw else { break };
-                            tracing::trace!(frame = ?raw, "TX raw");
-                            if let Err(e) = writer.write_all(&raw).await {
-                                tracing::debug!(error = %e, "send failed");
-                                break;
-                            }
-                        }
-                    }
-                }
-                let _ = writer.shutdown().await;
-            })
-        };
+        let reader_task = tokio::spawn(crate::cs101::receive_frames(
+            reader,
+            tx_frame,
+            stop_rx.clone(),
+            LINK_ADDR_SIZE,
+            session.clone(),
+        ));
+        let writer_task = tokio::spawn(crate::cs101::write_frames(
+            writer,
+            rx_out,
+            stop_rx.clone(),
+            cfg.timeout_response_t1,
+            session.clone(),
+        ));
 
         let mut link = LinkState::new(&self.option, tx_out.clone());
+        link.security = Some(session.clone());
+        let mac_watch = session.watch_mac();
+        tokio::pin!(mac_watch);
         let mut shutdown = self.shutdown.subscribe();
         let mut on_connect_called = false;
         let mut fatal: Option<Error> = None;
@@ -469,6 +510,8 @@ impl<H: ClientHandler> Client<H> {
 
             tokio::select! {
                 _ = shutdown.changed() => break,
+                _ = tx_out.closed() => break,
+                _ = &mut mac_watch => break,
 
                 frame = rx_frame.recv() => {
                     let Some(frame) = frame else { break };
@@ -502,7 +545,10 @@ impl<H: ClientHandler> Client<H> {
                     if let Some(raw) = frame.asdu().filter(|_| outcome.deliver) {
                         match Asdu::unmarshal_binary(raw).map(|a| a.with_time_zone(cfg.time_zone)) {
                             Ok(pack) => dispatch(&*self.handler, self.as_link(), &pack).await,
-                            Err(e) => tracing::warn!(error = %e, "discarding undecodable ASDU"),
+                            Err(e) => {
+                                session.invalid_asdu(&e, raw, frame.link_addr());
+                                tracing::warn!(error = %e, "discarding undecodable ASDU");
+                            }
                         }
                     }
                 }
@@ -611,6 +657,7 @@ impl<H: ClientHandler> Link for Client<H> {
 
 /// The link state machine, owned by the protocol task.
 struct LinkState {
+    security: Option<Session>,
     devices: HashMap<u8, Device>,
     order: Vec<u8>,
     poll_idx: usize,
@@ -639,6 +686,7 @@ impl LinkState {
             })
             .collect();
         LinkState {
+            security: None,
             devices,
             order,
             poll_idx: 0,
@@ -661,6 +709,12 @@ impl LinkState {
             .iter()
             .copied()
             .find(|a| self.devices[a].phase == Phase::Active)
+    }
+
+    fn link_event(&self, kind: Kind, action: Action, detail: &str, addr: Option<u16>) {
+        if let Some(session) = &self.security {
+            session.link_event(kind, action, detail, addr);
+        }
     }
 
     async fn write(&self, frame: &Frame) -> bool {
@@ -696,9 +750,21 @@ impl LinkState {
     fn confirm_positive(&mut self, addr: u8, addr_valid: bool) -> Option<Confirmed> {
         let Some(p) = self.last_sent.take() else {
             tracing::warn!("received a confirmation with no frame outstanding");
+            self.link_event(
+                Kind::UnsolLinkConfirm,
+                Action::Ignored,
+                "no frame outstanding",
+                addr_valid.then_some(u16::from(addr)),
+            );
             return None;
         };
         if addr_valid && p.addr != addr {
+            self.link_event(
+                Kind::LinkUnexpectedAddr,
+                Action::Ignored,
+                "confirmation came from the wrong station",
+                Some(u16::from(addr)),
+            );
             tracing::warn!(
                 got = addr,
                 expected = p.addr,
@@ -774,6 +840,12 @@ impl LinkState {
         let addr = frame.link_addr().unwrap_or(0) as u8;
         if !self.devices.contains_key(&addr) {
             tracing::warn!(addr, "ignoring a frame from an unexpected link address");
+            self.link_event(
+                Kind::LinkUnexpectedAddr,
+                Action::Ignored,
+                "unexpected link address",
+                Some(u16::from(addr)),
+            );
             return out;
         }
         let ctrl = frame.control().expect("not a single character ack");
@@ -781,6 +853,12 @@ impl LinkState {
         if ctrl.prm {
             // 103 defines no balanced procedure, so a device never sends PRM=1.
             tracing::warn!(%ctrl, "unexpected PRM=1 frame; 103 is unbalanced only");
+            self.link_event(
+                Kind::LinkWrongPrm,
+                Action::Ignored,
+                "primary frame on an unbalanced link",
+                Some(u16::from(addr)),
+            );
             return out;
         }
 

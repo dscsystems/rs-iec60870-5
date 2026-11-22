@@ -186,11 +186,11 @@ impl RelaySim {
                 }
 
                 prim_fc::USER_DATA_CONF => {
-                    if let Some(raw) = frame.asdu() {
-                        if let Ok(a) = Asdu::unmarshal_binary(raw) {
-                            self.react(&a, &mut class1);
-                            self.log(Event::UserData(Box::new(a))).await;
-                        }
+                    if let Some(raw) = frame.asdu()
+                        && let Ok(a) = Asdu::unmarshal_binary(raw)
+                    {
+                        self.react(&a, &mut class1);
+                        self.log(Event::UserData(Box::new(a))).await;
                     }
                     self.fixed(sec_fc::CONF_ACK, !class1.is_empty())
                 }

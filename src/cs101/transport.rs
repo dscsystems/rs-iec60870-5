@@ -6,14 +6,19 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Mutex;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::sync::{Semaphore, mpsc, watch};
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::cs101::config::{Config, TransportType};
+use crate::cs101::frame::{Frame, read_frame};
 use crate::error::{Error, Result};
+use crate::secevent::{Action, Kind, PeerInfo, Security, Session};
 
 enum Inner {
     Net(crate::net::Stream),
@@ -24,6 +29,7 @@ enum Inner {
 /// The byte stream carrying FT1.2 frames.
 pub struct LinkStream {
     inner: Inner,
+    _listener: Option<ActivePeer>,
 }
 
 impl AsyncRead for LinkStream {
@@ -77,7 +83,10 @@ impl AsyncWrite for LinkStream {
 /// without rebinding the port.
 pub struct Transporter {
     config: Config,
-    listener: Mutex<Option<TcpListener>>,
+    listener: Mutex<Option<Arc<TcpListener>>>,
+    binding: tokio::sync::Mutex<()>,
+    slot: Arc<Semaphore>,
+    security: Option<(Arc<Security>, &'static str, &'static str, usize)>,
 }
 
 impl Transporter {
@@ -86,7 +95,21 @@ impl Transporter {
         Transporter {
             config,
             listener: Mutex::new(None),
+            binding: tokio::sync::Mutex::new(()),
+            slot: Arc::new(Semaphore::new(1)),
+            security: None,
         }
+    }
+
+    pub(crate) fn with_security(
+        mut self,
+        security: Arc<Security>,
+        protocol: &'static str,
+        role: &'static str,
+        endpoint: usize,
+    ) -> Self {
+        self.security = Some((security, protocol, role, endpoint));
+        self
     }
 
     /// The address the TCP listener bound to, once it exists.
@@ -109,12 +132,13 @@ impl Transporter {
         if self.config.transport != TransportType::TcpServer {
             return Ok(());
         }
+        let _binding = self.binding.lock().await;
         if self.listener.lock().unwrap().is_some() {
             return Ok(());
         }
         let l = TcpListener::bind(&self.config.tcp.address).await?;
         tracing::debug!(local = ?l.local_addr().ok(), "FT1.2 TCP listener bound");
-        *self.listener.lock().unwrap() = Some(l);
+        *self.listener.lock().unwrap() = Some(Arc::new(l));
         Ok(())
     }
 
@@ -156,6 +180,7 @@ impl Transporter {
         Ok((
             LinkStream {
                 inner: Inner::Serial(port),
+                _listener: None,
             },
             format!("serial {}", cfg.address),
         ))
@@ -195,6 +220,7 @@ impl Transporter {
         Ok((
             LinkStream {
                 inner: Inner::Net(stream),
+                _listener: None,
             },
             desc,
         ))
@@ -203,41 +229,182 @@ impl Transporter {
     async fn open_tcp_server(&self) -> Result<(LinkStream, String)> {
         self.bind().await?;
 
-        // `accept` needs the listener across an await, so take it out and put
-        // it back; only one task ever calls `open` for a given transporter.
-        let listener = self
-            .listener
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or(Error::Config("the TCP listener disappeared"))?;
-        let accepted = listener.accept().await;
-        *self.listener.lock().unwrap() = Some(listener);
-
-        let (tcp, peer) = accepted?;
-        tcp.set_nodelay(true)?;
+        let permit = Arc::clone(&self.slot)
+            .acquire_owned()
+            .await
+            .expect("the transport slot is never closed");
+        let listener = self.listener.lock().unwrap().as_ref().unwrap().clone();
+        let (tcp, peer) = listener.accept().await?;
+        let security = self.security.clone();
+        let reject = tokio::spawn(async move {
+            let _permit = permit;
+            let initial_backoff = Duration::from_millis(5);
+            let mut backoff = initial_backoff;
+            loop {
+                let peer = match listener.accept().await {
+                    Ok((_, peer)) => {
+                        backoff = initial_backoff;
+                        peer
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "FT1.2 accept failed");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                if let Some((security, protocol, role, endpoint)) = &security {
+                    let peer = PeerInfo {
+                        network: "tcp",
+                        addr: Some(peer),
+                        ..PeerInfo::default()
+                    };
+                    Session::new(security.clone(), protocol, role, *endpoint, peer).note(
+                        Kind::ConnRejectedBusy,
+                        Action::Rejected,
+                        "FT1.2 transport already has a peer",
+                    );
+                }
+                tracing::debug!(%peer, "FT1.2 transport already has a peer");
+            }
+        });
+        let active = ActivePeer { reject };
 
         #[cfg(feature = "tls")]
-        let stream = crate::net::accept_stream(tcp, self.config.tcp.tls_server.as_ref()).await?;
+        let tls = self.config.tcp.tls_server.as_ref();
         #[cfg(not(feature = "tls"))]
-        let stream = crate::net::accept_stream(tcp, None).await?;
+        let tls = None;
+        let deadline = self
+            .config
+            .tcp
+            .connect_timeout
+            .unwrap_or(crate::cs101::config::DEFAULT_TCP_CONNECT_TIMEOUT);
+        let stream = match tokio::time::timeout(deadline, crate::net::accept_stream(tcp, tls)).await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) if tls.is_some() => {
+                return Err(crate::net::tls_transport_error(
+                    crate::net::tls_failure_kind(&error),
+                    error,
+                ));
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                let error = io::Error::new(io::ErrorKind::TimedOut, "FT1.2 TLS handshake timeout");
+                return Err(crate::net::tls_transport_error(
+                    Kind::TlsHandshakeTo,
+                    error.into(),
+                ));
+            }
+        };
 
         Ok((
             LinkStream {
                 inner: Inner::Net(stream),
+                _listener: Some(active),
             },
             format!("tcp-listen (peer {peer})"),
         ))
     }
 }
 
+pub(crate) async fn receive_frames(
+    mut reader: impl AsyncRead + Unpin,
+    sender: mpsc::Sender<Frame>,
+    mut stop: watch::Receiver<bool>,
+    addr_size: u8,
+    session: Session,
+) {
+    loop {
+        let frame = tokio::select! {
+            _ = stop.changed() => return,
+            frame = read_frame(&mut reader, addr_size) => frame,
+        };
+        match frame {
+            Ok(frame) => tokio::select! {
+                _ = stop.changed() => return,
+                result = sender.send(frame) => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+            },
+            Err(Error::Frame(reason)) => {
+                session.link_event(Kind::ProtoCs101Frame, Action::Ignored, reason, None);
+                tracing::warn!(reason, "discarding malformed frame");
+            }
+            Err(error) => {
+                tracing::debug!(%error, "receive stopped");
+                return;
+            }
+        }
+    }
+}
+
+pub(crate) async fn write_frames(
+    mut writer: impl AsyncWrite + Unpin,
+    mut frames: mpsc::Receiver<Vec<u8>>,
+    mut stop: watch::Receiver<bool>,
+    deadline: Duration,
+    session: Session,
+) {
+    loop {
+        let frame = tokio::select! {
+            _ = stop.changed() => break,
+            frame = frames.recv() => frame,
+        };
+        let Some(raw) = frame else { break };
+        tracing::trace!(frame = ?raw, "TX raw");
+        let result = tokio::select! {
+            _ = stop.changed() => return,
+            result = tokio::time::timeout(deadline, writer.write_all(&raw)) => result,
+        };
+        if !matches!(result, Ok(Ok(()))) {
+            if result.is_err() {
+                session.note(
+                    Kind::DosWriteStall,
+                    Action::Disconnected,
+                    "FT1.2 write deadline expired",
+                );
+            }
+            tracing::debug!(?result, "send failed");
+            return;
+        }
+    }
+    let _ = tokio::time::timeout(deadline, writer.shutdown()).await;
+}
+
+struct ActivePeer {
+    reject: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ActivePeer {
+    fn drop(&mut self) {
+        self.reject.abort();
+    }
+}
+
 /// Wrap an already established stream, for tests and for callers that bring
 /// their own transport (a virtual serial pair, an SSH tunnel, ...).
 impl LinkStream {
+    pub(crate) fn peer_info(&self, _serial_port: &str) -> PeerInfo {
+        match &self.inner {
+            Inner::Net(stream) => stream.peer_info(),
+            #[cfg(feature = "serial")]
+            Inner::Serial(_) => PeerInfo {
+                network: "serial",
+                serial_port: Some(_serial_port.to_owned()),
+                connected_at: Some(chrono::Utc::now()),
+                ..PeerInfo::default()
+            },
+        }
+    }
+
     /// Adopt an existing TCP connection as the link.
     pub fn from_tcp(tcp: TcpStream) -> LinkStream {
         LinkStream {
             inner: Inner::Net(crate::net::Stream::from_tcp(tcp)),
+            _listener: None,
         }
     }
 }
@@ -270,6 +437,37 @@ mod tests {
             // The same listener serves the next connection.
             assert_eq!(t.listen_addr(), Some(addr));
         }
+    }
+
+    #[tokio::test]
+    async fn an_additional_tcp_peer_is_closed_while_the_active_one_remains_open() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{Duration, timeout};
+
+        let transporter = Transporter::new(Config {
+            transport: TransportType::TcpServer,
+            tcp: TcpConfig {
+                address: "127.0.0.1:0".into(),
+                ..TcpConfig::default()
+            },
+            ..Config::default()
+        });
+        transporter.bind().await.unwrap();
+        let addr = transporter.listen_addr().unwrap();
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        let (mut stream, _) = transporter.open().await.unwrap();
+
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), extra.read_u8())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        first.write_u8(42).await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), 42);
     }
 
     #[tokio::test]

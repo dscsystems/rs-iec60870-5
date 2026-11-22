@@ -111,3 +111,5 @@ pub use frame::{
 pub use handler::{ClientHandler, ServerHandler};
 pub use server::Server;
 pub use transport::{LinkStream, Transporter};
+#[cfg(feature = "cs103")]
+pub(crate) use transport::{receive_frames, write_frames};

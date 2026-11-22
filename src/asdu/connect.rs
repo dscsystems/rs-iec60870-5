@@ -49,6 +49,17 @@ pub trait Connect: Send + Sync {
         }
     }
 
+    /// Report a security observation through this endpoint.
+    fn report_security_event(&self, _event: crate::secevent::Event) {}
+
+    /// Remote peer identity when this connection identifies one peer.
+    fn peer_info(&self) -> crate::secevent::PeerInfo {
+        crate::secevent::PeerInfo {
+            addr: self.peer_addr(),
+            ..Default::default()
+        }
+    }
+
     /// The remote address, when the endpoint has a single one.
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         None
@@ -72,6 +83,14 @@ impl<T: Connect + ?Sized> Connect for &T {
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         (**self).peer_addr()
     }
+
+    fn report_security_event(&self, event: crate::secevent::Event) {
+        (**self).report_security_event(event);
+    }
+
+    fn peer_info(&self) -> crate::secevent::PeerInfo {
+        (**self).peer_info()
+    }
 }
 
 #[async_trait::async_trait]
@@ -90,6 +109,14 @@ impl<T: Connect + ?Sized> Connect for std::sync::Arc<T> {
 
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         (**self).peer_addr()
+    }
+
+    fn report_security_event(&self, event: crate::secevent::Event) {
+        (**self).report_security_event(event);
+    }
+
+    fn peer_info(&self) -> crate::secevent::PeerInfo {
+        (**self).peer_info()
     }
 }
 
