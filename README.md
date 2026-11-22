@@ -9,7 +9,7 @@ Async throughout, built on Tokio. Requires Rust 1.88 or later. Verified for wire
 
 ```toml
 [dependencies]
-rs-iec60870-5 = "0.4"
+rs-iec60870-5 = "0.5"
 ```
 
 ## Modules
